@@ -36,6 +36,11 @@ runner before timing.
 
 All single-threaded. Every test verifies a checksum; a mismatch invalidates the run.
 
+TLS: T2–T6 run with TLS explicitly **off** for every stack (several drivers default to TLS-preferred, which
+would otherwise mix crypto cost into the driver comparison); `+tls` variants (T3, T5) turn it on. Every runner
+reports the negotiated cipher of the connection under test. caching_sha2_password: the orchestrator fills the
+server's auth cache after every restart, so T1 measures the fast-auth path.
+
 | Test | Work in one measured iteration | Variants | Reported unit |
 |---|---|---|---|
 | **T0 footprint** | Start, load driver, open 1 connection, run `SELECT 1` | — | RSS after load, RSS delta per connection, startup CPU |
