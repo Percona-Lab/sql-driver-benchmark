@@ -158,6 +158,10 @@ def main():
                     if not re.search(args.variants, variant):
                         continue
                     for config in args.configs.split(","):
+                        for ext in ("na", "fail"):  # drop status left by an earlier run of this cell
+                            stale = f"{args.results}/{server}/{stack}/{test}-{variant}-{config}.{ext}"
+                            if os.path.exists(stale):
+                                os.unlink(stale)
                         for rep in range(args.repeats if test != "T0" else min(3, args.repeats)):
                             status, msg = run_one(server, stack, test, variant, config, rep, pid, exp, args)
                             line = f"{time.strftime('%H:%M:%S')} {server:5} {stack:18} {test} {variant:20} {config:7} r{rep} {status:4} {msg}"
