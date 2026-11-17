@@ -87,3 +87,7 @@ python3 orchestrator/report.py > summary.json && python3 orchestrator/tables.py 
 ```
 
 `run.py --quick` runs every cell once as a smoke test.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
