@@ -1,11 +1,12 @@
 #!/bin/bash
 # CPU isolation for benchmarking: SMT off, boost off, performance governor,
-# client core isolated. Needs a reboot after the first run (kernel cmdline).
+# client core isolated from the scheduler (isolcpus). NOT nohz_full: its context tracking adds cost to
+# every kernel entry/exit (+14% on a TCP connect), which would penalise syscall-heavy drivers. Needs a reboot after the first run (kernel cmdline).
 set -euxo pipefail
 NCPU=$(lscpu -p=CORE | grep -v '^#' | sort -u | wc -l)
 CLIENT_CORE=$((NCPU-1))
 if ! grep -q "isolcpus=" /proc/cmdline; then
-  sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"nosmt isolcpus=$CLIENT_CORE nohz_full=$CLIENT_CORE rcu_nocbs=$CLIENT_CORE amd_pstate=passive /" /etc/default/grub
+  sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"nosmt isolcpus=$CLIENT_CORE amd_pstate=passive /" /etc/default/grub
   update-grub
   echo "REBOOT NEEDED"
 fi

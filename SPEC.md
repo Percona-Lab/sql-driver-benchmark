@@ -9,9 +9,9 @@ same for every stack; only driver/framework options vary.
 
 | Item | Value |
 |---|---|
-| Host | Vultr bare metal vbm-6c-32gb-amd (EPYC 4245P Zen 5, 6C, 30 GB, 2× Samsung PM9A3 NVMe), ewr, Ubuntu 26.04.1 (upgraded in place from 24.04; Vultr has no 26.04 image for this plan), kernel 7.0 |
+| Host | Vultr bare metal vbm-6c-32gb-amd (EPYC 4245P Zen 5, 6C, 32 GB, 2× Samsung PM9A3 NVMe), ewr, Ubuntu 26.04.1 (upgraded in place from 24.04; Vultr has no 26.04 image for this plan), kernel 7.0. `tcp_max_tw_buckets=4096` so TIME_WAIT sockets from earlier connects do not slow later ones |
 | CPU | `nosmt`, boost off, `performance` governor with min = max = 3.9 GHz (verified under load); applied at boot by `dbbench-cpu.service` |
-| Pinning | client on CPU 5 (`isolcpus=5 nohz_full=5 rcu_nocbs=5`); mysqld `CPUAffinity=1 2 3`; CPUs 0 and 4 for OS, orchestrator, profilers |
+| Pinning | client on CPU 5 (`isolcpus=5`; not `nohz_full`, whose context tracking adds +14% to a TCP connect); mysqld `CPUAffinity=1 2 3`; CPUs 0 and 4 for OS, orchestrator, profilers |
 | Servers | Percona Server for MySQL 9.7.2-3 LTS (`ps`, apt, port 3306), MariaDB 12.3.4 LTS (`maria`, official bintar in /opt/mariadb, port 3307); only one running at a time (`dbctl.sh start ps\|maria`). Users: `bench` (caching_sha2 on ps, native on maria), `bench_ed` (ed25519, maria) |
 | Transport | TCP 127.0.0.1 (default); Unix socket as a T1/T2 variant |
 | TLS | TLS 1.3, one ECDSA P-256 server cert used by both servers; client verifies CA in `tls-verify` variant |
@@ -92,15 +92,19 @@ run --test T3 --variant text-buffered --config default \
   `perf stat -D -1 --control fifo:$PERF_CTL,$PERF_ACK`, so only measured iterations are counted, for any language
   (it is just two file writes).
 
-## 5a. Hardware counters (all timed runs)
+## 5a. Hardware counters (separate processes)
 
-Counting mode (`perf stat`, no sampling), so overhead is negligible. The client process only, user and kernel
-counted separately (`:u` / `:k`). Two event sets, each ≤ 6 events so the AMD PMU never multiplexes:
+Hardware counters are **not** collected in timed runs. Counting hardware events adds cost to every context
+switch (measured: +26% CPU on a TCP connect, ~+2% on a point select), which would penalise drivers in
+proportion to their system calls. Each cell therefore runs 5 timed processes with no `perf` attached, plus
+two counter processes (`cA`, `cB`) wrapped in `perf stat` with one event set each. Counter processes are used
+only for per-op counter ratios (instructions, IPC, misses), never for CPU time. Each set has ≤ 6 hardware
+events so the AMD PMU never multiplexes; the kernel NMI watchdog is off.
 
 | Set | Events | Derived metrics |
 |---|---|---|
-| A (runs 1–3) | cycles, instructions, branch-misses, context-switches, page-faults, task-clock | cycles/op, instructions/op, **IPC**, branch-miss %, minor faults/op (allocation churn) |
-| B (runs 4–5) | cycles, instructions, L1-dcache-load-misses, LLC misses (`cache-misses`), dTLB-load-misses, iTLB-load-misses | L1/LLC misses per op and per 1k instructions, TLB misses (large heaps, big code footprint of JIT/interpreters) |
+| A (`cA`) | cycles, instructions, branch-misses, context-switches, page-faults, task-clock | cycles/op, instructions/op, **IPC**, branch-miss %, minor faults/op (allocation churn) |
+| B (`cB`) | cycles, instructions, L1-dcache-load-misses, LLC misses (`cache-misses`), dTLB-load-misses, iTLB-load-misses | L1/LLC misses per op and per 1k instructions, TLB misses (large heaps, big code footprint of JIT/interpreters) |
 
 With boost off, cycles track CPU time closely; **instructions per op** is the most stable metric and is used to confirm
 small differences that CPU time alone cannot resolve. Kernel cycles show the syscall/network share. Exact AMD Zen 5

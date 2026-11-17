@@ -102,13 +102,20 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
     os.makedirs(outdir, exist_ok=True)
     label = f"{test}-{variant}-{config}-{rep}".replace("/", "_")
     res, perfout = f"{outdir}/{label}.json", f"{outdir}/{label}.perf"
-    evset = "A" if rep < 3 else "B"
+    evset = {"cA": "A", "cB": "B"}.get(str(rep))
     with tempfile.TemporaryDirectory() as td:
         ctl, ack = f"{td}/ctl", f"{td}/ack"
         os.mkfifo(ctl); os.mkfifo(ack)
         env.update(PERF_CTL=ctl, PERF_ACK=ack)
-        cmd = (["taskset", "-c", CLIENT_CPU, "perf", "stat", "-x", ",", "-o", perfout, "-D", "-1",
-                "--control", f"fifo:{ctl},{ack}", "-e", EVENTS[evset], "--"]
+        # Timed runs carry no perf at all: counting hardware events adds cost to every context switch
+        # (+26% on a TCP connect). Counters come from separate processes (evset A / B).
+        prefix = ["taskset", "-c", CLIENT_CPU]
+        if evset:
+            prefix += ["perf", "stat", "-x", ",", "-o", perfout, "-D", "-1", "--control", f"fifo:{ctl},{ack}",
+                       "-e", EVENTS[evset], "--"]
+        else:
+            env.pop("PERF_CTL"); env.pop("PERF_ACK")
+        cmd = (prefix
                + argv + ["--test", test, "--variant", base, "--config", config, "--server", server,
                          "--warmup", str(warmup), "--iters", str(iters), "--out", res])
         t0 = time.time()
@@ -123,10 +130,11 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
     d = json.load(open(res))
     want = expected_checksum(exp, test, variant)
     bad = [it["checksum"] for it in d["iters"] if want is not None and it["checksum"] != want]
-    d.update(variant=variant, rep=rep, event_set=evset, perf=parse_perf(perfout), elapsed_s=round(time.time() - t0, 2),
-             checksum_ok=not bad, expected=want)
+    d.update(variant=variant, rep=rep, event_set=evset, perf=parse_perf(perfout) if evset else None,
+             elapsed_s=round(time.time() - t0, 2), checksum_ok=not bad, expected=want)
     json.dump(d, open(res, "w"))
-    os.unlink(perfout)
+    if evset:
+        os.unlink(perfout)
     if bad:
         return "fail", f"checksum {bad[0]} != {want}"
     cpu = sorted(it["cpu_ns"] for it in d["iters"])[len(d["iters"]) // 2]
@@ -144,6 +152,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--quick", action="store_true", help="smoke test: 1 process, 1 iteration, no warm-up")
     ap.add_argument("--results", default=RESULTS)
+    ap.add_argument("--no-counters", action="store_true", help="skip the two hardware-counter processes per cell")
     args = ap.parse_args()
     if args.quick:
         args.repeats, args.results = 1, f"{ROOT}/results-smoke"
@@ -162,7 +171,10 @@ def main():
                             stale = f"{args.results}/{server}/{stack}/{test}-{variant}-{config}.{ext}"
                             if os.path.exists(stale):
                                 os.unlink(stale)
-                        for rep in range(args.repeats if test != "T0" else min(3, args.repeats)):
+                        reps = list(range(args.repeats if test != "T0" else min(3, args.repeats)))
+                        if not args.quick and not args.no_counters:
+                            reps += ["cA", "cB"]   # hardware-counter processes (not used for timing)
+                        for rep in reps:
                             status, msg = run_one(server, stack, test, variant, config, rep, pid, exp, args)
                             line = f"{time.strftime('%H:%M:%S')} {server:5} {stack:18} {test} {variant:20} {config:7} r{rep} {status:4} {msg}"
                             print(line, flush=True); log.write(line + "\n"); log.flush()

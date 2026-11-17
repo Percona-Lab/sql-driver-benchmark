@@ -22,15 +22,16 @@ All tests are single-threaded and verify a checksum on every iteration, so no dr
 | T5 large values | 1,000 JSON / BLOB values of 1 KB, 10 KB, 100 KB or mixed, 20 queries | ns per KB |
 | T6 bulk insert | 1M rows in 1,000-row statements: app-built SQL, 4,000-placeholder statement, driver batch API | µs per statement |
 
-Per measured iteration: process CPU (includes GC/JIT threads), wall time, server CPU, peak RSS, and
-`perf stat` hardware counters (cycles, instructions, IPC, user/kernel split, branch/L1/LLC/TLB misses)
-counted only during measured iterations. Each cell runs as 5 fresh processes; the median is reported.
+Per measured iteration: process CPU (includes GC/JIT threads), wall time, server CPU and peak RSS. Each
+cell runs as 5 fresh processes; the median is reported. Hardware counters (cycles, instructions, IPC,
+user/kernel split, branch/L1/LLC/TLB misses) come from two extra processes per cell under `perf stat`,
+because counting adds measurable cost to syscall-heavy work and must not touch the timed runs.
 A separate profiling pass (perf/eBPF + language profilers) shows where the time goes.
 
 ## Environment
 
 One bare-metal host (Vultr, AMD EPYC 4245P, 6 cores, 32 GB, NVMe), Ubuntu 26.04.1, kernel 7.0.
-SMT off, boost off, frequency fixed at 3.9 GHz. The client runs alone on an isolated core; the database
+SMT off, boost off, frequency fixed at 3.9 GHz. The client runs alone on an isolated core (`isolcpus`); the database
 server is pinned to three other cores. Client and server talk over loopback TCP (Unix socket as a
 variant), so only client-side cost differs between drivers. Exact versions: [results/versions.txt](results/versions.txt).
 
@@ -48,9 +49,10 @@ Prisma, Sequelize, Doctrine, ActiveRecord, EF Core, Diesel, …), then async dri
 
 ## Status
 
-- C baseline: complete on both servers.
-- Phase 1 (Java, Python, Go): runners validated, full run in progress. `results/` is a **snapshot of a run
-  in progress**; `results/summary-snapshot.json` aggregates whatever has finished.
+- Phase 1 (C, Java, Python, Go): runners validated; full run in progress.
+- `results/` holds an **earlier snapshot taken with perf attached to timed runs and `nohz_full` on the client
+  core**, which inflated connect cost by up to ~40% and point-select cost by a few percent. It will be
+  replaced by the current run.
 
 Early observations (to be confirmed by the profiling pass):
 

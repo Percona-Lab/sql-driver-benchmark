@@ -16,7 +16,11 @@ for f in glob.glob(f"{RES}/*/*/*.json"):
     rows.setdefault(key, []).append(d)
 
 out = []
-for (server, stack, test, variant, config), runs in sorted(rows.items()):
+for (server, stack, test, variant, config), allruns in sorted(rows.items()):
+    runs = [r for r in allruns if not r.get("event_set")]          # timed processes (no perf attached)
+    counted = [r for r in allruns if r.get("event_set")]           # hardware-counter processes
+    if not runs:
+        continue
     ops = runs[0]["ops_per_iter"]
     proc_cpu = [st.median(it["cpu_ns"] for it in r["iters"]) / ops for r in runs]
     proc_wall = [st.median(it["wall_ns"] for it in r["iters"]) / ops for r in runs]
@@ -31,7 +35,7 @@ for (server, stack, test, variant, config), runs in sorted(rows.items()):
         row["rss_start_kb"] = runs[0].get("rss_start_kb")
     # hardware counters: per op, per event set
     for evset in ("A", "B"):
-        rs = [r for r in runs if r.get("event_set") == evset and r.get("perf")]
+        rs = [r for r in counted if r.get("event_set") == evset and r.get("perf")]
         if not rs:
             continue
         tot = {}
