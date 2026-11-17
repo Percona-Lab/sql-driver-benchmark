@@ -15,5 +15,8 @@ net.ipv4.ip_local_port_range=10000 65000
 net.ipv4.tcp_tw_reuse=1
 kernel.perf_event_paranoid=-1
 kernel.kptr_restrict=0
+# cap TIME_WAIT sockets: T1 opens 10k connections per iteration; a growing TIME_WAIT table slows
+# ephemeral port selection and makes connect cost depend on what ran before
+net.ipv4.tcp_max_tw_buckets=4096
 SYS
 sysctl --system >/dev/null

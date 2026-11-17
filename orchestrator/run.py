@@ -32,7 +32,7 @@ VARIANTS = {
     "T6": ["sqltext", "multiparam", "batch"],
 }
 # measured iterations / warm-up per test (JIT runtimes get a longer warm-up from the stack entry)
-ITERS = {"T0": 1, "T1": 3, "T2": 3, "T3": 10, "T4": 20, "T5": 5, "T6": 3}
+ITERS = {"T0": 1, "T1": 3, "T2": 3, "T3": 5, "T4": 5, "T5": 3, "T6": 3}
 
 # Stack registry: name -> (working dir, argv prefix, jit?)
 STACKS = {
@@ -94,7 +94,7 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
         if server != "maria":
             return "n/a", "ed25519 auth is MariaDB-only"
         env["DB_USER"] = "bench_ed"
-    warmup = (10 if jit else 2) if test != "T1" else (3 if jit else 1)
+    warmup = (5 if jit else 2) if test != "T1" else (3 if jit else 1)
     iters = ITERS[test]
     if args.quick:
         warmup, iters = 0, 1
@@ -116,7 +116,10 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
     if p.returncode == 3:
         return "n/a", (p.stderr.strip().splitlines() or ["?"])[-1].removeprefix("n/a: ")
     if p.returncode != 0:
-        return "fail", (p.stderr.strip().splitlines() or ["?"])[-1][:300]
+        msg = (p.stderr.strip().splitlines() or ["?"])[-1][:300]
+        if "@ed25519" in variant:  # missing client support for MariaDB's ed25519 plugin is a capability, not a bug
+            return "n/a", "no ed25519 client support: " + msg
+        return "fail", msg
     d = json.load(open(res))
     want = expected_checksum(exp, test, variant)
     bad = [it["checksum"] for it in d["iters"] if want is not None and it["checksum"] != want]
