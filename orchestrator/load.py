@@ -31,6 +31,8 @@ users = {"ps": """
 CREATE USER IF NOT EXISTS 'bench'@'%' IDENTIFIED WITH caching_sha2_password BY 'bench';
 GRANT ALL ON bench.* TO 'bench'@'%';
 """, "maria": """
+DROP USER IF EXISTS ''@'localhost';
+DROP USER IF EXISTS ''@'dbdrivers';
 CREATE USER IF NOT EXISTS 'bench'@'%' IDENTIFIED BY 'bench';
 CREATE USER IF NOT EXISTS 'bench_ed'@'%' IDENTIFIED VIA ed25519 USING PASSWORD('bench');
 GRANT ALL ON bench.* TO 'bench'@'%';

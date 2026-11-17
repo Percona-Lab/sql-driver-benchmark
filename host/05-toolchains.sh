@@ -2,7 +2,7 @@
 # Language runtimes, client libraries and profilers. Versions are recorded in /root/bench/versions.txt.
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
-GO=1.27.4; NODE=v26.13.1; RUBY=4.0.9; ASPROF=4.6; RBSPY=v0.55.0; MYSQLAPT=0.8.40-1
+GO=1.27.4; NODE=v26.13.1; RUBY=4.0.9; ASPROF=4.6; MCONNC=v3.4.11; RBSPY=v0.55.0; MYSQLAPT=0.8.40-1; MYSQLCLI=9.7.4-1ubuntu26.04
 
 apt-get update
 apt-get -y install build-essential cmake pkg-config git unzip zip jq libssl-dev zlib1g-dev libyaml-dev \
@@ -11,21 +11,35 @@ apt-get -y install build-essential cmake pkg-config git unzip zip jq libssl-dev 
   php-cli php-mysql php-dev php-xml php-mbstring composer \
   dotnet-sdk-10.0 \
   unixodbc unixodbc-dev odbc-mariadb libdbi-perl libdbd-mysql-perl libdbd-mariadb-perl cpanminus \
-  libmariadb-dev \
   linux-tools-generic linux-tools-$(uname -r) bpftrace bpfcc-tools heaptrack
 
-# Oracle MySQL 9.7 LTS client library + Connector/C++ + Connector/ODBC (only client packages from this repo)
+# Oracle MySQL 9.7 LTS client library, Connector/C++, Connector/ODBC.
+# Oracle's client debs depend on Oracle's server packages (conflict with Percona Server), so they are
+# unpacked into /opt/oracle instead of being installed. Ubuntu's libmysqlclient 8.4 stays in /usr (Perl DBD).
 if ! apt-cache policy | grep -q repo.mysql.com; then
   curl -sLO https://repo.mysql.com/apt/ubuntu/pool/mysql-apt-config/m/mysql-apt-config/mysql-apt-config_${MYSQLAPT}_all.deb
   echo "mysql-apt-config mysql-apt-config/select-server select mysql-9.7-lts" | debconf-set-selections
   echo "mysql-apt-config mysql-apt-config/select-tools select Enabled" | debconf-set-selections
   dpkg -i mysql-apt-config_${MYSQLAPT}_all.deb
-  # never take server packages from Oracle's repo (Percona Server is installed from Percona's)
-  printf "Package: mysql-server* mysql-community-server* mysql-client* mysql-community-client*\nPin: origin repo.mysql.com\nPin-Priority: -1\n" > /etc/apt/preferences.d/no-oracle-server
-  apt-get update
 fi
-apt-get -y install libmysqlclient-dev libmysqlcppconnx2 libmysqlcppconn-dev mysql-connector-odbc || \
-  apt-get -y install libmysqlclient-dev
+printf "Package: *\nPin: origin repo.mysql.com\nPin-Priority: 100\n" > /etc/apt/preferences.d/oracle-low
+apt-get update
+if [ ! -f /opt/oracle/usr/lib/x86_64-linux-gnu/libmysqlclient.so.24 ]; then
+  mkdir -p /usr/local/src/oracle-debs /opt/oracle && cd /usr/local/src/oracle-debs
+  apt-get download libmysqlclient24=$MYSQLCLI libmysqlclient-dev=$MYSQLCLI mysql-community-client-plugins=$MYSQLCLI \
+    libmysqlcppconn10 libmysqlcppconnx2 libmysqlcppconn-dev mysql-connector-odbc
+  for d in *.deb; do dpkg -x $d /opt/oracle; done
+fi
+sed -i -e 's|/usr/include|/opt/oracle/usr/include|g' -e 's|/usr/lib/x86_64-linux-gnu|/opt/oracle/usr/lib/x86_64-linux-gnu|g' /opt/oracle/usr/bin/mysql_config
+apt-get -y remove libmariadb-dev libmariadb-dev-compat 2>/dev/null || true
+# MariaDB Connector/C from source in its own prefix (Ubuntu's libmariadb-dev conflicts with libmysqlclient-dev)
+if [ ! -x /opt/mariadb-connc/bin/mariadb_config ]; then
+  cd /usr/local/src && rm -rf mariadb-connector-c && git clone -q --depth 1 -b $MCONNC https://github.com/mariadb-corporation/mariadb-connector-c
+  cd mariadb-connector-c && cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/opt/mariadb-connc -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_C_FLAGS="-fno-omit-frame-pointer" -DWITH_SSL=OPENSSL -DWITH_UNIT_TESTS=OFF >/dev/null
+  cmake --build build -j5 >/dev/null && cmake --install build >/dev/null
+  echo /opt/mariadb-connc/lib/mariadb > /etc/ld.so.conf.d/mariadb-connc.conf && ldconfig
+fi
 
 # Go, Node (official tarballs: newer than the distro)
 [ -x /opt/go/bin/go ] || { curl -sL https://go.dev/dl/go$GO.linux-amd64.tar.gz | tar xz -C /opt; }
@@ -63,8 +77,9 @@ mkdir -p /root/bench
   gcc --version | head -1; java -version 2>&1 | head -1; mvn -v | head -1; python3 --version
   go version; echo "node $(node -v)"; php -v | head -1; ruby -v; dotnet --version | sed 's/^/dotnet /'
   rustc --version; perl -v | sed -n 2p
-  echo "libmysqlclient $(mysql_config --version 2>/dev/null)"; echo "libmariadb $(mariadb_config --version 2>/dev/null)"
-  dpkg-query -W -f '${Package} ${Version}\n' libmysqlcppconnx2 libmysqlcppconn-dev mysql-connector-odbc odbc-mariadb libdbd-mysql-perl libdbd-mariadb-perl 2>/dev/null
+  echo "oracle libmysqlclient $(/opt/oracle/usr/bin/mysql_config --version)"; echo "mariadb-connector-c $(/opt/mariadb-connc/bin/mariadb_config --cc_version 2>/dev/null)"
+  dpkg-query -W -f '${Package} ${Version}\n' libmysqlclient24 odbc-mariadb libdbd-mysql-perl libdbd-mariadb-perl 2>/dev/null
+  ls /usr/local/src/oracle-debs
   perf --version; bpftrace --version; echo "async-profiler $ASPROF"; /opt/tools/bin/py-spy --version
 } > /root/bench/versions.txt 2>&1
 cat /root/bench/versions.txt
