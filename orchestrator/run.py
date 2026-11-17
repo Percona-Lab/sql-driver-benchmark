@@ -23,9 +23,9 @@ SERVERS = {
 # Variants per test. "+tls": run with DB_TLS=on. "@ed25519": run as bench_ed (maria only).
 VARIANTS = {
     "T0": ["-"],
-    "T1": ["tcp", "tls", "tls-verify", "tls-resume", "socket", "tcp@ed25519"],
+    "T1": ["tcp", "tls", "tls-verify", "tls-resume", "tls-verify-resume", "socket", "tcp@ed25519"],
     "T2": ["literal", "param", "prepared"],
-    "T3": ["text-buffered", "text-streamed", "binary-buffered", "binary-streamed", "text-buffered+tls"],
+    "T3": ["text-buffered", "text-streamed", "binary-buffered", "binary-streamed", "text-buffered+tls", "text-streamed+tls"],
     "T4": ["int-text", "mix-text", "int-binary", "mix-binary"],
     "T5": [f"{c}-{col}" for c in ("1k", "10k", "100k", "mix") for col in ("doc", "doc_bin")]
           + ["100k-doc+tls", "10k-doc-parse"],
@@ -39,6 +39,12 @@ STACKS = {
     "c-libmysqlclient": ("stacks/c", ["./run-libmysqlclient"], False),
     "c-mariadb-connc":  ("stacks/c", ["./run-mariadb-connc"], False),
 }
+for _d in ("mysqlclient", "pymysql", "mysql-connector-c", "mysql-connector-pure", "mariadb"):
+    STACKS["py-" + _d] = ("stacks/python", ["venv/bin/python", "runner.py", "--driver", _d], False)
+for _d in ("connector-j", "mariadb-j"):
+    STACKS["java-" + _d] = ("stacks/java", ["./run", "--driver", _d], True)
+for _d in ("go-sql-driver", "go-mysql"):
+    STACKS[_d] = ("stacks/go", ["./runner", "--driver", _d], False)
 
 # Hardware counter sets (<= 6 HW counters each so the PMU never multiplexes; NMI watchdog is off)
 EVENTS = {
@@ -89,7 +95,10 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
             return "n/a", "ed25519 auth is MariaDB-only"
         env["DB_USER"] = "bench_ed"
     warmup = (10 if jit else 2) if test != "T1" else (3 if jit else 1)
-    outdir = f"{RESULTS}/{server}/{stack}"
+    iters = ITERS[test]
+    if args.quick:
+        warmup, iters = 0, 1
+    outdir = f"{args.results}/{server}/{stack}"
     os.makedirs(outdir, exist_ok=True)
     label = f"{test}-{variant}-{config}-{rep}".replace("/", "_")
     res, perfout = f"{outdir}/{label}.json", f"{outdir}/{label}.perf"
@@ -101,7 +110,7 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
         cmd = (["taskset", "-c", CLIENT_CPU, "perf", "stat", "-x", ",", "-o", perfout, "-D", "-1",
                 "--control", f"fifo:{ctl},{ack}", "-e", EVENTS[evset], "--"]
                + argv + ["--test", test, "--variant", base, "--config", config, "--server", server,
-                         "--warmup", str(warmup), "--iters", str(ITERS[test]), "--out", res])
+                         "--warmup", str(warmup), "--iters", str(iters), "--out", res])
         t0 = time.time()
         p = subprocess.run(cmd, cwd=f"{SRC}/{cwd}", env=env, capture_output=True, text=True, timeout=args.timeout)
     if p.returncode == 3:
@@ -130,7 +139,11 @@ def main():
     ap.add_argument("--repeats", type=int, default=5)
     ap.add_argument("--variants", default=".*")
     ap.add_argument("--timeout", type=int, default=1800)
+    ap.add_argument("--quick", action="store_true", help="smoke test: 1 process, 1 iteration, no warm-up")
+    ap.add_argument("--results", default=RESULTS)
     args = ap.parse_args()
+    if args.quick:
+        args.repeats, args.results = 1, f"{ROOT}/results-smoke"
     subprocess.run(["/root/03-runtime-cpu.sh"], capture_output=True)
     log = open(f"{ROOT}/run.log", "a")
     for server in args.servers.split(","):
@@ -142,12 +155,12 @@ def main():
                     if not re.search(args.variants, variant):
                         continue
                     for config in args.configs.split(","):
-                        for rep in range(args.repeats if test != "T0" else 3):
+                        for rep in range(args.repeats if test != "T0" else min(3, args.repeats)):
                             status, msg = run_one(server, stack, test, variant, config, rep, pid, exp, args)
                             line = f"{time.strftime('%H:%M:%S')} {server:5} {stack:18} {test} {variant:20} {config:7} r{rep} {status:4} {msg}"
                             print(line, flush=True); log.write(line + "\n"); log.flush()
                             if status != "ok":
-                                d = f"{RESULTS}/{server}/{stack}"
+                                d = f"{args.results}/{server}/{stack}"
                                 os.makedirs(d, exist_ok=True)
                                 json.dump({"stack": stack, "test": test, "variant": variant, "config": config,
                                            "server": server, "status": status, "reason": msg},

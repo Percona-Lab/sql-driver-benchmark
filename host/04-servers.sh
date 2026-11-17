@@ -9,14 +9,19 @@ apt-get -y install curl gnupg lsb-release openssl libaio1t64 libncurses6 numactl
 
 # --- TLS: one CA + ECDSA P-256 server cert for both servers
 mkdir -p /etc/dbbench/tls && cd /etc/dbbench/tls
-if [ ! -f server-cert.pem ]; then
+if [ ! -f server-cert.pem ] || ! openssl x509 -in ca.pem -noout -ext keyUsage 2>/dev/null | grep -q "Certificate Sign"; then
+  # strict-X.509-clean chain (Python 3.13+ and Java check keyUsage / basicConstraints)
   openssl ecparam -genkey -name prime256v1 -out ca-key.pem
-  openssl req -x509 -new -key ca-key.pem -days 3650 -subj "/CN=dbbench-ca" -out ca.pem
+  openssl req -x509 -new -key ca-key.pem -days 3650 -subj "/CN=dbbench-ca" -out ca.pem \
+    -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    -addext "subjectKeyIdentifier=hash"
   openssl ecparam -genkey -name prime256v1 -out server-key.pem
   openssl req -new -key server-key.pem -subj "/CN=localhost" -out server.csr
-  printf "subjectAltName=DNS:localhost,IP:127.0.0.1\n" > san.ext
+  printf "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost,IP:127.0.0.1\nauthorityKeyIdentifier=keyid\nsubjectKeyIdentifier=hash\n" > san.ext
   openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -days 3650 -extfile san.ext -out server-cert.pem
   chmod 644 *.pem
+  # Java truststore with the same CA
+  rm -f ca.p12; keytool -importcert -noprompt -alias dbbench-ca -file ca.pem -keystore ca.p12 -storetype PKCS12 -storepass changeit >/dev/null 2>&1 || true
 fi
 
 # --- Percona Server 9.7

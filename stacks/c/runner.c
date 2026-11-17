@@ -94,9 +94,13 @@ static int *g_ids; static int g_nids;
 static long long g_ops;
 
 /* T1: connect */
+static int t1_tls(void) {
+  return !strncmp(g_variant, "tls-verify", 10) ? TLS_VERIFY : !strncmp(g_variant, "tls", 3) ? TLS_ON : TLS_OFF;
+}
+static int t1_resume(void) { return strstr(g_variant, "resume") != NULL; }
 static void t1(char *ck) {
-  int n = 2000, sock = !strcmp(g_variant, "socket"), resume = !strcmp(g_variant, "tls-resume");
-  int tls = !strcmp(g_variant, "tls") || resume ? TLS_ON : !strcmp(g_variant, "tls-verify") ? TLS_VERIFY : TLS_OFF;
+  int sock = !strcmp(g_variant, "socket"), resume = t1_resume(), tls = t1_tls();
+  int n = tls == TLS_OFF ? 10000 : 2000;   /* plain connects are ~30 us: more of them for a stable median */
   for (int i = 0; i < n; i++) { MYSQL *m = db_connect(tls, sock, resume); mysql_close(m); }
   g_ops = n; snprintf(ck, 96, "%d", n);
 }
@@ -372,6 +376,8 @@ int main(int argc, char **argv) {
     return 0;
   }
 
+  if (!strcmp(g_test, "T1") && strstr(g_variant, "resume") && IS_MARIADB) b_na("Connector/C has no TLS session resumption API");
+  if (!IS_MARIADB && !strcmp(E("DB_USER", ""), "bench_ed")) b_na("libmysqlclient has no ed25519 client plugin");
   g_m = db_connect(tls_mode(), 0, 0);
   record_tls(g_m);
   if (!strcmp(g_test, "T2")) {
@@ -381,12 +387,10 @@ int main(int argc, char **argv) {
     g_ids = malloc(200000 * sizeof(int)); while (g_nids < 200000 && fscanf(f, "%d", &g_ids[g_nids]) == 1) g_nids++;
     fclose(f);
   }
-  if (!strcmp(g_test, "T1") && !strcmp(g_variant, "tls-resume") && IS_MARIADB) b_na("Connector/C has no TLS session resumption API");
+
   if (!strcmp(g_test, "T1")) {   /* record the cipher of a connection made with the variant's settings */
     mysql_close(g_m);
-    int resume = !strcmp(g_variant, "tls-resume");
-    int tls = !strcmp(g_variant, "tls") || resume ? TLS_ON : !strcmp(g_variant, "tls-verify") ? TLS_VERIFY : TLS_OFF;
-    g_m = db_connect(tls, !strcmp(g_variant, "socket"), resume); record_tls(g_m);
+    g_m = db_connect(t1_tls(), !strcmp(g_variant, "socket"), t1_resume()); record_tls(g_m);
     mysql_close(g_m); g_m = NULL;
   }
 
