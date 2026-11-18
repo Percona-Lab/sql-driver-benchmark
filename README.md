@@ -6,7 +6,7 @@ It is not a database benchmark: the server configuration is fixed and identical 
 only driver/framework options vary. The first round covers **MySQL (Percona Server 9.7 LTS) and
 MariaDB 12.3 LTS**; other databases will follow.
 
-Full method: [SPEC.md](SPEC.md). Stack inventory and tuned options: [stacks.yaml](stacks.yaml).
+Full method: [SPEC.md](SPEC.md). Host-setup distortions we found and fixed: [docs/measurement-pitfalls.md](docs/measurement-pitfalls.md). Stack inventory and tuned options: [stacks.yaml](stacks.yaml).
 
 ## What is measured
 
