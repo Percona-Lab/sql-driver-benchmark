@@ -85,9 +85,9 @@ class Mysqli_ {
         elseif ($variant === "param") {  // mysqli has no client-side parameters: execute_query = prepare+execute+close
             foreach ($ids as $id) $s += (int)$c->execute_query("SELECT v FROM t_int WHERE id = ?", [$id])->fetch_row()[0];
         } else {
-            $st = $c->prepare("SELECT v FROM t_int WHERE id = ?"); $p = 0; $v = 0;
-            $st->bind_param("i", $p); $st->bind_result($v);   // bound by reference: assign, don't rebind via foreach
-            foreach ($ids as $id) { $p = $id; $st->execute(); $st->fetch(); $s += $v; $st->free_result(); }
+            $st = $c->prepare("SELECT v FROM t_int WHERE id = ?"); $p = 0;
+            $st->bind_param("i", $p);   // bound by reference
+            foreach ($ids as $id) { $p = $id; $st->execute(); $s += (int)$st->get_result()->fetch_row()[0]; }
             $st->close();
         }
         return $s;

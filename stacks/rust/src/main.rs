@@ -271,6 +271,8 @@ mod sqlx_drv {
 // ======================================================================== main
 fn main() {
     let rss_start = status_kb("VmRSS:");
+    // mysql (rustls-tls) and sqlx (tls-rustls) enable different rustls backends: pick one explicitly
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut a = Args { driver: "mysql".into(), test: "T0".into(), variant: String::new(), config: "default".into(), server: "ps".into(), out: None, warmup: 2, iters: 5 };
     let argv: Vec<String> = env::args().collect();
     let mut i = 1;

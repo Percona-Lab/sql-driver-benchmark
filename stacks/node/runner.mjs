@@ -80,7 +80,7 @@ const MariaDB = {
   name: "node-mariadb", mod: () => require("mariadb"),
   lib() { return "mariadb " + pkgVersion("mariadb") + " (node " + process.version + ")"; },
   async connect(tls = "off", sock = false) {
-    const o = { ...base(sock), autoJsonMap: false, rowsAsArray: tuned };
+    const o = { ...base(sock), autoJsonMap: false, jsonStrings: true, rowsAsArray: tuned };
     const t = tlsOpt(tls); o.ssl = t || false;
     return this.mod().createConnection(o);
   },

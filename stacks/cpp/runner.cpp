@@ -52,7 +52,7 @@ static sql::Connection* connect_(const std::string& tls, bool sock) {
   o["OPT_SSL_MODE"] = tls == "off" ? sql::SSL_MODE_DISABLED : tls == "on" ? sql::SSL_MODE_REQUIRED : sql::SSL_MODE_VERIFY_IDENTITY;
   if (tls == "verify") o["sslCA"] = sql::SQLString(E("DB_CA", ""));
   // Connector/C++ 9.x+ loads mysql_native_password as a plugin; point it at the unpacked Oracle client plugins
-  o["OPT_PLUGIN_DIR"] = sql::SQLString(E("CPP_PLUGIN_DIR", "/opt/oracle/usr/lib/x86_64-linux-gnu/mysql/libmysqlcppconn10/plugin"));
+  o["pluginDir"] = sql::SQLString(E("CPP_PLUGIN_DIR", "/opt/oracle/usr/lib/x86_64-linux-gnu/mysql/libmysqlcppconn10/plugin"));
   return d->connect(o);
 #endif
 }

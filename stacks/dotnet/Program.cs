@@ -67,7 +67,6 @@ static class P
         cs.Append(sock ? $"Server={Env("DB_SOCKET")};Protocol=Unix;" : $"Server={Env("DB_HOST", "127.0.0.1")};Port={Env("DB_PORT", "3306")};");
         cs.Append($"User ID={Env("DB_USER", "bench")};Password={Env("DB_PASS", "bench")};Database={Env("DB_NAME", "bench")};Pooling=false;");
         cs.Append(tls switch { "off" => connector ? "SslMode=None;" : "SslMode=Disabled;", "on" => "SslMode=Required;", _ => $"SslMode=VerifyFull;SslCa={Env("DB_CA")};" });
-        if (!connector && ServerPrep) cs.Append("IgnorePrepare=false;");   // MySql.Data ignores Prepare() by default
         var c = Factory.CreateConnection()!; c.ConnectionString = cs.ToString(); c.Open(); return c;
     }
     static DbCommand Cmd(DbConnection c, string sql) { var cmd = c.CreateCommand(); cmd.CommandText = sql; return cmd; }
