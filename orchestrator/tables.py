@@ -7,6 +7,8 @@ from collections import defaultdict
 UNIT = {"T0": ("ms", 1e6), "T1": ("µs/connect", 1e3), "T2": ("µs/query", 1e3), "T3": ("ns/row", 1),
         "T4": ("ns/cell", 1), "T5": ("ns/KB", 1), "T6": ("µs/1000-row stmt", 1e3)}
 ORDER = ["c-libmysqlclient", "c-mariadb-connc", "go-sql-driver", "go-mysql", "java-connector-j", "java-mariadb-j",
+         "rust-mysql", "rust-sqlx", "dotnet-mysqlconnector", "dotnet-mysql-data", "node-mysql2", "node-mariadb", "node-mysql",
+         "php-mysqli", "php-pdo-mysql", "rb-mysql2", "rb-trilogy",
          "py-mysqlclient", "py-mysql-connector-c", "py-mariadb", "py-pymysql", "py-mysql-connector-pure"]
 
 ap = argparse.ArgumentParser()

@@ -45,6 +45,17 @@ for _d in ("connector-j", "mariadb-j"):
     STACKS["java-" + _d] = ("stacks/java", ["./run", "--driver", _d], True)
 for _d in ("go-sql-driver", "go-mysql"):
     STACKS[_d] = ("stacks/go", ["./runner", "--driver", _d], False)
+# Phase 2. jit=True gets the longer warm-up (V8, YJIT, .NET tiered JIT)
+for _d in ("mysql2", "mariadb", "mysql"):
+    STACKS["node-" + _d] = ("stacks/node", ["/opt/node/bin/node", "runner.mjs", "--driver", _d], True)
+STACKS["php-mysqli"] = ("stacks/php", ["php", "runner.php", "--driver", "mysqli"], False)
+STACKS["php-pdo-mysql"] = ("stacks/php", ["php", "runner.php", "--driver", "pdo"], False)
+for _d in ("mysql2", "trilogy"):
+    STACKS["rb-" + _d] = ("stacks/ruby", ["./run", "--driver", _d], True)
+STACKS["dotnet-mysqlconnector"] = ("stacks/dotnet", ["./run", "--driver", "mysqlconnector"], True)
+STACKS["dotnet-mysql-data"] = ("stacks/dotnet", ["./run", "--driver", "mysql-data"], True)
+for _d in ("mysql", "sqlx"):
+    STACKS["rust-" + _d] = ("stacks/rust", ["./target/release/runner", "--driver", _d], False)
 
 # Hardware counter sets (<= 6 HW counters each so the PMU never multiplexes; NMI watchdog is off)
 EVENTS = {
