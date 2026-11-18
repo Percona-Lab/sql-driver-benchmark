@@ -4,6 +4,8 @@ package bench;
 // Same CLI/env contract as the other runners (SPEC.md section 5).
 
 import java.io.*;
+import java.lang.foreign.*;
+import java.lang.invoke.MethodHandle;
 import java.lang.management.*;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
@@ -57,15 +59,25 @@ public class Runner {
         for (GarbageCollectorMXBean b : ManagementFactory.getGarbageCollectorMXBeans()) { n += b.getCollectionCount(); t += b.getCollectionTime(); }
         return new long[]{n, t};
     }
+    // Process CPU in ns via clock_gettime(CLOCK_PROCESS_CPUTIME_ID) (Java 22+ FFM API).
+    // OperatingSystemMXBean.getProcessCpuTime() only advances in 10 ms clock ticks on Linux.
+    static final MethodHandle CLOCK_GETTIME = Linker.nativeLinker().downcallHandle(
+        Linker.nativeLinker().defaultLookup().find("clock_gettime").orElseThrow(),
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+    static final MemorySegment TS = Arena.global().allocate(16, 8);
+    static long cpuNs() {
+        try { int rc = (int) CLOCK_GETTIME.invokeExact(2, TS); } catch (Throwable t) { throw new RuntimeException(t); }
+        return TS.get(ValueLayout.JAVA_LONG, 0) * 1_000_000_000L + TS.get(ValueLayout.JAVA_LONG, 8);
+    }
     static long cpu0, wall0, srv0, alloc0; static long[] gc0;
     static void begin() throws IOException {
         Files.writeString(Path.of("/proc/self/clear_refs"), "5");
         gc0 = gc(); alloc0 = TM.getCurrentThreadAllocatedBytes(); srv0 = srvTicks();
         perf("enable\n");
-        wall0 = System.nanoTime(); cpu0 = OS.getProcessCpuTime();
+        wall0 = System.nanoTime(); cpu0 = cpuNs();
     }
     static String end(Object ck) throws IOException {
-        long cpu = OS.getProcessCpuTime(), wall = System.nanoTime();
+        long cpu = cpuNs(), wall = System.nanoTime();
         perf("disable\n");
         long s = srvTicks(); long[] g = gc();
         return String.format("{\"cpu_ns\":%d,\"wall_ns\":%d,\"srv_ticks\":%d,\"rss_peak_kb\":%d,\"rss_end_kb\":%d,"
