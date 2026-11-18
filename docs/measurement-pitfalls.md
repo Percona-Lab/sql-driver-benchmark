@@ -42,8 +42,13 @@ certificate match.
 
 ## Not pitfalls, but easy to misread
 
-- **Server pace changes client CPU.** Percona Server converts `JSON` from its binary format on every
-  read (~2 µs/KB), so data arrives in smaller pieces and the client makes more `recv` calls: more client
-  CPU per KB than the same documents from MariaDB. Identical `LONGBLOB` data costs the same on both.
+- **Server pace changes client CPU.** MySQL (and so Percona Server) stores `JSON` in a binary format and
+  converts it back to text, reformatted, on every read: ~1.9 µs/KB server CPU for 100 KB documents against
+  ~0.15 µs/KB for the same bytes as `LONGBLOB`. MariaDB stores `JSON` as text and returns it unchanged.
+  The slower server send means data arrives in smaller pieces and the client makes more `recv` calls, so
+  the same client does 10–30% more CPU per KB reading JSON from Percona Server than from MariaDB, while
+  `LONGBLOB` costs the same on both. Compare drivers against the same server, or use blob data. (This is
+  the cost of whole-document text reads; the binary format has its own benefits: validation on insert,
+  path access without parsing, partial updates.)
 - **"TLS on" without a CA is not cheap TLS.** Both C client libraries load the full system CA bundle on
   every connection when no CA is configured (~3.6 ms vs ~0.7 ms CPU per connect with a CA file).
