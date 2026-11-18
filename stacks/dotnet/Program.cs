@@ -61,10 +61,12 @@ static class P
 
     static DbConnection Connect(string tls = "off", bool sock = false)
     {
+        if (!connector && tls == "verify")
+            throw new NA("MySql.Data cannot verify the server against a CA file alone (SslCa requires SslCert/SslKey too)");
         var cs = new StringBuilder();
         cs.Append(sock ? $"Server={Env("DB_SOCKET")};Protocol=Unix;" : $"Server={Env("DB_HOST", "127.0.0.1")};Port={Env("DB_PORT", "3306")};");
         cs.Append($"User ID={Env("DB_USER", "bench")};Password={Env("DB_PASS", "bench")};Database={Env("DB_NAME", "bench")};Pooling=false;");
-        cs.Append(tls switch { "off" => "SslMode=None;", "on" => "SslMode=Required;", _ => $"SslMode=VerifyFull;SslCa={Env("DB_CA")};" });
+        cs.Append(tls switch { "off" => connector ? "SslMode=None;" : "SslMode=Disabled;", "on" => "SslMode=Required;", _ => $"SslMode=VerifyFull;SslCa={Env("DB_CA")};" });
         if (!connector && ServerPrep) cs.Append("IgnorePrepare=false;");   // MySql.Data ignores Prepare() by default
         var c = Factory.CreateConnection()!; c.ConnectionString = cs.ToString(); c.Open(); return c;
     }
@@ -228,7 +230,7 @@ static class P
             }
         try { Run(rssStart); return 0; }
         catch (NA e) { Console.Error.WriteLine("n/a: " + e.Message); return 3; }
-        catch (Exception e) { Console.Error.WriteLine(e.GetType().Name + ": " + e.Message.Split('\n')[0]); return 1; }
+        catch (Exception e) { var m = e.GetType().Name + ": " + e.Message.Split('\n')[0]; for (var x = e.InnerException; x != null; x = x.InnerException) m += " <- " + x.GetType().Name + ": " + x.Message.Split('\n')[0]; Console.Error.WriteLine(m); return 1; }
     }
     static void Run(long rssStart)
     {

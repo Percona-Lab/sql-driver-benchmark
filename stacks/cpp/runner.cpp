@@ -51,6 +51,8 @@ static sql::Connection* connect_(const std::string& tls, bool sock) {
   o["schema"] = sql::SQLString(E("DB_NAME", "bench"));
   o["OPT_SSL_MODE"] = tls == "off" ? sql::SSL_MODE_DISABLED : tls == "on" ? sql::SSL_MODE_REQUIRED : sql::SSL_MODE_VERIFY_IDENTITY;
   if (tls == "verify") o["sslCA"] = sql::SQLString(E("DB_CA", ""));
+  // Connector/C++ 9.x+ loads mysql_native_password as a plugin; point it at the unpacked Oracle client plugins
+  o["OPT_PLUGIN_DIR"] = sql::SQLString(E("CPP_PLUGIN_DIR", "/opt/oracle/usr/lib/x86_64-linux-gnu/mysql/libmysqlcppconn10/plugin"));
   return d->connect(o);
 #endif
 }
@@ -61,7 +63,10 @@ static std::string cipher(sql::Connection* c) {
   std::string v = r->next() ? S(r->getString(2)) : "";
   return v.empty() ? "none" : v;
 }
-static void exec(sql::Connection* c, const char* q) { std::unique_ptr<sql::Statement> st(c->createStatement()); st->execute(q); }
+static void exec(sql::Connection* c, const char* q) {
+  std::unique_ptr<sql::Statement> st(c->createStatement());
+  if (st->execute(q)) { std::unique_ptr<sql::ResultSet> r(st->getResultSet()); while (r->next()) {} }   // consume, or the next query is out of sync
+}
 
 // Statement configured for buffered (default) or streamed results
 static sql::Statement* stmt_for(sql::Connection* c, bool streamed) {
@@ -197,7 +202,7 @@ static std::string t6(sql::Connection* c) {
     std::unique_ptr<sql::PreparedStatement> ps(c->prepareStatement("INSERT INTO t_bulk (id,a,b,c) VALUES (?,?,?,?)"));
     for (int s0 = 1; s0 <= 1000000; s0 += 1000) {
       for (int i = s0; i < s0 + 1000; i++) { ps->setInt(1, i); ps->setInt(2, i * 3); ps->setString(3, row_b(i)); ps->setDouble(4, i * 0.5); ps->addBatch(); }
-      ps->executeBatch();
+      ps->executeBatch(); ps->clearBatch();   // MariaDB Connector/C++ keeps the batch after executeBatch()
     }
 #else
     throw NA{"Connector/C++ has no batch API"};

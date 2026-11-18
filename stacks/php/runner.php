@@ -85,9 +85,9 @@ class Mysqli_ {
         elseif ($variant === "param") {  // mysqli has no client-side parameters: execute_query = prepare+execute+close
             foreach ($ids as $id) $s += (int)$c->execute_query("SELECT v FROM t_int WHERE id = ?", [$id])->fetch_row()[0];
         } else {
-            $st = $c->prepare("SELECT v FROM t_int WHERE id = ?"); $id = 0; $v = 0;
-            $st->bind_param("i", $id); $st->bind_result($v);
-            foreach ($ids as $id) { $st->execute(); $st->fetch(); $s += $v; $st->free_result(); }
+            $st = $c->prepare("SELECT v FROM t_int WHERE id = ?"); $p = 0; $v = 0;
+            $st->bind_param("i", $p); $st->bind_result($v);   // bound by reference: assign, don't rebind via foreach
+            foreach ($ids as $id) { $p = $id; $st->execute(); $st->fetch(); $s += $v; $st->free_result(); }
             $st->close();
         }
         return $s;
@@ -120,7 +120,7 @@ class Pdo_ {
         return new PDO($dsn, E("DB_USER", "bench"), E("DB_PASS", "bench"), $o);
     }
     function close($c) { $c = null; }
-    function exec($c, $sql) { $c->exec($sql); }
+    function exec($c, $sql) { $c->query($sql)->fetchAll(); }   // consume any result so the connection stays usable
     function rows($c, $sql, $streamed = false, $binary = false) {
         global $TUNED;
         $M = class_exists("Pdo\\Mysql") ? "Pdo\\Mysql::" : "PDO::MYSQL_";

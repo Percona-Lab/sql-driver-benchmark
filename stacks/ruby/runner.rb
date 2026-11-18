@@ -82,7 +82,8 @@ class TrilogyAd
     o = { username: env("DB_USER", "bench"), password: env("DB_PASS", "bench"), database: env("DB_NAME", "bench") }
     sock ? o[:socket] = env("DB_SOCKET") : o.merge!(host: env("DB_HOST", "127.0.0.1"), port: env("DB_PORT", "3306").to_i)
     if tls == "on" then o.merge!(ssl: true, ssl_mode: Trilogy::SSL_REQUIRED_NOVERIFY)
-    elsif tls == "verify" then o.merge!(ssl: true, ssl_mode: Trilogy::SSL_VERIFY_IDENTITY, ssl_ca: env("DB_CA"))
+    elsif tls == "verify"   # trilogy verifies host names only (not IP SANs): connect by name
+      o.merge!(ssl: true, ssl_mode: Trilogy::SSL_VERIFY_IDENTITY, ssl_ca: env("DB_CA")); o[:host] = "localhost" unless sock
     end
     Trilogy.new(o)
   end

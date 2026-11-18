@@ -5,6 +5,8 @@ import path from "node:path";
 import { PerformanceObserver } from "node:perf_hooks";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
+// read a package version from node_modules (some packages' export maps block require("pkg/package.json"))
+const pkgVersion = name => JSON.parse(fs.readFileSync(new URL(`./node_modules/${name}/package.json`, import.meta.url), "utf8")).version;
 
 const rssStartKb = statusKb("VmRSS:");
 const A = { driver: "mysql2", test: "T0", variant: "", config: "default", server: "ps", out: null, warmup: 2, iters: 5, floor: false };
@@ -56,7 +58,7 @@ const tuned = A.config === "tuned";
 
 const Mysql2 = {
   name: "node-mysql2", mod: () => require("mysql2/promise"),
-  lib() { return "mysql2 " + require("mysql2/package.json").version + " (node " + process.version + ")"; },
+  lib() { return "mysql2 " + pkgVersion("mysql2") + " (node " + process.version + ")"; },
   async connect(tls = "off", sock = false) {
     const o = { ...base(sock), jsonStrings: true, rowsAsArray: tuned };
     const t = tlsOpt(tls); if (t) o.ssl = t;
@@ -76,7 +78,7 @@ const Mysql2 = {
 
 const MariaDB = {
   name: "node-mariadb", mod: () => require("mariadb"),
-  lib() { return "mariadb " + require("mariadb/package.json").version + " (node " + process.version + ")"; },
+  lib() { return "mariadb " + pkgVersion("mariadb") + " (node " + process.version + ")"; },
   async connect(tls = "off", sock = false) {
     const o = { ...base(sock), autoJsonMap: false, rowsAsArray: tuned };
     const t = tlsOpt(tls); o.ssl = t || false;
@@ -99,7 +101,7 @@ const MariaDB = {
 
 const Legacy = {
   name: "node-mysql", mod: () => require("mysql"),
-  lib() { return "mysql " + require("mysql/package.json").version + " (node " + process.version + ")"; },
+  lib() { return "mysql " + pkgVersion("mysql") + " (node " + process.version + ")"; },
   connect(tls = "off", sock = false) {
     const o = base(sock); const t = tlsOpt(tls); if (t) o.ssl = t;
     const c = this.mod().createConnection(o);
@@ -115,7 +117,15 @@ const Legacy = {
   execute() { throw new NA("legacy mysql package has no server-side prepared statements"); },
   async *stream(c, sql, binary) {
     if (binary) throw new NA("legacy mysql package has no binary protocol");
-    yield* c.query(sql).stream({ highWaterMark: 1000 });
+    // the legacy package's stream() is an old readable-stream (not async-iterable): use its row events
+    const q = c.query(sql); const buf = []; let done = false, err = null, wake = null;
+    q.on("result", r => { buf.push(r); if (buf.length >= 1000) c.pause(); if (wake) { wake(); wake = null; } })
+     .on("error", e => { err = e; if (wake) wake(); }).on("end", () => { done = true; if (wake) wake(); });
+    while (true) {
+      while (buf.length) yield buf.shift();
+      if (err) throw err; if (done) return;
+      c.resume(); await new Promise(r => (wake = r));
+    }
   },
   escape: (c, s) => c.escape(s),
   async batch(c, rows) { await this.query(c, "INSERT INTO t_bulk (id,a,b,c) VALUES ?", [rows]); },
