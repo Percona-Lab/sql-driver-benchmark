@@ -2,7 +2,8 @@
 # MySQL Connector/C++ 26.10 (Oracle debs unpacked in /opt/oracle) and MariaDB Connector/C++ (built from source
 # against MariaDB Connector/C 3.4 in /opt/mariadb-connc).
 set -euo pipefail
-cd "$(dirname "$0")"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+cd "$HERE"
 MACPP=1.1.9
 if [ ! -f /opt/mariadb-connector-cpp/lib/libmariadbcpp.so ] && [ ! -f /opt/mariadb-connector-cpp/lib64/libmariadbcpp.so ]; then
   cd /usr/local/src && rm -rf mariadb-connector-cpp
@@ -11,8 +12,8 @@ if [ ! -f /opt/mariadb-connector-cpp/lib/libmariadbcpp.so ] && [ ! -f /opt/maria
   cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INSTALL_PREFIX=/opt/mariadb-connector-cpp \
     -DCMAKE_CXX_FLAGS="-fno-omit-frame-pointer" -DCMAKE_C_FLAGS="-fno-omit-frame-pointer" -DWITH_UNIT_TESTS=OFF -DCONC_WITH_UNIT_TESTS=OFF >/dev/null
   cmake --build build -j5 >/dev/null && cmake --install build >/dev/null
-  cd - >/dev/null
 fi
+cd "$HERE"
 MLIB=$(dirname "$(find /opt/mariadb-connector-cpp -name 'libmariadbcpp.so' | head -1)")
 OLIB=/opt/oracle/usr/lib/x86_64-linux-gnu
 MYCPP=$(ls $OLIB/libmysqlcppconn.so.10.* | sed 's/.*\.so\.10\.//')

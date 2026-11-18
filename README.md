@@ -49,10 +49,9 @@ Prisma, Sequelize, Doctrine, ActiveRecord, EF Core, Diesel, …), then async dri
 
 ## Status
 
-- Phase 1 (C, Java, Python, Go): runners validated; full run in progress.
-- `results/` holds an **earlier snapshot taken with perf attached to timed runs and `nohz_full` on the client
-  core**, which inflated connect cost by up to ~40% and point-select cost by a few percent. It will be
-  replaced by the current run.
+- **Phase 1 (C, Go, Python, Java) complete** — report: [reports/phase1.md](reports/phase1.md). Java CPU numbers
+  in `results/raw` are 10 ms-granular (runner clock bug, now fixed); Java is being rerun.
+- **Phase 2 (Node.js, PHP, Ruby, .NET, Rust, C++)**: runners built, smoke tests in progress.
 
 Early observations (to be confirmed by the profiling pass):
 

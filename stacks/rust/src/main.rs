@@ -78,7 +78,7 @@ mod sync_drv {
         b = match tls {
             "off" => b,
             "on" => b.ssl_opts(Some(SslOpts::default().with_danger_accept_invalid_certs(true).with_danger_skip_domain_validation(true))),
-            _ => b.ssl_opts(Some(SslOpts::default().with_root_certs(vec![std::path::PathBuf::from(e("DB_CA", "")).into()]))),
+            _ => b.ssl_opts(Some(SslOpts::default().with_root_cert_path(Some(std::path::PathBuf::from(e("DB_CA", "")))))),
         };
         b.into()
     }
@@ -171,7 +171,7 @@ mod sync_drv {
 mod sqlx_drv {
     use super::*;
     use futures_util::TryStreamExt;
-    use sqlx::{mysql::*, Column, ConnectOptions, Connection, Executor, Row, TypeInfo, ValueRef};
+    use sqlx::{mysql::*, AssertSqlSafe, Column, ConnectOptions, Connection, Executor, Row, TypeInfo, ValueRef};
     fn opts(tls: &str, sock: bool) -> MySqlConnectOptions {
         let mut o = MySqlConnectOptions::new().username(&e("DB_USER", "bench")).password(&e("DB_PASS", "bench")).database(&e("DB_NAME", "bench"));
         o = if sock { o.socket(e("DB_SOCKET", "")) } else { o.host(&e("DB_HOST", "127.0.0.1")).port(e("DB_PORT", "3306").parse().unwrap()) };
@@ -191,7 +191,7 @@ mod sqlx_drv {
                 let mut s = 0i64;
                 for id in ids {
                     s += match v {
-                        "literal" => { let r = sqlx::raw_sql(&format!("SELECT v FROM t_int WHERE id = {id}")).fetch_one(&mut *c).await?; r.try_get::<i32, _>(0)? as i64 }
+                        "literal" => { let r = sqlx::raw_sql(AssertSqlSafe(format!("SELECT v FROM t_int WHERE id = {id}"))).fetch_one(&mut *c).await?; r.try_get::<i32, _>(0)? as i64 }
                         "param" => sqlx::query_scalar::<_, i32>("SELECT v FROM t_int WHERE id = ?").bind(id).persistent(false).fetch_one(&mut *c).await? as i64,
                         _ => sqlx::query_scalar::<_, i32>("SELECT v FROM t_int WHERE id = ?").bind(id).fetch_one(&mut *c).await? as i64,  // cached prepare
                     };
@@ -232,7 +232,7 @@ mod sqlx_drv {
                 let (sql, parse) = t5_sql(v); let (mut ck, mut bytes) = (0i64, 0i64);
                 for _ in 0..20 {
                     ck = 0;
-                    for r in sqlx::raw_sql(&sql).fetch_all(&mut *c).await? {
+                    for r in sqlx::raw_sql(AssertSqlSafe(sql.clone())).fetch_all(&mut *c).await? {
                         let raw = r.try_get_raw(0)?;
                         let doc: &[u8] = <&[u8] as sqlx::Decode<MySql>>::decode(raw).map_err(|e| e.to_string())?;
                         ck += touch(doc); bytes += doc.len() as i64;
@@ -245,12 +245,12 @@ mod sqlx_drv {
                 match v {
                     "sqltext" => for st in (1..=1_000_000i64).step_by(1000) {
                         let vals: Vec<String> = (st..st + 1000).map(|i| format!("({i},{},'{}',{})", i * 3, esc(&row_b(i)), i as f64 * 0.5)).collect();
-                        c.execute(sqlx::raw_sql(&format!("INSERT INTO t_bulk (id,a,b,c) VALUES {}", vals.join(",")))).await?;
+                        c.execute(sqlx::raw_sql(AssertSqlSafe(format!("INSERT INTO t_bulk (id,a,b,c) VALUES {}", vals.join(","))))).await?;
                     },
                     "multiparam" => {
                         let sql = format!("INSERT INTO t_bulk (id,a,b,c) VALUES {}", vec!["(?,?,?,?)"; 1000].join(","));
                         for s0 in (1..=1_000_000i64).step_by(1000) {
-                            let mut q = sqlx::query(&sql);
+                            let mut q = sqlx::query(AssertSqlSafe(sql.clone()));
                             for i in s0..s0 + 1000 { q = q.bind(i).bind(i * 3).bind(row_b(i)).bind(i as f64 * 0.5); }
                             q.execute(&mut *c).await?;
                         }
@@ -261,7 +261,7 @@ mod sqlx_drv {
             }
         }
     }
-    pub async fn exec(c: &mut MySqlConnection, sql: &str) -> R<()> { c.execute(sqlx::raw_sql(sql)).await?; Ok(()) }
+    pub async fn exec(c: &mut MySqlConnection, sql: &str) -> R<()> { c.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await?; Ok(()) }
     pub async fn verify6(c: &mut MySqlConnection) -> R<String> {
         let r = sqlx::query("SELECT COUNT(*), CAST(SUM(a) AS SIGNED), CAST(SUM(CHAR_LENGTH(b)) AS SIGNED) FROM t_bulk").fetch_one(&mut *c).await?;
         Ok(format!("{}:{}:{}", r.try_get::<i64, _>(0)?, r.try_get::<i64, _>(1)?, r.try_get::<i64, _>(2)?))
@@ -300,7 +300,7 @@ fn run(a: &Args, rss_start: i64) -> R<()> {
     let ids: Vec<i32> = if a.test == "T2" { fs::read_to_string(format!("{}/ids_200k.txt", e("DATA_DIR", "/root/bench/data")))?.lines().map(|l| l.parse().unwrap()).collect() } else { vec![] };
     let mut iters = vec![];
     let mut ops = 0i64;
-    let mut perf;
+    let mut perf = Perf::open();
     if a.driver == "sqlx" {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         rt.block_on(async {
