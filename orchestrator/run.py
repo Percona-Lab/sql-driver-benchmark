@@ -54,6 +54,8 @@ for _d in ("mysql2", "trilogy"):
     STACKS["rb-" + _d] = ("stacks/ruby", ["./run", "--driver", _d], True)
 STACKS["dotnet-mysqlconnector"] = ("stacks/dotnet", ["./run", "--driver", "mysqlconnector"], True)
 STACKS["dotnet-mysql-data"] = ("stacks/dotnet", ["./run", "--driver", "mysql-data"], True)
+STACKS["cpp-mysql-connector"] = ("stacks/cpp", ["./run-mysql-connector"], False)
+STACKS["cpp-mariadb"] = ("stacks/cpp", ["./run-mariadb"], False)
 for _d in ("mysql", "sqlx"):
     STACKS["rust-" + _d] = ("stacks/rust", ["./target/release/runner", "--driver", _d], False)
 
