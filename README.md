@@ -62,7 +62,10 @@ Early observations (to be confirmed by the profiling pass):
   its per-row cost for large result sets.
 - MariaDB Connector/C sleeps (`usleep(1)`, ~50 µs on Linux) after every `connect()`, adding wall time
   (not CPU) to each connection.
-- Percona Server returns `JSON` columns ~10% larger than stored (it reformats them).
+- MySQL/Percona Server converts `JSON` from its binary storage format to text on every read: ~13× the
+  server CPU of the same bytes as `LONGBLOB` (100 KB documents), output ~10% larger (reformatted), and the
+  slower send costs the client 10–30% more CPU per KB than reading the same documents from MariaDB, which
+  stores `JSON` as text. A storage-format trade-off; analysing it further is out of scope here.
 
 ## Layout
 
