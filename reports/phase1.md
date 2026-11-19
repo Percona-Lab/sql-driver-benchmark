@@ -1,5 +1,7 @@
 # Phase 1 report — C, Go, Java, Python
 
+> **AI-generated results.** This benchmark was designed, run and analyzed with an AI assistant (Claude). Results and findings have been spot-checked by a person, but not every number and explanation has been verified in detail, and some may be wrong. The code and raw data are published so you can verify anything here; please report problems as [issues](https://github.com/Percona-Lab/sql-driver-benchmark/issues).
+
 Run: 2026-11-17 23:09 → 2026-11-18 19:20 UTC on one bare-metal host (EPYC 4245P, client alone on an
 isolated core, 3.9 GHz fixed). Servers: Percona Server 9.7.2-3 and MariaDB 12.3.4, identical
 configuration. Method: [SPEC.md](../SPEC.md); host pitfalls fixed before this run: [measurement-pitfalls](../docs/measurement-pitfalls.md).

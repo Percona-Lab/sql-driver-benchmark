@@ -1,5 +1,7 @@
 # SQL driver benchmark
 
+> **AI-generated results.** This benchmark was designed, run and analyzed with an AI assistant (Claude). Results and findings have been spot-checked by a person, but not every number and explanation has been verified in detail, and some may be wrong. The code and raw data are published so you can verify anything here; please report problems as [issues](https://github.com/Percona-Lab/sql-driver-benchmark/issues).
+
 Measures the **client-side cost of database drivers** — CPU time, memory, hardware counters — across
 programming languages, and the extra cost of frameworks built on them (SQLAlchemy, Hibernate, GORM, …).
 It is not a database benchmark: the server configuration is fixed and identical for every driver, and
