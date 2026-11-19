@@ -6,6 +6,8 @@ It is not a database benchmark: the server configuration is fixed and identical 
 only driver/framework options vary. The first round covers **MySQL (Percona Server 9.7 LTS) and
 MariaDB 12.3 LTS**; other databases will follow.
 
+**Interactive results: https://percona-lab.github.io/sql-driver-benchmark/**
+
 Full method: [SPEC.md](SPEC.md). Host-setup distortions we found and fixed: [docs/measurement-pitfalls.md](docs/measurement-pitfalls.md). Stack inventory and tuned options: [stacks.yaml](stacks.yaml).
 
 ## What is measured
@@ -64,6 +66,12 @@ Early observations (to be confirmed by the profiling pass):
   server CPU of the same bytes as `LONGBLOB` (100 KB documents), output ~10% larger (reformatted), and the
   slower send costs the client 10–30% more CPU per KB than reading the same documents from MariaDB, which
   stores `JSON` as text. A storage-format trade-off; analysing it further is out of scope here.
+
+## Updating the results page
+
+`docs/` is the GitHub Pages site. After a run: `python3 orchestrator/report.py results/raw > s.json`,
+`python3 orchestrator/artifact_data.py s.json docs/data/cells.json`, and copy `reports/notes.json` to `docs/data/`.
+Notes are rules in `reports/notes.json` matched against server, driver, test, variant and config.
 
 ## Layout
 

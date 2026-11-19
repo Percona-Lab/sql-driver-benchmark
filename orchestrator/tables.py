@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
 """Markdown pivot tables from report.py output: one table per test, rows = stack/config, columns = variants,
 cells = client CPU per op as 'ps / maria'. usage: tables.py summary.json [--tests T1,T3] [--metric cpu_ns_op]"""
-import argparse, json
+import argparse, json, os, re
 from collections import defaultdict
+
+SUP = str.maketrans("0123456789,", "⁰¹²³⁴⁵⁶⁷⁸⁹˒")
+NOTES = json.load(open(os.path.join(os.path.dirname(__file__), "..", "reports", "notes.json")))
+
+
+def notes_for(r):
+    """1-based note numbers that apply to a summary row (same rules as the report artifact)."""
+    out = []
+    for i, n in enumerate(NOTES, 1):
+        if "auto" in n:
+            if r.get("cv_pct", 0) > 5 and r["test"] != "T0":
+                out.append(i)
+        elif all(re.fullmatch(p, str(r.get(k, ""))) for k, p in n["match"].items()):
+            out.append(i)
+    return out
 
 UNIT = {"T0": ("ms", 1e6), "T1": ("µs/connect", 1e3), "T2": ("µs/query", 1e3), "T3": ("ns/row", 1),
         "T4": ("ns/cell", 1), "T5": ("ns/KB", 1), "T6": ("µs/1000-row stmt", 1e3)}
@@ -32,6 +47,7 @@ for t in a.tests.split(","):
     print(f"\n### {t} — client CPU, {unit} (Percona / MariaDB)\n")
     print("| stack | config | " + " | ".join(vs) + " |")
     print("|---|---|" + "---|" * len(vs))
+    used = set()
     for st, cfg in stacks:
         out = []
         for v in vs:
@@ -39,8 +55,17 @@ for t in a.tests.split(","):
             parts = []
             for srv in ("ps", "maria"):
                 r = c.get(srv)
-                if not r: parts.append("–")
-                elif "status" in r: parts.append("n/a" if r["status"] == "n/a" else "FAIL")
-                else: parts.append(f"{r[a.metric] / div:,.3g}" if r[a.metric] / div < 100 else f"{r[a.metric] / div:,.0f}")
+                if not r: parts.append("–"); continue
+                ns = notes_for(r); used.update(ns)
+                mark = ",".join(map(str, ns)).translate(SUP)
+                if "status" in r: parts.append(("n/a" if r["status"] == "n/a" else "FAIL") + mark)
+                else:
+                    v_ = r[a.metric] / div
+                    parts.append((f"{v_:,.3g}" if v_ < 100 else f"{v_:,.0f}") + mark)
             out.append(" / ".join(parts))
         print(f"| {st} | {cfg} | " + " | ".join(out) + " |")
+    if used:
+        print()
+        for i in sorted(used):
+            n = NOTES[i - 1]
+            print(f"{str(i).translate(SUP)} **{n['title']}.** {n['text']}  ")
