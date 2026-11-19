@@ -185,7 +185,25 @@ def main
   meta[:rss_baseline_kb] = status_kb("VmRSS:")   # after load + connect + setup, before warm-up
   fn = A[:floor] ? method(:floor_) : method({ "T1" => :t1, "T2" => :t2, "T3" => :t3, "T4" => :t4, "T5" => :t5, "T6" => :t6 }[A[:test]])
   perf_open; iters = []
-  (A[:warmup] + A[:iters]).times do |i|
+  # Adaptive warm-up (YJIT): warm up until the last 3 iterations are within 5% of each other (min --warmup, cap WARMUP_CAP iterations / WARMUP_CAP_S seconds)
+  start = 0
+  if ENV["ADAPTIVE_WARMUP"]
+    w = []; t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC); cap = env("WARMUP_CAP", "40").to_i; cap_s = env("WARMUP_CAP_S", "120").to_f
+    meta[:warmup_stable] = true
+    loop do
+      D.exec(c, "TRUNCATE TABLE t_bulk") if A[:test] == "T6"
+      a = Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID, :nanosecond); fn.(c)
+      w << Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID, :nanosecond) - a
+      if w.size >= [3, A[:warmup]].max
+        l = w.last(3).sort; break if l[2] - l[0] <= 0.05 * l[1]
+      end
+      if w.size >= cap || Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0 > cap_s
+        meta[:warmup_stable] = false; break
+      end
+    end
+    A[:warmup] = w.size; start = w.size; meta[:warmup_adaptive] = true
+  end
+  (start...(A[:warmup] + A[:iters])).each do |i|
     D.exec(c, "TRUNCATE TABLE t_bulk") if A[:test] == "T6"
     (fn.(c); next) if i < A[:warmup]
     m = Meter.new; m.begin_; ck = fn.(c); r = m.end_(ck)

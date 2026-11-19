@@ -253,7 +253,23 @@ static class P
         meta["rss_baseline_kb"] = StatusKb("VmRSS:");   // after load + connect + setup, before warm-up
         Func<DbConnection, object> fn = floor ? Floor : test switch { "T1" => T1, "T2" => T2, "T3" => T3, "T4" => T4, "T5" => T5, _ => T6 };
         PerfOpen();
-        for (int i = 0; i < warmup + iters; i++)
+        // Adaptive warm-up (JIT runtimes): warm up until the last 3 iterations are within 5% of each other (min --warmup, cap WARMUP_CAP iterations / WARMUP_CAP_S seconds)
+        int start = 0;
+        if (Env("ADAPTIVE_WARMUP") != "")
+        {
+            var w = new List<long>(); var t0 = Stopwatch.GetTimestamp();
+            int cap = int.Parse(Env("WARMUP_CAP", "40")); double capS = double.Parse(Env("WARMUP_CAP_S", "120"));
+            meta["warmup_stable"] = true;
+            while (true)
+            {
+                if (test == "T6") Cmd(c, "TRUNCATE TABLE t_bulk").ExecuteNonQuery();
+                long a = CpuNs(); fn(c); w.Add(CpuNs() - a);
+                if (w.Count >= Math.Max(3, warmup)) { var l = w.Skip(w.Count - 3).OrderBy(x => x).ToArray(); if (l[2] - l[0] <= 0.05 * l[1]) break; }
+                if (w.Count >= cap || Stopwatch.GetElapsedTime(t0).TotalSeconds > capS) { meta["warmup_stable"] = false; break; }
+            }
+            warmup = w.Count; start = w.Count; meta["warmup_adaptive"] = true;
+        }
+        for (int i = start; i < warmup + iters; i++)
         {
             if (test == "T6") Cmd(c, "TRUNCATE TABLE t_bulk").ExecuteNonQuery();
             if (i < warmup) { fn(c); continue; }

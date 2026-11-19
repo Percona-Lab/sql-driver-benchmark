@@ -260,7 +260,20 @@ async function main() {
   const fn = A.floor ? floor : { T1: t1, T2: t2, T3: t3, T4: t4, T5: t5, T6: t6 }[A.test];
   perfOpen();
   const iters = [];
-  for (let i = 0; i < A.warmup + A.iters; i++) {
+  // Adaptive warm-up (JIT runtimes): warm up until the last 3 iterations are within 5% of each other (min --warmup, cap WARMUP_CAP iterations / WARMUP_CAP_S seconds)
+  let start = 0;
+  if (process.env.ADAPTIVE_WARMUP) {
+    const w = [], t0 = Date.now(), cap = +E("WARMUP_CAP", "40"), capMs = 1000 * +E("WARMUP_CAP_S", "120");
+    meta.warmup_stable = true;
+    for (;;) {
+      if (A.test === "T6") await D.query(c, "TRUNCATE TABLE t_bulk");
+      const a = cpuNs(); await fn(c); w.push(cpuNs() - a);
+      if (w.length >= Math.max(3, A.warmup)) { const l = w.slice(-3).sort((x, y) => x - y); if (l[2] - l[0] <= 0.05 * l[1]) break; }
+      if (w.length >= cap || Date.now() - t0 > capMs) { meta.warmup_stable = false; break; }
+    }
+    A.warmup = w.length; start = w.length; meta.warmup_adaptive = true;
+  }
+  for (let i = start; i < A.warmup + A.iters; i++) {
     if (A.test === "T6") await D.query(c, "TRUNCATE TABLE t_bulk");
     if (i < A.warmup) { await fn(c); continue; }
     const m = new Meter(); m.begin(); const ck = await fn(c); const r = m.end(ck);

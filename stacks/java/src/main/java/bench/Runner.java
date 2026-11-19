@@ -20,6 +20,7 @@ public class Runner {
     static int warmup = 2, iters = 5;
     static boolean floor = false;
     static long ops;
+    static boolean adaptive = false, warmStable = true;
     static boolean mariadb;
 
     static class NA extends RuntimeException { NA(String m) { super(m); } }
@@ -354,7 +355,24 @@ public class Runner {
 
         long rssBase = statusKb("VmRSS:");   // after load + connect + setup, before warm-up
         perfOpen();
-        for (int i = 0; i < warmup + iters; i++) {
+        // Adaptive warm-up (JIT runtimes): warm up until the last 3 iterations are within 5% of each other (min --warmup, cap WARMUP_CAP iterations / WARMUP_CAP_S seconds)
+        boolean stable = true;
+        if (System.getenv("ADAPTIVE_WARMUP") != null) {
+            List<Long> w = new ArrayList<>(); long t0 = System.nanoTime();
+            int cap = Integer.parseInt(env("WARMUP_CAP", "40")); long capNs = Long.parseLong(env("WARMUP_CAP_S", "120")) * 1_000_000_000L;
+            while (true) {
+                if (test.equals("T6")) try (Statement s = c.createStatement()) { s.execute("TRUNCATE TABLE t_bulk"); }
+                long a = cpuNs(); step(c); w.add(cpuNs() - a);
+                int n = w.size();
+                if (n >= Math.max(3, warmup)) {
+                    List<Long> l3 = new ArrayList<>(w.subList(n - 3, n)); Collections.sort(l3);
+                    if ((l3.get(2) - l3.get(0)) <= 0.05 * l3.get(1)) break;
+                }
+                if (n >= cap || System.nanoTime() - t0 > capNs) { stable = false; break; }
+            }
+            warmup = w.size(); adaptive = true; warmStable = stable;
+        }
+        for (int i = adaptive ? warmup : 0; i < warmup + iters; i++) {
             if (test.equals("T6")) try (Statement s = c.createStatement()) { s.execute("TRUNCATE TABLE t_bulk"); }
             if (i < warmup) { step(c); continue; }
             begin(); String ck = step(c); String rec = end(ck);
@@ -365,7 +383,7 @@ public class Runner {
             }
             recs.add(rec);
         }
-        meta.append(String.format(",\"tls\":\"%s\",\"ops_per_iter\":%d,\"warmup\":%d,\"rss_baseline_kb\":%d", tlsName, ops, warmup, rssBase));
+        meta.append(String.format(",\"tls\":\"%s\",\"ops_per_iter\":%d,\"warmup\":%d,\"rss_baseline_kb\":%d,\"warmup_adaptive\":%b,\"warmup_stable\":%b", tlsName, ops, warmup, rssBase, adaptive, warmStable));
         write(meta, recs);
         c.close();
     }

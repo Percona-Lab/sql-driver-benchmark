@@ -109,8 +109,12 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
         env["DB_USER"] = "bench_ed"
     warmup = (5 if jit else 2) if test != "T1" else (3 if jit else 1)
     iters = ITERS[test]
+    if jit and test != "T0":
+        env["ADAPTIVE_WARMUP"] = "1"   # runner warms up until stable (SPEC section 6)
+        warmup, iters = 3, iters + 2
     if args.quick:
         warmup, iters = 0, 1
+        env.pop("ADAPTIVE_WARMUP", None)
     outdir = f"{args.results}/{server}/{stack}"
     os.makedirs(outdir, exist_ok=True)
     label = f"{test}-{variant}-{config}-{rep}".replace("/", "_")
