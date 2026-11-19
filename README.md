@@ -49,9 +49,8 @@ Prisma, Sequelize, Doctrine, ActiveRecord, EF Core, Diesel, …), then async dri
 
 ## Status
 
-- **Phase 1 (C, Go, Python, Java) complete** — report: [reports/phase1.md](reports/phase1.md). Java CPU numbers
-  in `results/raw` are 10 ms-granular (runner clock bug, now fixed); Java is being rerun.
-- **Phase 2 (Node.js, PHP, Ruby, .NET, Rust, C++)**: runners built, smoke tests in progress.
+- **Phase 1 (C, Go, Python, Java) complete** — report: [reports/phase1.md](reports/phase1.md), including the Java rerun.
+- **Phase 2 (Node.js, PHP, Ruby, .NET, Rust, C++)**: full run in progress.
 
 Early observations (to be confirmed by the profiling pass):
 

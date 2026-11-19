@@ -1,4 +1,4 @@
-# Phase 1 report — C, Go, Python (Java pending)
+# Phase 1 report — C, Go, Java, Python
 
 Run: 2026-11-17 23:09 → 2026-11-18 19:20 UTC on one bare-metal host (EPYC 4245P, client alone on an
 isolated core, 3.9 GHz fixed). Servers: Percona Server 9.7.2-3 and MariaDB 12.3.4, identical
@@ -8,9 +8,10 @@ configuration. Method: [SPEC.md](../SPEC.md); host pitfalls fixed before this ru
   attached) + 2 hardware-counter processes; every iteration checksum-verified. **0 failures.**
 - Repeatability: median coefficient of variation across the 5 processes **0.47%**; 95% of cells under 2.6%
   (outliers are T0, a single cold start).
-- **Java is pending.** The Java runner read process CPU from `OperatingSystemMXBean`, which only advances in
-  10 ms ticks on Linux, so its per-op numbers are too coarse. Fixed (ns `clock_gettime` via FFM); Java is being
-  rerun and is left out of the tables below.
+- **Java was rerun** (2026-11-18 20:21 → 2026-11-19 03:15 UTC) after a runner fix: the first run read process CPU
+  from `OperatingSystemMXBean`, which only advances in 10 ms ticks on Linux. Java now uses `clock_gettime` via FFM.
+  Java cells show more run-to-run spread than the others (up to ~13%, JIT and GC); read small Java differences
+  with that in mind.
 - Raw results: [`results/raw/`](../results/raw), aggregate: [`results/summary-phase1.json`](../results/summary-phase1.json).
 
 All numbers are **client CPU per operation** (user + kernel, whole process), shown as **Percona / MariaDB**.
@@ -69,6 +70,15 @@ All numbers are **client CPU per operation** (user + kernel, whole process), sho
   (1.2–3.1 ms) and `executemany` (2.1–4.7 ms). **MariaDB Connector/Python `executemany`: 0.6 ms on MariaDB (bulk
   protocol) but 13.7 ms on Percona** (falls back to one execute per row).
 
+**Java**
+- MariaDB Connector/J reads 1M integers at 17–21 ns/row, cheaper than the C libraries; Connector/J needs
+  148–265 ns/row. On wide rows MariaDB Connector/J is 9–32 ns/cell vs Connector/J 54–97.
+- Point select: MariaDB Connector/J 4.3 µs per query (C level); Connector/J 6.2–6.9 µs.
+- Connector/J's verified TLS costs 4.6 ms per connect vs 1.8 ms unverified; MariaDB Connector/J ~1.85 ms either way.
+- Connector/J `executeBatch()` on defaults: 5.7 ms per 1,000 rows (one statement per row); with
+  `rewriteBatchedStatements`: 1.6 ms.
+- JVM start + connect: 180–340 ms of CPU and 67–77 MB resident before any work.
+
 **Footprint (T0)**
 - Startup + connect: Go 0.1 ms / ~10 MB RSS, C 0.4–0.7 ms / 8–11 MB, Python 0.9–5.6 ms / 23–36 MB
   (PyMySQL the largest).
@@ -90,6 +100,10 @@ All numbers are **client CPU per operation** (user + kernel, whole process), sho
 | go-sql-driver | tuned | 17.2 / 14.5 | 31.7 / 26.6 | 285 / 2,557 | 233 / 2,562 | 395 / 2,618 | 236 / 2,622 | n/a / n/a |
 | go-mysql | default | 25 / 22.4 | 39.4 / 34.7 | 314 / 2,606 | 265 / 2,608 | 452 / 2,690 | 292 / 2,701 | n/a / 69.5 |
 | go-mysql | tuned | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a |
+| java-connector-j | default | n/a / n/a | 72.9 / 70.9 | 1,848 / 7,763 | n/a / n/a | 4,578 / 10,634 | n/a / n/a | n/a / n/a |
+| java-connector-j | tuned | n/a / n/a | 57.4 / 54 | 1,868 / 7,645 | n/a / n/a | 4,638 / 9,916 | n/a / n/a | n/a / n/a |
+| java-mariadb-j | default | 43.9 / 40 | 66.5 / 58.9 | 1,839 / 7,352 | n/a / n/a | 1,854 / 7,055 | n/a / n/a | n/a / 155 |
+| java-mariadb-j | tuned | 59.2 / 53.2 | 79.8 / 70 | 1,973 / 7,435 | n/a / n/a | 2,031 / 7,235 | n/a / n/a | n/a / 166 |
 | py-mysqlclient | default | 29.6 / 28.9 | 46.6 / 44.4 | 3,684 / 3,954 | n/a / n/a | 816 / 1,103 | n/a / n/a | n/a / n/a |
 | py-mysql-connector-c | default | 42.4 / 41.7 | 65 / 62.1 | 3,730 / 4,004 | n/a / n/a | 856 / 1,148 | n/a / n/a | n/a / n/a |
 | py-mariadb | default | 16.2 / 15 | 31.8 / 29.1 | 3,637 / 3,867 | n/a / n/a | 718 / 1,011 | n/a / n/a | n/a / 76 |
@@ -106,6 +120,10 @@ All numbers are **client CPU per operation** (user + kernel, whole process), sho
 | go-sql-driver | tuned | 5.94 / 6.08 | 6.3 / 6.21 | 6.04 / 6.26 |
 | go-mysql | default | 5.76 / 5.89 | 5.84 / 5.7 | 13.2 / 13.1 |
 | go-mysql | tuned | n/a / n/a | n/a / n/a | n/a / n/a |
+| java-connector-j | default | 6.9 / 6.8 | 6.21 / 6.05 | 6.19 / 6.12 |
+| java-connector-j | tuned | 6.7 / 6.65 | 6.05 / 5.83 | 6.07 / 5.87 |
+| java-mariadb-j | default | 4.29 / 4.21 | 4.28 / 4.2 | 4.33 / 4.2 |
+| java-mariadb-j | tuned | 4.29 / 4.21 | 4.32 / 4.17 | 4.36 / 4.2 |
 | py-mysqlclient | default | 6.4 / 6.36 | n/a / n/a | 6.99 / 6.95 |
 | py-mysql-connector-c | default | 10.7 / 10.7 | 14.5 / 14.5 | 11.6 / 11.6 |
 | py-mariadb | default | 5.92 / 5.98 | 13.1 / 12 | 6.66 / 6.69 |
@@ -122,6 +140,10 @@ All numbers are **client CPU per operation** (user + kernel, whole process), sho
 | go-sql-driver | tuned | n/a / n/a | 85.8 / 85.6 | n/a / n/a | n/a / n/a | 101 / 101 | 102 / 107 |
 | go-mysql | default | 69.3 / 69.8 | 65.7 / 65.9 | 83.4 / 83.1 | 84.3 / 85.7 | 78.7 / 81.4 | 80.6 / 83.9 |
 | go-mysql | tuned | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a |
+| java-connector-j | default | 265 / 262 | 148 / 147 | 221 / 220 | 329 / 326 | 149 / 150 | 167 / 169 |
+| java-connector-j | tuned | 188 / 187 | 124 / 123 | 218 / 211 | 311 / 235 | 123 / 123 | 142 / 150 |
+| java-mariadb-j | default | 21.5 / 21 | 21.3 / 20.7 | 20.5 / 20.4 | 51.3 / 41.3 | 17 / 23.7 | 63.5 / 40.4 |
+| java-mariadb-j | tuned | 20 / 20.1 | 22.6 / 21.3 | 20 / 20.4 | 61.5 / 41.6 | 17.1 / 18.6 | 62.6 / 44.3 |
 | py-mysqlclient | default | n/a / n/a | n/a / n/a | 218 / 219 | 260 / 260 | 320 / 319 | 425 / 427 |
 | py-mysql-connector-c | default | 1,300 / 1,313 | 1,291 / 1,321 | 500 / 506 | 575 / 585 | 989 / 999 | 1,102 / 1,118 |
 | py-mariadb | default | 306 / 305 | 400 / 409 | 196 / 197 | 196 / 197 | 396 / 401 | 402 / 405 |
@@ -138,6 +160,10 @@ All numbers are **client CPU per operation** (user + kernel, whole process), sho
 | go-sql-driver | tuned | 35.4 / 35.3 | 50.4 / 51 | 48.3 / 48.5 | 61.4 / 61.6 |
 | go-mysql | default | 8.96 / 8.79 | 21.8 / 21.9 | 53.5 / 53 | 25.6 / 25.9 |
 | go-mysql | tuned | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a |
+| java-connector-j | default | 53.7 / 53 | 67.7 / 69.2 | 76.2 / 72.7 | 96.6 / 94.5 |
+| java-connector-j | tuned | 51.9 / 50.3 | 69.1 / 69.7 | 75.2 / 70.9 | 92 / 92.1 |
+| java-mariadb-j | default | 8.77 / 10.2 | 14 / 13.4 | 21.3 / 21.3 | 32.2 / 30.9 |
+| java-mariadb-j | tuned | 10.4 / 11.7 | 11.5 / 13 | 21.6 / 21.1 | 30.7 / 31.5 |
 | py-mysqlclient | default | n/a / n/a | 66.8 / 66.9 | n/a / n/a | 197 / 196 |
 | py-mysql-connector-c | default | 107 / 108 | 95.4 / 95.5 | 262 / 261 | 242 / 241 |
 | py-mariadb | default | 61.6 / 61.5 | 110 / 109 | 83.2 / 81.3 | 148 / 148 |
@@ -154,6 +180,10 @@ All numbers are **client CPU per operation** (user + kernel, whole process), sho
 | go-sql-driver | tuned | 185 / 147 | 373 / 387 | 149 / 148 | 332 / 254 | 257 / 257 | 522 / 477 | 479 / 484 | 264 / 199 | 199 / 199 | 16,378 / 17,576 |
 | go-mysql | default | 237 / 225 | 439 / 403 | 223 / 226 | 349 / 265 | 266 / 268 | 424 / 380 | 377 / 382 | 251 / 204 | 196 / 201 | 14,796 / 16,069 |
 | go-mysql | tuned | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a |
+| java-connector-j | default | 186 / 197 | 417 / 443 | 185 / 187 | 428 / 518 | 538 / 531 | 2,409 / 1,594 | 1,594 / 1,542 | 403 / 528 | 506 / 481 | n/a / n/a |
+| java-connector-j | tuned | 183 / 192 | 421 / 449 | 184 / 185 | 413 / 493 | 539 / 541 | 1,736 / 1,809 | 1,660 / 1,615 | 391 / 524 | 492 / 495 | n/a / n/a |
+| java-mariadb-j | default | 191 / 191 | 419 / 451 | 182 / 185 | 329 / 397 | 408 / 398 | 1,630 / 1,372 | 1,317 / 1,259 | 259 / 447 | 431 / 431 | n/a / n/a |
+| java-mariadb-j | tuned | 189 / 191 | 421 / 446 | 181 / 183 | 329 / 398 | 434 / 403 | 1,643 / 1,298 | 1,310 / 1,344 | 261 / 439 | 439 / 428 | n/a / n/a |
 | py-mysqlclient | default | 351 / 354 | 477 / 486 | 253 / 254 | 463 / 462 | 349 / 350 | 736 / 708 | 516 / 521 | 457 / 349 | 232 / 232 | 3,962 / 4,372 |
 | py-mysql-connector-c | default | 376 / 386 | 501 / 499 | 274 / 269 | 515 / 509 | 399 / 393 | 1,604 / 1,599 | 1,346 / 1,350 | 519 / 403 | 281 / 281 | 3,999 / 4,296 |
 | py-mariadb | default | 324 / 440 | 455 / 567 | 331 / 330 | 410 / 522 | 406 / 404 | 548 / 757 | 571 / 573 | 274 / 378 | 261 / 253 | 3,990 / 4,406 |
@@ -170,9 +200,12 @@ All numbers are **client CPU per operation** (user + kernel, whole process), sho
 | go-sql-driver | tuned | 225 / 226 | 258 / 257 | n/a / n/a |
 | go-mysql | default | 277 / 269 | 282 / 280 | n/a / n/a |
 | go-mysql | tuned | n/a / n/a | n/a / n/a | n/a / n/a |
+| java-connector-j | default | 484 / 459 | 292 / 230 | 5,654 / 5,605 |
+| java-connector-j | tuned | 345 / 296 | 322 / 237 | 1,572 / 1,548 |
+| java-mariadb-j | default | 158 / 159 | 104 / 111 | 4,024 / 189 |
+| java-mariadb-j | tuned | 116 / 114 | 102 / 115 | 3,959 / 195 |
 | py-mysqlclient | default | 1,811 / 1,837 | 813 / 821 | 2,326 / 2,351 |
 | py-mysql-connector-c | default | 1,208 / 1,219 | 806 / 814 | 2,079 / 2,098 |
 | py-mariadb | default | 1,351 / 1,396 | 608 / 612 | 13,733 / 608 |
 | py-pymysql | default | 1,598 / 1,610 | 781 / 778 | 2,151 / 2,171 |
 | py-mysql-connector-pure | default | 3,143 / 3,177 | 959 / 965 | 4,628 / 4,729 |
-
