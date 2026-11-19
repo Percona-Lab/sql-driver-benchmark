@@ -27,7 +27,7 @@ function srvTicks() {
 }
 $CTL = $ACK = null;
 function perfOpen() { global $CTL, $ACK; if (getenv("PERF_CTL") && getenv("PERF_ACK")) { $CTL = fopen(getenv("PERF_CTL"), "w"); $ACK = fopen(getenv("PERF_ACK"), "r"); } }
-function perf($cmd) { global $CTL, $ACK; if (!$CTL) return; fwrite($CTL, $cmd); fflush($CTL); fread($ACK, 8); }
+function perf($cmd) { global $CTL, $ACK; if (!$CTL) return; fwrite($CTL, $cmd); fflush($CTL); fgets($ACK); }   // perf answers "ack\n": fread(8) would block for 8 bytes
 function cpuNs() { $r = getrusage(); return ($r["ru_utime.tv_sec"] + $r["ru_stime.tv_sec"]) * 1000000000 + ($r["ru_utime.tv_usec"] + $r["ru_stime.tv_usec"]) * 1000; }
 class Meter {
     function begin() { file_put_contents("/proc/self/clear_refs", "5"); $this->rss = statusKb("VmRSS:"); $this->gc = gc_status()["runs"]; $this->srv = srvTicks(); perf("enable\n"); $this->wall = hrtime(true); $this->cpu = cpuNs(); }

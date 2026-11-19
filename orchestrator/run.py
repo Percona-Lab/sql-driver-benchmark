@@ -132,7 +132,10 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
                + argv + ["--test", test, "--variant", base, "--config", config, "--server", server,
                          "--warmup", str(warmup), "--iters", str(iters), "--out", res])
         t0 = time.time()
-        p = subprocess.run(cmd, cwd=f"{SRC}/{cwd}", env=env, capture_output=True, text=True, timeout=args.timeout)
+        try:
+            p = subprocess.run(cmd, cwd=f"{SRC}/{cwd}", env=env, capture_output=True, text=True, timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            return "fail", f"timeout after {args.timeout} s"
     if p.returncode == 3:
         return "n/a", (p.stderr.strip().splitlines() or ["?"])[-1].removeprefix("n/a: ")
     if p.returncode != 0:
