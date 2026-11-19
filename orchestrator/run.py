@@ -11,7 +11,7 @@ usage: run.py --stacks c-libmysqlclient,c-mariadb-connc [--servers ps,maria]
 import argparse, json, os, re, subprocess, sys, tempfile, time
 
 ROOT = "/root/bench"
-SRC = f"{ROOT}/src"
+SRC = os.environ.get("BENCH_SRC", f"{ROOT}/src")   # memory pass runs from a second checkout
 RESULTS = f"{ROOT}/results"
 CLIENT_CPU = "5"
 
