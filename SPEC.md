@@ -117,7 +117,13 @@ on the native parts of the others.
 ## 6. Run protocol
 
 - Orchestrator (`orchestrator/run.py`) runs each (stack, server, test, variant, config) as **5 fresh processes**; median of the per-process medians is reported.
-- Warm-up: 2 iterations for AOT/native/interpreted stacks; for JIT stacks (JVM, .NET, Node) warm-up runs until the per-iteration CPU changes by < 2% for 3 iterations (cap 30). The warm-up length is reported.
+- Warm-up: results are **steady state**. Native and interpreted stacks (C, C++, Rust, Go, CPython, PHP without JIT) get 2
+  warm-up iterations; their per-iteration CPU varies by under 1% within a process. JIT runtimes (JVM, .NET, Node/V8,
+  Ruby YJIT) warm up adaptively: iterations continue until the last 3 agree within 5% of their median (minimum 3, cap
+  40 iterations or 120 s), then 2 more measured iterations than the native stacks. Each result records the warm-up
+  count and whether it stabilised (`warmup`, `warmup_adaptive`, `warmup_stable`); an unstable one gets a note.
+  Introduced 2026-11-19 after the first Java run showed 26–45% spread within a process with a fixed 5-iteration
+  warm-up; Java, .NET and Node were rerun with it.
 - A cell is accepted when the coefficient of variation across the 5 processes is ≤ 3%; otherwise it is re-run once and flagged if still noisy.
 - CPU frequency, temperature and steal-free state are checked before each batch.
 
