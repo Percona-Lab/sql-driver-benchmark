@@ -39,7 +39,8 @@ def _perf(cmd):
 class Iter:
     def begin(self):
         with open("/proc/self/clear_refs", "w") as f:
-            f.write("5")
+            f.write("5")                      # resets VmHWM to the current RSS
+        self.rss0 = status_kb("VmRSS:")       # memory before the work
         self.gc0 = sum(s["collections"] for s in gc.get_stats())
         self.srv0 = srv_ticks()
         _perf(b"enable\n")
@@ -52,7 +53,7 @@ class Iter:
         s = srv_ticks()
         return {"cpu_ns": cpu - self.cpu0, "wall_ns": wall - self.wall0,
                 "srv_ticks": s - self.srv0 if s >= 0 and self.srv0 >= 0 else -1,
-                "rss_peak_kb": status_kb("VmHWM:"), "rss_end_kb": status_kb("VmRSS:"), "checksum": str(checksum),
+                "rss_start_kb": self.rss0, "rss_peak_kb": status_kb("VmHWM:"), "rss_end_kb": status_kb("VmRSS:"), "checksum": str(checksum),
                 "gc_count": sum(st["collections"] for st in gc.get_stats()) - self.gc0}
 
 

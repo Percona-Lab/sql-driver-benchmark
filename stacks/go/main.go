@@ -236,6 +236,7 @@ func run(rssStart int64) error {
 		return "", fmt.Errorf("unknown test %s", fTest)
 	}
 
+	meta["rss_baseline_kb"] = statusKB("VmRSS:") // after load + connect + setup, before warm-up
 	perfOpen()
 	var iters []IterRec
 	for i := 0; i < fWarmup+fIters; i++ {

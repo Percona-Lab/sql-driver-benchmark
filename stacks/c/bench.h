@@ -13,12 +13,12 @@
 #include <unistd.h>
 
 typedef struct {
-  long long cpu_ns, wall_ns, srv_ticks, rss_peak_kb, rss_end_kb;
+  long long cpu_ns, wall_ns, srv_ticks, rss_start_kb, rss_peak_kb, rss_end_kb;
   char checksum[96];
 } iter_t;
 
 static int b_perf_ctl = -1, b_perf_ack = -1;
-static long long b_cpu0, b_wall0, b_srv0;
+static long long b_cpu0, b_wall0, b_srv0, b_rss0;
 
 static long long b_clock(clockid_t c) {
   struct timespec ts; clock_gettime(c, &ts);
@@ -60,7 +60,8 @@ static void b_perf_cmd(const char *cmd) {
 
 static void b_begin(void) {
   int fd = open("/proc/self/clear_refs", O_WRONLY);
-  if (fd >= 0) { if (write(fd, "5", 1) < 0) {} close(fd); }
+  if (fd >= 0) { if (write(fd, "5", 1) < 0) {} close(fd); }   /* resets VmHWM to the current RSS */
+  b_rss0 = b_status_kb("VmRSS:");                                /* memory before the work */
   b_srv0 = b_srv_ticks();
   b_perf_cmd("enable\n");
   b_wall0 = b_clock(CLOCK_MONOTONIC);
@@ -72,7 +73,7 @@ static void b_end(iter_t *it) {
   b_perf_cmd("disable\n");
   it->cpu_ns = cpu - b_cpu0; it->wall_ns = wall - b_wall0;
   long long s = b_srv_ticks(); it->srv_ticks = (s >= 0 && b_srv0 >= 0) ? s - b_srv0 : -1;
-  it->rss_peak_kb = b_status_kb("VmHWM:"); it->rss_end_kb = b_status_kb("VmRSS:");
+  it->rss_start_kb = b_rss0; it->rss_peak_kb = b_status_kb("VmHWM:"); it->rss_end_kb = b_status_kb("VmRSS:");
 }
 
 static void b_na(const char *why) { fprintf(stderr, "n/a: %s\n", why); exit(3); }
@@ -90,9 +91,9 @@ static void b_write(const char *out, const char *stack, const char *lib, const c
              "\"server\":\"%s\",\"tls\":\"%s\",\"ops_per_iter\":%lld,\"warmup\":%d%s%s,\"iters\":[",
           stack, lib, test, variant, config, server, tls, ops, warmup, *extra ? "," : "", extra);
   for (int i = 0; i < n; i++)
-    fprintf(f, "%s{\"cpu_ns\":%lld,\"wall_ns\":%lld,\"srv_ticks\":%lld,\"rss_peak_kb\":%lld,"
+    fprintf(f, "%s{\"cpu_ns\":%lld,\"wall_ns\":%lld,\"srv_ticks\":%lld,\"rss_start_kb\":%lld,\"rss_peak_kb\":%lld,"
                "\"rss_end_kb\":%lld,\"checksum\":\"%s\"}", i ? "," : "",
-            its[i].cpu_ns, its[i].wall_ns, its[i].srv_ticks, its[i].rss_peak_kb, its[i].rss_end_kb, its[i].checksum);
+            its[i].cpu_ns, its[i].wall_ns, its[i].srv_ticks, its[i].rss_start_kb, its[i].rss_peak_kb, its[i].rss_end_kb, its[i].checksum);
   fprintf(f, "]}\n");
   if (out) fclose(f);
 }

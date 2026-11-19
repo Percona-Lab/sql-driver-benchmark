@@ -399,6 +399,8 @@ int main(int argc, char **argv) {
       !strcmp(g_test, "T4") ? t4 : !strcmp(g_test, "T5") ? t5 : !strcmp(g_test, "T6") ? t6 : NULL;
   if (!fn) b_die("unknown test %s", g_test);
 
+  long long rss_base = b_status_kb("VmRSS:");   /* after load + connect + setup, before warm-up */
+  snprintf(extra, sizeof extra, "\"rss_baseline_kb\":%lld", rss_base);
   b_perf_open();
   iter_t scratch;
   for (int i = 0; i < g_warmup + g_iters; i++) {

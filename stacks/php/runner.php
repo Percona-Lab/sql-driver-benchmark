@@ -30,11 +30,11 @@ function perfOpen() { global $CTL, $ACK; if (getenv("PERF_CTL") && getenv("PERF_
 function perf($cmd) { global $CTL, $ACK; if (!$CTL) return; fwrite($CTL, $cmd); fflush($CTL); fread($ACK, 8); }
 function cpuNs() { $r = getrusage(); return ($r["ru_utime.tv_sec"] + $r["ru_stime.tv_sec"]) * 1000000000 + ($r["ru_utime.tv_usec"] + $r["ru_stime.tv_usec"]) * 1000; }
 class Meter {
-    function begin() { file_put_contents("/proc/self/clear_refs", "5"); $this->gc = gc_status()["runs"]; $this->srv = srvTicks(); perf("enable\n"); $this->wall = hrtime(true); $this->cpu = cpuNs(); }
+    function begin() { file_put_contents("/proc/self/clear_refs", "5"); $this->rss = statusKb("VmRSS:"); $this->gc = gc_status()["runs"]; $this->srv = srvTicks(); perf("enable\n"); $this->wall = hrtime(true); $this->cpu = cpuNs(); }
     function end($ck) {
         $cpu = cpuNs(); $wall = hrtime(true); perf("disable\n"); $s = srvTicks();
         return ["cpu_ns" => $cpu - $this->cpu, "wall_ns" => $wall - $this->wall, "srv_ticks" => ($s >= 0 && $this->srv >= 0) ? $s - $this->srv : -1,
-                "rss_peak_kb" => statusKb("VmHWM:"), "rss_end_kb" => statusKb("VmRSS:"), "checksum" => (string)$ck,
+                "rss_start_kb" => $this->rss, "rss_peak_kb" => statusKb("VmHWM:"), "rss_end_kb" => statusKb("VmRSS:"), "checksum" => (string)$ck,
                 "gc_count" => gc_status()["runs"] - $this->gc, "php_mem_peak" => memory_get_peak_usage()];
     }
 }
@@ -230,6 +230,7 @@ function main() {
     $c = $D->connect(E("DB_TLS", "off"));
     if ($A["test"] !== "T1") $meta["tls"] = $D->cipher($c);
     if ($A["test"] === "T2") $IDS = array_map("intval", file(E("DATA_DIR", "/root/bench/data") . "/ids_200k.txt", FILE_IGNORE_NEW_LINES));
+    $meta["rss_baseline_kb"] = statusKb("VmRSS:");   // after load + connect + setup, before warm-up
     $fn = $A["floor"] ? "floor_" : ["T1" => "t1", "T2" => "t2", "T3" => "t3", "T4" => "t4", "T5" => "t5", "T6" => "t6"][$A["test"]];
     perfOpen(); $iters = [];
     for ($i = 0; $i < $A["warmup"] + $A["iters"]; $i++) {

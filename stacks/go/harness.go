@@ -31,6 +31,7 @@ type IterRec struct {
 	CPU      int64  `json:"cpu_ns"`
 	Wall     int64  `json:"wall_ns"`
 	Srv      int64  `json:"srv_ticks"`
+	RSSStart int64  `json:"rss_start_kb"`
 	RSSPeak  int64  `json:"rss_peak_kb"`
 	RSSEnd   int64  `json:"rss_end_kb"`
 	Checksum string `json:"checksum"`
@@ -93,12 +94,13 @@ func srvTicks() int64 {
 }
 
 type meter struct {
-	cpu, wall, srv int64
+	cpu, wall, srv, rss int64
 	ms             runtime.MemStats
 }
 
 func (m *meter) begin() {
-	os.WriteFile("/proc/self/clear_refs", []byte("5"), 0)
+	os.WriteFile("/proc/self/clear_refs", []byte("5"), 0) // resets VmHWM to the current RSS
+	m.rss = statusKB("VmRSS:")
 	runtime.ReadMemStats(&m.ms)
 	m.srv = srvTicks()
 	perfCmd("enable\n")
@@ -112,7 +114,7 @@ func (m *meter) end(ck string) IterRec {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 	s := srvTicks()
-	r := IterRec{CPU: cpu - m.cpu, Wall: wall - m.wall, Srv: -1, RSSPeak: statusKB("VmHWM:"), RSSEnd: statusKB("VmRSS:"),
+	r := IterRec{CPU: cpu - m.cpu, Wall: wall - m.wall, Srv: -1, RSSStart: m.rss, RSSPeak: statusKB("VmHWM:"), RSSEnd: statusKB("VmRSS:"),
 		Checksum: ck, Alloc: ms.TotalAlloc - m.ms.TotalAlloc, GC: ms.NumGC - m.ms.NumGC, GCns: ms.PauseTotalNs - m.ms.PauseTotalNs}
 	if s >= 0 && m.srv >= 0 {
 		r.Srv = s - m.srv

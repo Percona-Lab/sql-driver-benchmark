@@ -33,6 +33,16 @@ for (server, stack, test, variant, config), allruns in sorted(rows.items()):
            "checksum_ok": all(r.get("checksum_ok", True) for r in runs)}
     if test == "T0":
         row["rss_start_kb"] = runs[0].get("rss_start_kb")
+    # memory (runs from 2026-11-19 on): baseline = after load + connect + setup, before warm-up;
+    # work = peak - start of each measured iteration; retained = end - start; growth = highest peak - baseline
+    if all("rss_start_kb" in it for r in runs for it in r["iters"]) and test != "T0":
+        row["mem_work_kb"] = st.median(st.median(it["rss_peak_kb"] - it["rss_start_kb"] for it in r["iters"]) for r in runs)
+        row["mem_retained_kb"] = st.median(st.median(it["rss_end_kb"] - it["rss_start_kb"] for it in r["iters"]) for r in runs)
+        base = [r["rss_baseline_kb"] for r in runs if "rss_baseline_kb" in r]
+        if base:
+            row["mem_baseline_kb"] = st.median(base)
+            row["mem_growth_kb"] = st.median(max(it["rss_peak_kb"] for it in r["iters"]) - r["rss_baseline_kb"]
+                                             for r in runs if "rss_baseline_kb" in r)
     # hardware counters: per op, per event set
     for evset in ("A", "B"):
         rs = [r for r in counted if r.get("event_set") == evset and r.get("perf")]

@@ -34,11 +34,11 @@ let gcCount = 0, gcMs = 0;
 new PerformanceObserver(l => { for (const e of l.getEntries()) { gcCount++; gcMs += e.duration; } }).observe({ entryTypes: ["gc"] });
 const cpuNs = () => { const u = process.cpuUsage(); return (u.user + u.system) * 1000; };
 class Meter {
-  begin() { fs.writeFileSync("/proc/self/clear_refs", "5"); this.gc = gcCount; this.gcMs = gcMs; this.srv = srvTicks(); perf("enable\n"); this.wall = process.hrtime.bigint(); this.cpu = cpuNs(); }
+  begin() { fs.writeFileSync("/proc/self/clear_refs", "5"); this.rss = statusKb("VmRSS:"); this.gc = gcCount; this.gcMs = gcMs; this.srv = srvTicks(); perf("enable\n"); this.wall = process.hrtime.bigint(); this.cpu = cpuNs(); }
   end(ck) {
     const cpu = cpuNs(), wall = process.hrtime.bigint(); perf("disable\n"); const s = srvTicks();
     return { cpu_ns: cpu - this.cpu, wall_ns: Number(wall - this.wall), srv_ticks: s >= 0 && this.srv >= 0 ? s - this.srv : -1,
-      rss_peak_kb: statusKb("VmHWM:"), rss_end_kb: statusKb("VmRSS:"), checksum: String(ck), gc_count: gcCount - this.gc, gc_ms: Math.round(gcMs - this.gcMs) };
+      rss_start_kb: this.rss, rss_peak_kb: statusKb("VmHWM:"), rss_end_kb: statusKb("VmRSS:"), checksum: String(ck), gc_count: gcCount - this.gc, gc_ms: Math.round(gcMs - this.gcMs) };
   }
 }
 
@@ -256,6 +256,7 @@ async function main() {
   const c = await D.connect(E("DB_TLS", "off"));
   if (A.test !== "T1") meta.tls = await cipher(c);
   if (A.test === "T2") IDS = fs.readFileSync(path.join(E("DATA_DIR", "/root/bench/data"), "ids_200k.txt"), "utf8").trim().split("\n").map(Number);
+  meta.rss_baseline_kb = statusKb("VmRSS:");   // after load + connect + setup, before warm-up
   const fn = A.floor ? floor : { T1: t1, T2: t2, T3: t3, T4: t4, T5: t5, T6: t6 }[A.test];
   perfOpen();
   const iters = [];

@@ -30,14 +30,14 @@ end
 def perf(cmd) = $ctl && ($ctl.write(cmd); $ctl.flush; $ack.readpartial(8))
 class Meter
   def begin_
-    File.write("/proc/self/clear_refs", "5"); @gc = GC.count; @alloc = GC.stat(:total_allocated_objects); @srv = srv_ticks
+    File.write("/proc/self/clear_refs", "5"); @rss = status_kb("VmRSS:"); @gc = GC.count; @alloc = GC.stat(:total_allocated_objects); @srv = srv_ticks
     perf("enable\n"); @wall = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
     @cpu = Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID, :nanosecond)
   end
   def end_(ck)
     cpu = Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID, :nanosecond); wall = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
     perf("disable\n"); s = srv_ticks
-    { cpu_ns: cpu - @cpu, wall_ns: wall - @wall, srv_ticks: s >= 0 && @srv >= 0 ? s - @srv : -1, rss_peak_kb: status_kb("VmHWM:"),
+    { cpu_ns: cpu - @cpu, wall_ns: wall - @wall, srv_ticks: s >= 0 && @srv >= 0 ? s - @srv : -1, rss_start_kb: @rss, rss_peak_kb: status_kb("VmHWM:"),
       rss_end_kb: status_kb("VmRSS:"), checksum: ck.to_s, gc_count: GC.count - @gc, alloc_objects: GC.stat(:total_allocated_objects) - @alloc }
   end
 end
@@ -182,6 +182,7 @@ def main
   c = D.connect(env("DB_TLS", "off"))
   meta[:tls] = D.cipher(c) unless A[:test] == "T1"
   $ids = File.readlines(File.join(env("DATA_DIR", "/root/bench/data"), "ids_200k.txt")).map(&:to_i) if A[:test] == "T2"
+  meta[:rss_baseline_kb] = status_kb("VmRSS:")   # after load + connect + setup, before warm-up
   fn = A[:floor] ? method(:floor_) : method({ "T1" => :t1, "T2" => :t2, "T3" => :t3, "T4" => :t4, "T5" => :t5, "T6" => :t6 }[A[:test]])
   perf_open; iters = []
   (A[:warmup] + A[:iters]).times do |i|

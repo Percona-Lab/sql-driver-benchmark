@@ -45,6 +45,9 @@ for r in rows:
                  instr=sig(r["instr_op"]) if r.get("instr_op") else None,
                  kernel_pct=round(r["kernel_pct"], 1) if r.get("kernel_pct") is not None else None,
                  tls=r.get("tls", ""))
+        for k in ("mem_baseline_kb", "mem_work_kb", "mem_retained_kb", "mem_growth_kb"):
+            if k in r:
+                o[k.replace("_kb", "_mb")] = round(r[k] / 1024, 2)
         if r["test"] == "T0":
             o["rss_start_mb"] = round((r.get("rss_start_kb") or 0) / 1024, 1)
     out.append(o)

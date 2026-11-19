@@ -246,6 +246,7 @@ int main(int argc, char** argv) {
     if (g_test != "T1") tls_name = cipher(c.get());
     if (g_test == "T2") { std::ifstream f(std::string(E("DATA_DIR", "/root/bench/data")) + "/ids_200k.txt"); int x; while (f >> x) g_ids.push_back(x); }
     std::string (*fn)(sql::Connection*) = g_test == "T1" ? t1 : g_test == "T2" ? t2 : g_test == "T3" ? t3 : g_test == "T4" ? t4 : g_test == "T5" ? t5 : t6;
+    char extra[64]; snprintf(extra, sizeof extra, "\"rss_baseline_kb\":%lld", b_status_kb("VmRSS:"));
     b_perf_open();
     for (int i = 0; i < g_warmup + g_iters; i++) {
       if (g_test == "T6") exec(c.get(), "TRUNCATE TABLE t_bulk");
@@ -259,7 +260,7 @@ int main(int argc, char** argv) {
         r->next(); snprintf(it->checksum, sizeof it->checksum, "%lld:%lld:%lld", (long long)r->GET_LONG(1), (long long)r->GET_LONG(2), (long long)r->GET_LONG(3));
       }
     }
-    b_write(g_out, STACK, lib.c_str(), g_test.c_str(), g_variant.c_str(), g_config.c_str(), g_server.c_str(), tls_name.c_str(), g_ops, g_warmup, its.data(), g_iters, "");
+    b_write(g_out, STACK, lib.c_str(), g_test.c_str(), g_variant.c_str(), g_config.c_str(), g_server.c_str(), tls_name.c_str(), g_ops, g_warmup, its.data(), g_iters, extra);
   } catch (NA& e) { fprintf(stderr, "n/a: %s\n", e.why.c_str()); return 3; }
   catch (sql::SQLException& e) {
     if (std::string(e.what()).find("Bulk") != std::string::npos) { fprintf(stderr, "n/a: server has no bulk execute\n"); return 3; }

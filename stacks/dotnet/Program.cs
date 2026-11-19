@@ -35,10 +35,11 @@ static class P
     static FileStream? ctl, ack;
     static void PerfOpen() { var c = Env("PERF_CTL"); var a = Env("PERF_ACK"); if (c != "" && a != "") { ctl = new FileStream(c, FileMode.Open, FileAccess.Write); ack = new FileStream(a, FileMode.Open, FileAccess.Read); } }
     static void Perf(string cmd) { if (ctl == null) return; var b = Encoding.ASCII.GetBytes(cmd); ctl.Write(b); ctl.Flush(); ack!.Read(new byte[8]); }
-    static long cpu0, wall0, srv0, alloc0; static int gc0;
+    static long cpu0, wall0, srv0, alloc0, rss0; static int gc0;
     static void Begin()
     {
-        File.WriteAllText("/proc/self/clear_refs", "5");
+        File.WriteAllText("/proc/self/clear_refs", "5");   // resets VmHWM to the current RSS
+        rss0 = StatusKb("VmRSS:");
         gc0 = GC.CollectionCount(0) + GC.CollectionCount(1) + GC.CollectionCount(2); alloc0 = GC.GetTotalAllocatedBytes(); srv0 = SrvTicks();
         Perf("enable\n"); wall0 = Stopwatch.GetTimestamp(); cpu0 = CpuNs();
     }
@@ -47,7 +48,7 @@ static class P
         long cpu = CpuNs(), wall = Stopwatch.GetTimestamp(); Perf("disable\n"); long s = SrvTicks();
         return new() {
             ["cpu_ns"] = cpu - cpu0, ["wall_ns"] = (long)((wall - wall0) * (1e9 / Stopwatch.Frequency)), ["srv_ticks"] = s >= 0 && srv0 >= 0 ? s - srv0 : -1,
-            ["rss_peak_kb"] = StatusKb("VmHWM:"), ["rss_end_kb"] = StatusKb("VmRSS:"), ["checksum"] = ck.ToString()!,
+            ["rss_start_kb"] = rss0, ["rss_peak_kb"] = StatusKb("VmHWM:"), ["rss_end_kb"] = StatusKb("VmRSS:"), ["checksum"] = ck.ToString()!,
             ["gc_count"] = GC.CollectionCount(0) + GC.CollectionCount(1) + GC.CollectionCount(2) - gc0, ["alloc_bytes"] = GC.GetTotalAllocatedBytes() - alloc0 };
     }
 
@@ -249,6 +250,7 @@ static class P
         using var c = Connect(Env("DB_TLS", "off"));
         if (test != "T1") meta["tls"] = Cipher(c);
         if (test == "T2") ids = File.ReadAllLines(Path.Combine(Env("DATA_DIR", "/root/bench/data"), "ids_200k.txt")).Select(int.Parse).ToArray();
+        meta["rss_baseline_kb"] = StatusKb("VmRSS:");   // after load + connect + setup, before warm-up
         Func<DbConnection, object> fn = floor ? Floor : test switch { "T1" => T1, "T2" => T2, "T3" => T3, "T4" => T4, "T5" => T5, _ => T6 };
         PerfOpen();
         for (int i = 0; i < warmup + iters; i++)

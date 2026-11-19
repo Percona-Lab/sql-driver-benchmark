@@ -31,17 +31,18 @@ mod harness {
             if let (Some(ctl), Some(ack)) = (&mut self.ctl, &mut self.ack) { ctl.write_all(c.as_bytes()).unwrap(); let mut b = [0u8; 8]; let _ = ack.read(&mut b); }
         }
     }
-    pub struct Meter { cpu: i64, wall: Instant, srv: i64 }
+    pub struct Meter { cpu: i64, wall: Instant, srv: i64, rss: i64 }
     impl Meter {
         pub fn begin(p: &mut Perf) -> Meter {
-            let _ = fs::write("/proc/self/clear_refs", "5");
+            let _ = fs::write("/proc/self/clear_refs", "5");   // resets VmHWM to the current RSS
+            let rss = status_kb("VmRSS:");
             let srv = srv_ticks(); p.cmd("enable\n");
-            Meter { wall: Instant::now(), cpu: cpu_ns(), srv }
+            Meter { wall: Instant::now(), cpu: cpu_ns(), srv, rss }
         }
         pub fn end(self, p: &mut Perf, ck: String) -> serde_json::Value {
             let cpu = cpu_ns(); let wall = self.wall.elapsed().as_nanos() as i64; p.cmd("disable\n"); let s = srv_ticks();
             serde_json::json!({"cpu_ns": cpu - self.cpu, "wall_ns": wall, "srv_ticks": if s >= 0 && self.srv >= 0 { s - self.srv } else { -1 },
-                "rss_peak_kb": status_kb("VmHWM:"), "rss_end_kb": status_kb("VmRSS:"), "checksum": ck})
+                "rss_start_kb": self.rss, "rss_peak_kb": status_kb("VmHWM:"), "rss_end_kb": status_kb("VmRSS:"), "checksum": ck})
         }
     }
 }
@@ -315,6 +316,7 @@ fn run(a: &Args, rss_start: i64) -> R<()> {
             if a.test == "T1" { let mut c2 = sqlx_drv::connect(t1_mode(&a.variant), a.variant == "socket").await?; meta["tls"] = sqlx_drv::cipher(&mut c2).await.into(); }
             let mut c = sqlx_drv::connect(&tls, false).await?;
             if a.test != "T1" { meta["tls"] = sqlx_drv::cipher(&mut c).await.into(); }
+            meta["rss_baseline_kb"] = status_kb("VmRSS:").into();
             perf = Perf::open();
             for k in 0..a.warmup + a.iters {
                 if a.test == "T6" { sqlx_drv::exec(&mut c, "TRUNCATE TABLE t_bulk").await?; }
@@ -334,6 +336,7 @@ fn run(a: &Args, rss_start: i64) -> R<()> {
             if a.test == "T1" { let mut c2 = sync_drv::connect(t1_mode(&a.variant), a.variant == "socket")?; meta["tls"] = sync_drv::cipher(&mut c2).into(); }
             let mut c = sync_drv::connect(&tls, false)?;
             if a.test != "T1" { meta["tls"] = sync_drv::cipher(&mut c).into(); }
+            meta["rss_baseline_kb"] = status_kb("VmRSS:").into();
             perf = Perf::open();
             for k in 0..a.warmup + a.iters {
                 if a.test == "T6" { sync_drv::exec(&mut c, "TRUNCATE TABLE t_bulk")?; }

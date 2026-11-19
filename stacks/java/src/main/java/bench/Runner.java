@@ -69,9 +69,10 @@ public class Runner {
         try { int rc = (int) CLOCK_GETTIME.invokeExact(2, TS); } catch (Throwable t) { throw new RuntimeException(t); }
         return TS.get(ValueLayout.JAVA_LONG, 0) * 1_000_000_000L + TS.get(ValueLayout.JAVA_LONG, 8);
     }
-    static long cpu0, wall0, srv0, alloc0; static long[] gc0;
+    static long cpu0, wall0, srv0, alloc0, rss0; static long[] gc0;
     static void begin() throws IOException {
-        Files.writeString(Path.of("/proc/self/clear_refs"), "5");
+        Files.writeString(Path.of("/proc/self/clear_refs"), "5");   // resets VmHWM to the current RSS
+        rss0 = statusKb("VmRSS:");
         gc0 = gc(); alloc0 = TM.getCurrentThreadAllocatedBytes(); srv0 = srvTicks();
         perf("enable\n");
         wall0 = System.nanoTime(); cpu0 = cpuNs();
@@ -80,9 +81,9 @@ public class Runner {
         long cpu = cpuNs(), wall = System.nanoTime();
         perf("disable\n");
         long s = srvTicks(); long[] g = gc();
-        return String.format("{\"cpu_ns\":%d,\"wall_ns\":%d,\"srv_ticks\":%d,\"rss_peak_kb\":%d,\"rss_end_kb\":%d,"
+        return String.format("{\"cpu_ns\":%d,\"wall_ns\":%d,\"srv_ticks\":%d,\"rss_start_kb\":%d,\"rss_peak_kb\":%d,\"rss_end_kb\":%d,"
                 + "\"checksum\":\"%s\",\"alloc_bytes\":%d,\"gc_count\":%d,\"gc_ms\":%d}",
-            cpu - cpu0, wall - wall0, s >= 0 && srv0 >= 0 ? s - srv0 : -1, statusKb("VmHWM:"), statusKb("VmRSS:"),
+            cpu - cpu0, wall - wall0, s >= 0 && srv0 >= 0 ? s - srv0 : -1, rss0, statusKb("VmHWM:"), statusKb("VmRSS:"),
             ck, TM.getCurrentThreadAllocatedBytes() - alloc0, g[0] - gc0[0], g[1] - gc0[1]);
     }
 
@@ -351,6 +352,7 @@ public class Runner {
         if (tlsName == null) tlsName = cipher(c);
         if (test.equals("T2")) ids = Files.readAllLines(Path.of(env("DATA_DIR", "/root/bench/data"), "ids_200k.txt")).stream().mapToInt(Integer::parseInt).toArray();
 
+        long rssBase = statusKb("VmRSS:");   // after load + connect + setup, before warm-up
         perfOpen();
         for (int i = 0; i < warmup + iters; i++) {
             if (test.equals("T6")) try (Statement s = c.createStatement()) { s.execute("TRUNCATE TABLE t_bulk"); }
@@ -363,7 +365,7 @@ public class Runner {
             }
             recs.add(rec);
         }
-        meta.append(String.format(",\"tls\":\"%s\",\"ops_per_iter\":%d,\"warmup\":%d", tlsName, ops, warmup));
+        meta.append(String.format(",\"tls\":\"%s\",\"ops_per_iter\":%d,\"warmup\":%d,\"rss_baseline_kb\":%d", tlsName, ops, warmup, rssBase));
         write(meta, recs);
         c.close();
     }
