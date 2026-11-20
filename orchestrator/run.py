@@ -14,6 +14,7 @@ ROOT = "/root/bench"
 SRC = os.environ.get("BENCH_SRC", f"{ROOT}/src")   # memory pass runs from a second checkout
 RESULTS = f"{ROOT}/results"
 CLIENT_CPU = "5"
+CLIENT_MEM = "8G"   # per client process; the servers have 16 GB buffer pools on a 32 GB host
 
 SERVERS = {
     "ps":    {"port": "3306", "socket": "/var/run/mysqld/mysqld.sock"},
@@ -126,7 +127,9 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
         env.update(PERF_CTL=ctl, PERF_ACK=ack)
         # Timed runs carry no perf at all: counting hardware events adds cost to every context switch
         # (+26% on a TCP connect). Counters come from separate processes (evset A / B).
-        prefix = ["taskset", "-c", CLIENT_CPU]
+        # client memory cap (cgroup): a runaway client is killed, not the database server
+        prefix = ["systemd-run", "--scope", "--quiet", "-p", f"MemoryMax={CLIENT_MEM}", "-p", "MemorySwapMax=0",
+                  "taskset", "-c", CLIENT_CPU]
         if evset:
             prefix += ["perf", "stat", "-x", ",", "-o", perfout, "-D", "-1", "--control", f"fifo:{ctl},{ack}",
                        "-e", EVENTS[evset], "--"]
@@ -140,6 +143,8 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
             p = subprocess.run(cmd, cwd=f"{SRC}/{cwd}", env=env, capture_output=True, text=True, timeout=args.timeout)
         except subprocess.TimeoutExpired:
             return "fail", f"timeout after {args.timeout} s"
+    if p.returncode in (-9, 137) or "oom" in (p.stderr or "").lower():
+        return "fail", f"client killed: exceeded the {CLIENT_MEM} memory cap"
     if p.returncode == 3:
         return "n/a", (p.stderr.strip().splitlines() or ["?"])[-1].removeprefix("n/a: ")
     if p.returncode != 0:
@@ -159,6 +164,11 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
         return "fail", f"checksum {bad[0]} != {want}"
     cpu = sorted(it["cpu_ns"] for it in d["iters"])[len(d["iters"]) // 2]
     return "ok", f"cpu/op {cpu / d['ops_per_iter'] / 1000:.3f} us  tls={d['tls']}"
+
+
+def server_pid(server):
+    unit = "mysql" if server == "ps" else "mariadb-bench"
+    return subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", unit], capture_output=True, text=True).stdout.strip()
 
 
 def main():
@@ -196,6 +206,10 @@ def main():
                             reps += ["cA", "cB"]   # hardware-counter processes (not used for timing)
                         for rep in reps:
                             status, msg = run_one(server, stack, test, variant, config, rep, pid, exp, args)
+                            now = server_pid(server)
+                            if now != pid:   # the server died (e.g. OOM) and systemd restarted it: re-prime, flag the cell
+                                status, msg = "fail", f"database server restarted during this run ({msg})"
+                                pid = subprocess.run(["/root/dbctl.sh", "start", server], capture_output=True, text=True).stdout.split()[-1]
                             line = f"{time.strftime('%H:%M:%S')} {server:5} {stack:18} {test} {variant:20} {config:7} r{rep} {status:4} {msg}"
                             print(line, flush=True); log.write(line + "\n"); log.flush()
                             if status != "ok":

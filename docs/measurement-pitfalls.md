@@ -12,6 +12,7 @@ numbers are client CPU per operation for Oracle libmysqlclient 9.7 against Perco
 | TIME_WAIT sockets piling up from earlier connects | TCP connect 27 → 57 µs (**+110%**), and dependent on what ran before | connect tests | cap with `net.ipv4.tcp_max_tw_buckets` |
 | Package side effects re-pointing `/etc/mysql/my.cnf` | server silently started with defaults (128 MB buffer pool, no TLS cert, binlog on) | everything | verify server variables on every start |
 | `caching_sha2_password` cache emptied by a server restart | non-TLS TCP logins fail (or take the slow full-auth path) | connect tests, any non-TLS client | log in once over the Unix socket after each restart |
+| A client using too much memory, with no limit on it | the kernel's OOM killer picked **mysqld**; systemd restarted it with an empty auth cache, so later tests failed to log in | any memory-hungry client | protect the servers (`OOMScoreAdjust=-1000`), cap each client (8 GB cgroup), detect a server restart after every process |
 | Test CA without `keyUsage` / strict extensions | Python 3.13+ (`VERIFY_X509_STRICT`) rejects it; looks like a driver failure | TLS-verify tests | generate a strict-X.509-clean CA |
 
 ## Details
