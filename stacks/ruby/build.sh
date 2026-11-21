@@ -3,9 +3,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 export PATH=/opt/ruby/bin:$PATH GEM_HOME=$PWD/vendor GEM_PATH=$PWD/vendor
-gem install --no-document mysql2 -- --with-mysql-config=/opt/oracle/usr/bin/mysql_config \
+gem install --no-document mysql2 -v 0.5.7 -- --with-mysql-config=/opt/oracle/usr/bin/mysql_config \
   --with-ldflags="-Wl,-rpath,/opt/oracle/usr/lib/x86_64-linux-gnu"
-gem install --no-document trilogy bigdecimal
+gem install --no-document trilogy -v 2.13.3
+gem install --no-document bigdecimal
 cat > run <<'EOF'
 #!/bin/bash
 # YJIT on: the default for production Ruby (Rails enables it)

@@ -2,6 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
+python3 gen_wide.py
 dotnet publish -c Release -o out runner.csproj
 cat > run <<'EOF'
 #!/bin/bash

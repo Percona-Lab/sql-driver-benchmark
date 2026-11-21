@@ -7,9 +7,10 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
-static class P
+static partial class P
 {
     static string test = "T0", variant = "", config = "default", server = "ps", driver = "mysqlconnector";
+    static string? fwName;
     static string? outPath;
     static int warmup = 2, iters = 5;
     static bool floor;
@@ -226,8 +227,9 @@ static class P
             {
                 case "--driver": driver = a[++i]; break; case "--test": test = a[++i]; break; case "--variant": variant = a[++i]; break;
                 case "--config": config = a[++i]; break; case "--server": server = a[++i]; break; case "--out": outPath = a[++i]; break;
-                case "--warmup": warmup = int.Parse(a[++i]); break; case "--iters": iters = int.Parse(a[++i]); break; case "--floor": floor = true; break;
+                case "--warmup": warmup = int.Parse(a[++i]); break; case "--fw": fwName = a[++i]; break; case "--iters": iters = int.Parse(a[++i]); break; case "--floor": floor = true; break;
             }
+        if (fwName != null) return RunFw(fwName, rssStart);   // Phase 3 frameworks (Fw.cs)
         try { Run(rssStart); return 0; }
         catch (NA e) { Console.Error.WriteLine("n/a: " + e.Message); return 3; }
         catch (Exception e) { var m = e.GetType().Name + ": " + e.Message.Split('\n')[0]; for (var x = e.InnerException; x != null; x = x.InnerException) m += " <- " + x.GetType().Name + ": " + x.Message.Split('\n')[0]; Console.Error.WriteLine(m); return 1; }

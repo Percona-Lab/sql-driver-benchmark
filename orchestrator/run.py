@@ -56,6 +56,13 @@ for _d in ("mysql2", "trilogy"):
 STACKS["dotnet-mysqlconnector"] = ("stacks/dotnet", ["./run", "--driver", "mysqlconnector"], True)
 STACKS["dotnet-mysql-data"] = ("stacks/dotnet", ["./run", "--driver", "mysql-data"], True)
 # Phase 3: frameworks (each on a Phase 1/2 driver)
+STACKS["php-dbal"] = ("stacks/php", ["php", "fw.php", "--fw", "dbal"], False)
+STACKS["php-doctrine-orm"] = ("stacks/php", ["php", "fw.php", "--fw", "doctrine"], False)
+STACKS["php-eloquent"] = ("stacks/php", ["php", "fw.php", "--fw", "eloquent"], False)
+for _f in ("dapper", "efcore"):
+    STACKS["dotnet-" + _f] = ("stacks/dotnet", ["./run", "--fw", _f], True)
+for _f in ("knex", "sequelize", "typeorm", "drizzle", "prisma"):
+    STACKS["node-" + _f] = ("stacks/node", ["/opt/node/bin/node", "fw.mjs", "--fw", _f], True)
 for _f in ("sqlx", "gorm"):
     STACKS["go-" + _f] = ("stacks/go", ["./runner", "--driver", _f], False)
 for _f in ("hibernate", "jooq", "jdbctemplate"):
