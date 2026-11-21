@@ -78,7 +78,9 @@ class PyMySQL(Adapter):
 
     def connect(self, tls="off", sock=False, resume=False):
         kw = self.common(sock)
-        if tls == "on":
+        if tls == "off":
+            kw["ssl_disabled"] = True   # PyMySQL negotiates TLS by default when the server offers it
+        elif tls == "on":
             kw.update(ssl={}, ssl_verify_cert=False, ssl_verify_identity=False)
         elif tls == "verify":
             kw.update(ssl_ca=E("DB_CA"), ssl_verify_cert=True, ssl_verify_identity=True)

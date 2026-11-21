@@ -33,6 +33,9 @@ for (server, stack, test, variant, config), allruns in sorted(rows.items()):
            "checksum_ok": all(r.get("checksum_ok", True) for r in runs)}
     if test == "T0":
         row["rss_start_kb"] = runs[0].get("rss_start_kb")
+    if any(r.get("warmup_adaptive") for r in runs):   # JIT runtimes: adaptive warm-up (SPEC section 6)
+        row["warmup_mean"] = round(st.mean(r.get("warmup", 0) for r in runs), 1)
+        row["warmup_unstable"] = sum(1 for r in runs if r.get("warmup_stable") is False)
     # memory (runs from 2026-11-19 on): baseline = after load + connect + setup, before warm-up;
     # work = peak - start of each measured iteration; retained = end - start; growth = highest peak - baseline
     if all("rss_start_kb" in it for r in runs for it in r["iters"]) and test != "T0":

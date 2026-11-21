@@ -12,8 +12,11 @@ def notes_for(r):
     """1-based note numbers that apply to a summary row (same rules as the report artifact)."""
     out = []
     for i, n in enumerate(NOTES, 1):
-        if "auto" in n:
+        if n.get("auto") == "cv":
             if r.get("cv_pct", 0) > 5 and r["test"] != "T0":
+                out.append(i)
+        elif n.get("auto") == "warmup":
+            if r.get("warmup_unstable", 0) > 0:
                 out.append(i)
         elif all(re.fullmatch(p, str(r.get(k, ""))) for k, p in n["match"].items()):
             out.append(i)
@@ -29,9 +32,15 @@ ORDER = ["c-libmysqlclient", "c-mariadb-connc", "cpp-mysql-connector", "cpp-mari
 ap = argparse.ArgumentParser()
 ap.add_argument("summary")
 ap.add_argument("--tests", default="T1,T2,T3,T4,T5,T6")
-ap.add_argument("--metric", default="cpu_ns_op")
+ap.add_argument("--metric", default="cpu_ns_op", help="cpu_ns_op, or mem_work_kb / mem_growth_kb / mem_baseline_kb (shown in MB)")
+ap.add_argument("--stacks", help="comma-separated stack prefixes to include")
 a = ap.parse_args()
 rows = json.load(open(a.summary))
+if a.stacks:
+    rows = [r for r in rows if any(r["stack"].startswith(p) for p in a.stacks.split(","))]
+MEM = a.metric.startswith("mem_")
+if MEM:
+    rows = [r for r in rows if "status" in r or a.metric in r]
 cell = {}
 variants = defaultdict(list)
 for r in rows:
@@ -40,11 +49,14 @@ for r in rows:
         variants[r["test"]].append(r["variant"])
     cell.setdefault(k, {})[r["server"]] = r
 for t in a.tests.split(","):
-    unit, div = UNIT[t]
+    unit, div = (("MB", 1024) if MEM else UNIT[t])
     vs = variants[t]
     stacks = sorted({(k[1], k[2]) for k in cell if k[0] == t},
                     key=lambda s: (ORDER.index(s[0]) if s[0] in ORDER else 99, s[1]))
-    print(f"\n### {t} — client CPU, {unit} (Percona / MariaDB)\n")
+    what = {"mem_work_kb": "memory for the work", "mem_growth_kb": "memory growth since connect",
+            "mem_baseline_kb": "memory after connect"}.get(a.metric, "client CPU")
+    if not vs: continue
+    print(f"\n### {t} — {what}, {unit} (Percona / MariaDB)\n")
     print("| stack | config | " + " | ".join(vs) + " |")
     print("|---|---|" + "---|" * len(vs))
     used = set()
@@ -60,9 +72,12 @@ for t in a.tests.split(","):
                 mark = ",".join(map(str, ns)).translate(SUP)
                 if "status" in r: parts.append(("n/a" if r["status"] == "n/a" else "FAIL") + mark)
                 else:
-                    v_ = r[a.metric] / div
+                    v_ = max(0, r[a.metric] / div) if MEM else r[a.metric] / div
+                    if MEM and v_ < 0.05: v_ = 0
                     parts.append((f"{v_:,.3g}" if v_ < 100 else f"{v_:,.0f}") + mark)
             out.append(" / ".join(parts))
+        if all(p.startswith(("n/a", "–")) for cell_ in out for p in cell_.split(" / ")):
+            continue   # e.g. a "tuned" config the driver does not have
         print(f"| {st} | {cfg} | " + " | ".join(out) + " |")
     if used:
         print()

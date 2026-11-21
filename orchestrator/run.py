@@ -153,6 +153,11 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
             return "n/a", "no ed25519 client support: " + msg
         return "fail", msg
     d = json.load(open(res))
+    # the negotiated TLS state must be the intended one (a driver may enable TLS on its own)
+    want_tls = ("+tls" in variant) or (test == "T1" and base.startswith("tls"))
+    got_tls = d.get("tls") not in (None, "", "none")
+    if test != "T0" and want_tls != got_tls:
+        return "fail", f"TLS state mismatch: wanted {'TLS' if want_tls else 'no TLS'}, got {d.get('tls')}"
     want = expected_checksum(exp, test, variant)
     bad = [it["checksum"] for it in d["iters"] if want is not None and it["checksum"] != want]
     d.update(variant=variant, rep=rep, event_set=evset, perf=parse_perf(perfout) if evset else None,
