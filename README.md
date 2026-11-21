@@ -39,35 +39,30 @@ SMT off, boost off, frequency fixed at 3.9 GHz. The client runs alone on an isol
 server is pinned to three other cores. Client and server talk over loopback TCP (Unix socket as a
 variant), so only client-side cost differs between drivers. Exact versions: [results/versions.txt](results/versions.txt).
 
-## Drivers (phase 1)
+## Drivers
 
 | Language | Drivers |
 |---|---|
-| C | Oracle libmysqlclient 9.7.4, MariaDB Connector/C 3.4.11 (baseline floor) |
-| Java 25 | MySQL Connector/J 26.10.0, MariaDB Connector/J 4.0.0 (defaults and tuned options) |
-| Python 3.14 | mysqlclient 2.3.1, mysql-connector-python 26.10 (C extension and pure), PyMySQL 1.2.4, MariaDB Connector/Python 1.1.15 |
+| C | Oracle libmysqlclient 9.7.4, MariaDB Connector/C 3.4.11 |
+| C++ | MySQL Connector/C++ 26.10, MariaDB Connector/C++ 1.1.9 |
 | Go 1.27 | go-sql-driver/mysql 1.10.2 (database/sql), go-mysql 1.16.0 |
+| Rust | mysql 28.0.4, sqlx 0.9.1 |
+| Java 25 | MySQL Connector/J 26.10.0, MariaDB Connector/J 4.0.0 |
+| .NET 10 | MySqlConnector 3.0.0, MySql.Data 26.10.0 |
+| Python 3.14 | mysqlclient 2.3.1, mysql-connector-python 26.10 (C extension and pure), PyMySQL 1.2.4, MariaDB Connector/Python 1.1.15 |
+| Node.js 26 | mysql2 3.24.6, mariadb 3.5.5, mysql 2.18.1 |
+| PHP 8.5 | mysqli, PDO_MySQL (mysqlnd) |
+| Ruby 4.0 (YJIT) | mysql2 0.5.7, trilogy 2.13.3 |
 
-Next: Node.js, PHP, Ruby, Rust, .NET, C++, then frameworks (SQLAlchemy, Django, Hibernate, jOOQ, GORM,
-Prisma, Sequelize, Doctrine, ActiveRecord, EF Core, Diesel, …), then async drivers, ODBC and Perl.
+Next: frameworks (SQLAlchemy, Django, Hibernate, jOOQ, GORM, Prisma, Sequelize, Doctrine, ActiveRecord, EF Core, Diesel, …),
+then async drivers, ODBC and Perl.
 
 ## Status
 
-- **Phase 1 (C, Go, Python, Java) complete** — report: [reports/phase1.md](reports/phase1.md), including the Java rerun.
-- **Phase 2 (Node.js, PHP, Ruby, .NET, Rust, C++)**: full run in progress.
-
-Early observations (to be confirmed by the profiling pass):
-
-- With TLS but no CA configured, both C client libraries load and parse the whole system CA bundle on
-  every connection (~3.6 ms CPU vs ~0.7 ms with a CA file).
-- libmysqlclient issues two `SSL_read` calls per row (2M for 1M rows; Connector/C: ~700), so TLS doubles
-  its per-row cost for large result sets.
-- MariaDB Connector/C sleeps (`usleep(1)`, ~50 µs on Linux) after every `connect()`, adding wall time
-  (not CPU) to each connection.
-- MySQL/Percona Server converts `JSON` from its binary storage format to text on every read: ~13× the
-  server CPU of the same bytes as `LONGBLOB` (100 KB documents), output ~10% larger (reformatted), and the
-  slower send costs the client 10–30% more CPU per KB than reading the same documents from MariaDB, which
-  stores `JSON` as text. A storage-format trade-off; analysing it further is out of scope here.
+- **All 24 drivers measured** (C, C++, Go, Rust, Java, .NET, Python, Node.js, PHP, Ruby) on both servers, CPU and memory.
+  Reports: [Phase 1 — C, Go, Java, Python](reports/phase1.md) · [Phase 2 — C++, Rust, .NET, Node.js, PHP, Ruby](reports/phase2.md).
+- `results/summary.json` (timed runs) and `results/summary-mem.json` (memory pass) aggregate `results/raw/` and `results/raw-mem/`.
+- Next: profiling pass (where the time goes), then frameworks (SQLAlchemy, Hibernate, GORM, Prisma, …).
 
 ## Updating the results page
 
