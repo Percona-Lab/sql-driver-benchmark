@@ -16,37 +16,37 @@ import java.time.LocalDateTime;
 import java.util.*;
 
 public class Runner {
-    static String test = "T0", variant = "", config = "default", server = "ps", out = null, driverName = "connector-j";
-    static int warmup = 2, iters = 5;
-    static boolean floor = false;
-    static long ops;
-    static boolean adaptive = false, warmStable = true;
-    static boolean mariadb;
+    public static String test = "T0", variant = "", config = "default", server = "ps", out = null, driverName = "connector-j";
+    public static int warmup = 2, iters = 5;
+    public static boolean floor = false;
+    public static long ops;
+    public static boolean adaptive = false, warmStable = true;
+    public static boolean mariadb;
 
-    static class NA extends RuntimeException { NA(String m) { super(m); } }
+    public static class NA extends RuntimeException { public NA(String m) { super(m); } }
 
-    static String env(String k, String d) { String v = System.getenv(k); return v == null || v.isEmpty() ? d : v; }
+    public static String env(String k, String d) { String v = System.getenv(k); return v == null || v.isEmpty() ? d : v; }
 
     // ------------------------------------------------------------ harness
-    static final com.sun.management.OperatingSystemMXBean OS =
+    public static final com.sun.management.OperatingSystemMXBean OS =
         (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
-    static final com.sun.management.ThreadMXBean TM = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
-    static FileOutputStream perfCtl; static FileInputStream perfAck;
+    public static final com.sun.management.ThreadMXBean TM = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+    public static FileOutputStream perfCtl; static FileInputStream perfAck;
 
-    static void perfOpen() throws IOException {
+    public static void perfOpen() throws IOException {
         String c = System.getenv("PERF_CTL"), a = System.getenv("PERF_ACK");
         if (c != null && a != null) { perfCtl = new FileOutputStream(c); perfAck = new FileInputStream(a); }
     }
-    static void perf(String cmd) throws IOException {
+    public static void perf(String cmd) throws IOException {
         if (perfCtl == null) return;
         perfCtl.write(cmd.getBytes()); perfCtl.flush(); perfAck.read(new byte[8]);
     }
-    static long statusKb(String key) throws IOException {
+    public static long statusKb(String key) throws IOException {
         for (String l : Files.readAllLines(Path.of("/proc/self/status")))
             if (l.startsWith(key)) return Long.parseLong(l.split("\\s+")[1]);
         return -1;
     }
-    static long srvTicks() {
+    public static long srvTicks() {
         String pid = System.getenv("MYSQLD_PID");
         if (pid == null) return -1;
         try {
@@ -55,30 +55,30 @@ public class Runner {
             return Long.parseLong(f[11]) + Long.parseLong(f[12]);
         } catch (IOException e) { return -1; }
     }
-    static long[] gc() {
+    public static long[] gc() {
         long n = 0, t = 0;
         for (GarbageCollectorMXBean b : ManagementFactory.getGarbageCollectorMXBeans()) { n += b.getCollectionCount(); t += b.getCollectionTime(); }
         return new long[]{n, t};
     }
     // Process CPU in ns via clock_gettime(CLOCK_PROCESS_CPUTIME_ID) (Java 22+ FFM API).
     // OperatingSystemMXBean.getProcessCpuTime() only advances in 10 ms clock ticks on Linux.
-    static final MethodHandle CLOCK_GETTIME = Linker.nativeLinker().downcallHandle(
+    public static final MethodHandle CLOCK_GETTIME = Linker.nativeLinker().downcallHandle(
         Linker.nativeLinker().defaultLookup().find("clock_gettime").orElseThrow(),
         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
-    static final MemorySegment TS = Arena.global().allocate(16, 8);
-    static long cpuNs() {
+    public static final MemorySegment TS = Arena.global().allocate(16, 8);
+    public static long cpuNs() {
         try { int rc = (int) CLOCK_GETTIME.invokeExact(2, TS); } catch (Throwable t) { throw new RuntimeException(t); }
         return TS.get(ValueLayout.JAVA_LONG, 0) * 1_000_000_000L + TS.get(ValueLayout.JAVA_LONG, 8);
     }
-    static long cpu0, wall0, srv0, alloc0, rss0; static long[] gc0;
-    static void begin() throws IOException {
+    public static long cpu0, wall0, srv0, alloc0, rss0; static long[] gc0;
+    public static void begin() throws IOException {
         Files.writeString(Path.of("/proc/self/clear_refs"), "5");   // resets VmHWM to the current RSS
         rss0 = statusKb("VmRSS:");
         gc0 = gc(); alloc0 = TM.getCurrentThreadAllocatedBytes(); srv0 = srvTicks();
         perf("enable\n");
         wall0 = System.nanoTime(); cpu0 = cpuNs();
     }
-    static String end(Object ck) throws IOException {
+    public static String end(Object ck) throws IOException {
         long cpu = cpuNs(), wall = System.nanoTime();
         perf("disable\n");
         long s = srvTicks(); long[] g = gc();
@@ -89,11 +89,11 @@ public class Runner {
     }
 
     // ------------------------------------------------------------ connections
-    static Driver drv;
-    static String lib;
+    public static Driver drv;
+    public static String lib;
 
     /** tls: off | on (no verification) | verify. Variant-specific options come from the test variant. */
-    static Connection connect(String tls, boolean sock) throws SQLException {
+    public static Connection connect(String tls, boolean sock) throws SQLException {
         Properties p = new Properties();
         p.setProperty("user", env("DB_USER", "bench")); p.setProperty("password", env("DB_PASS", "bench"));
         boolean serverPrep = variant.equals("prepared") || variant.startsWith("binary") || variant.endsWith("binary");
@@ -129,16 +129,16 @@ public class Runner {
         return c;
     }
 
-    static String cipher(Connection c) throws SQLException {
+    public static String cipher(Connection c) throws SQLException {
         try (Statement s = c.createStatement(); ResultSet r = s.executeQuery("SHOW SESSION STATUS LIKE 'Ssl_cipher'")) {
             return r.next() && r.getString(2) != null && !r.getString(2).isEmpty() ? r.getString(2) : "none";
         }
     }
 
     // ------------------------------------------------------------ tests
-    static int[] ids;
+    public static int[] ids;
 
-    static String t1(Connection unused) throws SQLException {
+    public static String t1(Connection unused) throws SQLException {
         String tls = variant.startsWith("tls-verify") ? "verify" : variant.startsWith("tls") ? "on" : "off";
         int n = tls.equals("off") ? 10000 : 2000;
         boolean sock = variant.equals("socket");
@@ -146,7 +146,7 @@ public class Runner {
         ops = n; return Integer.toString(n);
     }
 
-    static String t2(Connection c) throws SQLException {
+    public static String t2(Connection c) throws SQLException {
         long s = 0;
         if (variant.equals("literal")) {
             try (Statement st = c.createStatement()) {
@@ -160,17 +160,17 @@ public class Runner {
         ops = ids.length; return Long.toString(s);
     }
 
-    static Statement stmtFor(Connection c, boolean streamed, boolean binary, String sql) throws SQLException {
+    public static Statement stmtFor(Connection c, boolean streamed, boolean binary, String sql) throws SQLException {
         Statement st = binary ? c.prepareStatement(sql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)
                               : c.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
         if (streamed) st.setFetchSize(mariadb ? 1000 : Integer.MIN_VALUE); // Connector/J: MIN_VALUE = row streaming
         return st;
     }
-    static ResultSet exec(Statement st, String sql) throws SQLException {
+    public static ResultSet exec(Statement st, String sql) throws SQLException {
         return st instanceof PreparedStatement ps ? ps.executeQuery() : st.executeQuery(sql);
     }
 
-    static String t3(Connection c) throws SQLException {
+    public static String t3(Connection c) throws SQLException {
         String sql = "SELECT v FROM t_int"; long s = 0;
         try (Statement st = stmtFor(c, variant.contains("streamed"), variant.startsWith("binary"), sql); ResultSet r = exec(st, sql)) {
             while (r.next()) s += r.getInt(1);
@@ -178,7 +178,7 @@ public class Runner {
         ops = 1000000; return Long.toString(s);
     }
 
-    static String t4(Connection c) throws SQLException {
+    public static String t4(Connection c) throws SQLException {
         String sql = variant.startsWith("int") ? "SELECT * FROM t_wide_int" : "SELECT * FROM t_wide_mix";
         long nn = 0, isum = 0, slen = 0; int rows = 0;
         try (Statement st = stmtFor(c, false, variant.endsWith("binary"), sql); ResultSet r = exec(st, sql)) {
@@ -212,15 +212,15 @@ public class Runner {
         ops = rows * 100L; return Long.toString(nn + isum + slen);
     }
 
-    static String[] t5parts() {
+    public static String[] t5parts() {
         String[] p = variant.split("-", 2);
         if (p[1].endsWith("-parse")) throw new NA("Java has no standard-library JSON parser");
         return new String[]{"SELECT " + p[1] + " FROM t_blob WHERE size_class = '" + p[0] + "' ORDER BY id", p[1]};
     }
-    static long touch(String v) { long c = v.length(); for (int i = 0; i < v.length(); i += 64) c += v.charAt(i); return c; }
-    static long touch(byte[] v) { long c = v.length; for (int i = 0; i < v.length; i += 64) c += v[i] & 0xff; return c; }
+    public static long touch(String v) { long c = v.length(); for (int i = 0; i < v.length(); i += 64) c += v.charAt(i); return c; }
+    public static long touch(byte[] v) { long c = v.length; for (int i = 0; i < v.length; i += 64) c += v[i] & 0xff; return c; }
 
-    static String t5(Connection c) throws SQLException {
+    public static String t5(Connection c) throws SQLException {
         String[] p = t5parts(); boolean bin = p[1].equals("doc_bin");
         long ck = 0, bytes = 0;
         try (Statement st = c.createStatement()) {
@@ -237,10 +237,10 @@ public class Runner {
         ops = bytes / 1024; return Long.toString(ck);
     }
 
-    static String rowB(int i) { return (i % 10 == 0 ? "o'k-" : "name-") + i; }
-    static String esc(String s) { return s.replace("\\", "\\\\").replace("'", "\\'"); } // JDBC exposes no escaping API
+    public static String rowB(int i) { return (i % 10 == 0 ? "o'k-" : "name-") + i; }
+    public static String esc(String s) { return s.replace("\\", "\\\\").replace("'", "\\'"); } // JDBC exposes no escaping API
 
-    static String t6(Connection c) throws SQLException {
+    public static String t6(Connection c) throws SQLException {
         if (variant.equals("sqltext")) {
             StringBuilder sb = new StringBuilder(64 * 1024);
             try (Statement st = c.createStatement()) {
@@ -278,8 +278,8 @@ public class Runner {
     }
 
     // ------------------------------------------------------------ floor (T3, T5)
-    static Object floorData;
-    static String floorRun(Connection c) throws SQLException {
+    public static Object floorData;
+    public static String floorRun(Connection c) throws SQLException {
         if (test.equals("T3")) {
             if (floorData == null) { int[] v = new int[1000000]; for (int i = 0; i < v.length; i++) v[i] = (int) ((i + 1L) * 7919 % 1000003); floorData = v; }
             long s = 0; for (int x : (int[]) floorData) s += x;
@@ -322,7 +322,7 @@ public class Runner {
         catch (NA e) { System.err.println("n/a: " + e.getMessage()); System.exit(3); }
     }
 
-    static void run(long rssStart) throws Exception {
+    public static void run(long rssStart) throws Exception {
         mariadb = driverName.equals("mariadb-j");
         drv = mariadb ? new org.mariadb.jdbc.Driver() : new com.mysql.cj.jdbc.Driver();
         lib = (mariadb ? "MariaDB Connector/J " : "MySQL Connector/J ") + drv.getMajorVersion() + "." + drv.getMinorVersion()
@@ -388,7 +388,7 @@ public class Runner {
         c.close();
     }
 
-    static String step(Connection c) throws Exception {
+    public static String step(Connection c) throws Exception {
         if (floor) return floorRun(c);
         return switch (test) {
             case "T1" -> t1(c); case "T2" -> t2(c); case "T3" -> t3(c); case "T4" -> t4(c); case "T5" -> t5(c); case "T6" -> t6(c);
@@ -396,7 +396,7 @@ public class Runner {
         };
     }
 
-    static void write(StringBuilder meta, List<String> recs) throws IOException {
+    public static void write(StringBuilder meta, List<String> recs) throws IOException {
         meta.append(",\"iters\":[").append(String.join(",", recs)).append("]}\n");
         if (out == null) System.out.print(meta); else Files.writeString(Path.of(out), meta);
     }

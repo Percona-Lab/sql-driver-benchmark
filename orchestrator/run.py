@@ -55,6 +55,13 @@ for _d in ("mysql2", "trilogy"):
     STACKS["rb-" + _d] = ("stacks/ruby", ["./run", "--driver", _d], True)
 STACKS["dotnet-mysqlconnector"] = ("stacks/dotnet", ["./run", "--driver", "mysqlconnector"], True)
 STACKS["dotnet-mysql-data"] = ("stacks/dotnet", ["./run", "--driver", "mysql-data"], True)
+# Phase 3: frameworks (each on a Phase 1/2 driver)
+for _f in ("sqlx", "gorm"):
+    STACKS["go-" + _f] = ("stacks/go", ["./runner", "--driver", _f], False)
+for _f in ("hibernate", "jooq", "jdbctemplate"):
+    STACKS["java-" + _f] = ("stacks/java", ["./run", "--fw", _f], True)
+for _f in ("sqlalchemy-core", "sqlalchemy-orm", "django-orm"):
+    STACKS["py-" + _f] = ("stacks/python", ["venv/bin/python", "fw.py", "--fw", _f], False)
 STACKS["cpp-mysql-connector"] = ("stacks/cpp", ["./run-mysql-connector"], False)
 STACKS["cpp-mariadb"] = ("stacks/cpp", ["./run-mariadb"], False)
 for _d in ("mysql", "sqlx"):

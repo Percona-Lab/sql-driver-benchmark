@@ -101,6 +101,10 @@ func run(rssStart int64) error {
 	switch fDriver {
 	case "go-sql-driver":
 		d = &SQLDriver{tuned: fConfig == "tuned"}
+	case "sqlx":
+		d = &Sqlx{SQLDriver: SQLDriver{tuned: fConfig == "tuned"}}
+	case "gorm":
+		d = &Gorm{SQLDriver: SQLDriver{tuned: fConfig == "tuned"}}
 	case "go-mysql":
 		if fConfig != "default" {
 			return na("go-mysql has no driver options to tune")
