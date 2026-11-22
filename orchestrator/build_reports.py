@@ -41,6 +41,15 @@ Growth of JIT/GC runtimes includes heap the runtime chose to keep (the JVM sizes
 """
 
 
+TUNED = json.load(open("reports/tuned.json"))
+
+
+def tuned_section(prefixes):
+    lines = [f"- **{k}**: {v}" for k, v in TUNED.items() if not k.startswith("_") and any(k.startswith(p) for p in prefixes.split(","))]
+    return ("## What \"tuned\" changes\n\nEvery \"tuned\" result uses exactly these changes from the library defaults "
+            "(server settings are never tuned). Stacks not listed have no tuned configuration.\n\n" + "\n".join(lines) + "\n\n")
+
+
 def tables(stacks, tests="T1,T2,T3,T4,T5,T6"):
     out = subprocess.run(["python3", "orchestrator/tables.py", SUM, "--stacks", stacks, "--tests", tests],
                          capture_output=True, text=True, check=True).stdout
@@ -118,7 +127,7 @@ actually disabled; see "Corrections".
 - MariaDB's bulk protocol: MariaDB Connector/Python `executemany` {cpu('py-mariadb','T6','batch','maria')} µs on MariaDB,
   {cpu('py-mariadb','T6','batch')} µs on Percona (one execute per row).
 
-## Tables
+""" + tuned_section(P1) + """## Tables
 
 Superscript numbers mark results with a note; the notes follow each table.
 """ + tables(P1)
@@ -171,7 +180,7 @@ For comparison, libmysqlclient (C) on Percona: plain connect {cpu('c-libmysqlcli
   PHP {mb('php-mysqli','T2','literal','mem_baseline_kb')} MB, .NET {mb('dotnet-mysqlconnector','T2','literal','mem_baseline_kb')} MB,
   Node {mb('node-mariadb','T2','literal','mem_baseline_kb')}–{mb('node-mysql2','T2','literal','mem_baseline_kb')} MB.
 
-## Tables
+""" + tuned_section(P2) + """## Tables
 
 Superscript numbers mark results with a note; the notes follow each table.
 """ + tables(P2)

@@ -237,6 +237,7 @@ async function main() {
   const write = (iters) => { const s = JSON.stringify({ ...meta, iters }); A.out ? fs.writeFileSync(A.out, s) : console.log(s); };
   const cipherOf = async () => { const r = await D.raw("SHOW SESSION STATUS LIKE 'Ssl_cipher'"); const x = r[0]; const v = x ? (x.Value ?? Object.values(x)[1]) : ""; return v || "none"; };
   if (A.test === "T1") throw new NA("frameworks use the driver's connections (see the driver results)");
+  if (TUNED && A.fw === "knex") throw new NA("Knex has no tuned configuration (no framework option changes this path)");
   if (A.test === "T0") {
     perfOpen(); const m = new Meter(); m.begin(); await D.open(E("DB_TLS", "off")); await D.raw("SELECT 1");
     const r = m.end(1); Object.assign(meta, { tls: await cipherOf(), ops_per_iter: 1, warmup: 0, rss_start_kb: rssStartKb }); write([r]); await D.close(); return;
