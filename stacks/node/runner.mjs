@@ -68,9 +68,10 @@ const Mysql2 = {
   query: async (c, sql, p) => (await c.query(sql, p))[0],
   queryMeta: async (c, sql, binary) => { const [rows, fields] = binary ? await c.execute(sql) : await c.query(sql); return [rows, fields.map(f => f.columnType)]; },
   execute: async (c, sql, p) => (await c.execute(sql, p))[0],
-  async *stream(c, sql, binary) {
+  // return the driver's own async-iterable stream (an extra async-generator layer would add a promise hop per row)
+  stream(c, sql, binary) {
     if (binary) throw new NA("mysql2 execute() cannot stream rows");
-    yield* c.connection.query(sql).stream();
+    return c.connection.query(sql).stream();
   },
   escape: (c, s) => c.escape(s),
   async batch(c, rows) { await c.query("INSERT INTO t_bulk (id,a,b,c) VALUES ?", [rows]); }, // nested-array multi-row expansion
@@ -88,9 +89,9 @@ const MariaDB = {
   query: (c, sql, p) => c.query(sql, p),
   async queryMeta(c, sql, binary) { const rows = binary ? await c.execute(sql) : await c.query(sql); return [rows, rows.meta.map(m => m.columnType)]; },
   execute: (c, sql, p) => c.execute(sql, p),
-  async *stream(c, sql, binary) {
-    if (binary) { const p = await c.prepare(sql); try { yield* p.executeStream([]); } finally { p.close(); } }
-    else yield* c.queryStream(sql);
+  stream(c, sql, binary) {
+    if (!binary) return c.queryStream(sql);   // the driver's own async-iterable stream, iterated directly
+    return (async function* () { const p = await c.prepare(sql); try { yield* p.executeStream([]); } finally { p.close(); } })();
   },
   escape: (c, s) => c.escape(s),
   async batch(c, rows) {

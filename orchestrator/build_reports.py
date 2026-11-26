@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write reports/phase1.md and reports/phase2.md from the aggregated results.
+"""Write reports/phase1.md, phase2.md and phase3.md from the aggregated results.
 Numbers in the prose are looked up from the data, so text and tables cannot drift apart.
 
 usage: build_reports.py summary.json summary-mem.json   (report.py output of the timed runs and of the memory pass)
@@ -10,6 +10,13 @@ SUM, MEM = sys.argv[1], sys.argv[2]
 rows = {(r["server"], r["stack"], r["test"], r["variant"], r["config"]): r for r in json.load(open(SUM)) if "cpu_ns_op" in r}
 mem = {(r["server"], r["stack"], r["test"], r["variant"], r["config"]): r for r in json.load(open(MEM)) if "mem_work_kb" in r}
 DIV = {"T0": 1e6, "T1": 1e3, "T2": 1e3, "T3": 1, "T4": 1, "T5": 1, "T6": 1e3}
+# results before the steady-state rerun of 2026-11-26 (kept for the corrections sections)
+OLD = {(r["server"], r["stack"], r["test"], r["variant"], r["config"]): r
+       for r in json.load(open("results/summary-before-steady-state-rerun-2026-11-26.json")) if "cpu_ns_op" in r}
+
+
+def old(stack, test, variant, server="ps", config="default"):
+    return fmt(OLD[(server, stack, test, variant, config)]["cpu_ns_op"] / DIV[test])
 
 
 def fmt(v):
@@ -18,6 +25,10 @@ def fmt(v):
 
 def cpu(stack, test, variant, server="ps", config="default"):
     return fmt(rows[(server, stack, test, variant, config)]["cpu_ns_op"] / DIV[test])
+
+
+def instr(stack, test, variant, server="ps", config="default"):
+    return fmt(rows[(server, stack, test, variant, config)]["instr_op"])
 
 
 def mb(stack, test, variant, field="mem_work_kb", server="ps", config="default"):
@@ -44,8 +55,9 @@ Growth of JIT/GC runtimes includes heap the runtime chose to keep (the JVM sizes
 TUNED = json.load(open("reports/tuned.json"))
 
 
-def tuned_section(prefixes):
-    lines = [f"- **{k}**: {v}" for k, v in TUNED.items() if not k.startswith("_") and any(k.startswith(p) for p in prefixes.split(","))]
+def tuned_section(stacks):
+    want = stacks.split(",")
+    lines = [f"- **{k}**: {v}" for k, v in TUNED.items() if k in want]
     return ("## What \"tuned\" changes\n\nEvery \"tuned\" result uses exactly these changes from the library defaults "
             "(server settings are never tuned). Stacks not listed have no tuned configuration.\n\n" + "\n".join(lines) + "\n\n")
 
@@ -59,7 +71,29 @@ def tables(stacks, tests="T1,T2,T3,T4,T5,T6"):
     return out
 
 
-P1 = "c-,go-,java-,py-"
+P1 = ("c-libmysqlclient,c-mariadb-connc,go-sql-driver,go-mysql,java-connector-j,java-mariadb-j,"
+      "py-mysqlclient,py-mysql-connector-c,py-mariadb,py-pymysql,py-mysql-connector-pure")
+
+STEADY = f"""## Correction: steady state for JIT runtimes (2026-11-26)
+
+The adaptive warm-up stopped once three iterations agreed within 5%. Three equal iterations can be a plateau of
+not-yet-optimized code: .NET ran streamed reads at about 600 ms per iteration for several iterations, then about 120 ms
+once optimized code arrived, so the reported median mixed both. Every timed JIT process is now checked after it runs (first
+measured iteration more than 10% above the median of the last three → rerun with 10, 20, then 40 warm-up iterations), and
+the 90 earlier JIT cells whose median was more than 5% above their late-iteration level were rerun this way
+([SPEC.md](../SPEC.md) section 6). Examples (Percona unless noted, before → after): MySqlConnector streamed rows
+{old('dotnet-mysqlconnector','T3','text-streamed')} → **{cpu('dotnet-mysqlconnector','T3','text-streamed')} ns/row**,
+MySql.Data {old('dotnet-mysql-data','T3','text-streamed')} → {cpu('dotnet-mysql-data','T3','text-streamed')} ns/row,
+Connector/J buffered rows on MariaDB {old('java-connector-j','T3','text-buffered','maria')} →
+{cpu('java-connector-j','T3','text-buffered','maria')} ns/row, MariaDB Connector/J 1 KB documents on MariaDB
+{old('java-mariadb-j','T5','1k-doc_bin','maria')} → {cpu('java-mariadb-j','T5','1k-doc_bin','maria')} ns/KB. A few JIT cells
+still vary between or within processes (GC cycles, or different JIT outcomes per process); they carry the "noisy" note.
+The Node.js drivers' streamed results also changed: the runner consumed the driver's stream through an extra async
+generator (one more promise per row); it now iterates the driver's stream directly, as an application would (mysql2
+{old('node-mysql2','T3','text-streamed')} → {cpu('node-mysql2','T3','text-streamed')} ns/row, mariadb
+{old('node-mariadb','T3','text-streamed')} → {cpu('node-mariadb','T3','text-streamed')} ns/row).
+
+"""
 p1 = f"""# Phase 1 report — C, Go, Java, Python
 
 {DISCLOSURE}
@@ -68,7 +102,7 @@ Server 9.7.2-3 and MariaDB 12.3.4 with identical configuration. Java was rerun w
 actually disabled; see "Corrections".
 
 {COMMON}
-## Corrections to the first version of this report
+""" + STEADY + f"""## Earlier corrections
 
 - **PyMySQL was not slow to connect.** PyMySQL negotiates TLS by default whenever the server offers it, and the first runner
   did not turn that off, so every non-TLS PyMySQL result ran over TLS. With `ssl_disabled=True` a plain connect costs
@@ -103,7 +137,7 @@ actually disabled; see "Corrections".
 **Large result sets (1M ints, buffered text protocol)**
 - **MariaDB Connector/J {cpu('java-mariadb-j','T3','text-buffered')} ns/row, cheaper than libmysqlclient
   ({cpu('c-libmysqlclient','T3','text-buffered')} ns):** it keeps the raw bytes and converts only on `getInt()`, while
-  libmysqlclient copies every row into its own structures (310 vs 736 instructions per row). Connector/J
+  libmysqlclient copies every row into its own structures ({instr('java-mariadb-j','T3','text-buffered')} vs {instr('c-libmysqlclient','T3','text-buffered')} instructions per row). Connector/J
   {cpu('java-connector-j','T3','text-buffered')} ns.
 - **libmysqlclient over TLS: {cpu('c-libmysqlclient','T3','text-buffered+tls')} ns/row** (two `SSL_read` calls per row);
   MariaDB Connector/C {cpu('c-mariadb-connc','T3','text-buffered+tls')} ns.
@@ -132,7 +166,8 @@ actually disabled; see "Corrections".
 Superscript numbers mark results with a note; the notes follow each table.
 """ + tables(P1)
 
-P2 = "cpp-,rust-,dotnet-,node-,php-,rb-"
+P2 = ("cpp-mysql-connector,cpp-mariadb,rust-mysql,rust-sqlx,dotnet-mysqlconnector,dotnet-mysql-data,node-mysql2,"
+      "node-mariadb,node-mysql,php-mysqli,php-pdo-mysql,rb-mysql2,rb-trilogy")
 p2 = f"""# Phase 2 report — C++, Rust, .NET, Node.js, PHP, Ruby
 
 {DISCLOSURE}
@@ -142,7 +177,7 @@ Connector/C++ 1.1.9, Rust `mysql` 28.0.4 and `sqlx` 0.9.1, MySqlConnector 3.0.0 
 mariadb 3.5.5 and mysql 2.18.1, PHP 8.5 mysqli and PDO_MySQL (mysqlnd), Ruby mysql2 0.5.7 and trilogy 2.13.3.
 
 {COMMON}
-For comparison, libmysqlclient (C) on Percona: plain connect {cpu('c-libmysqlclient','T1','tcp')} µs, point select
+""" + STEADY + f"""For comparison, libmysqlclient (C) on Percona: plain connect {cpu('c-libmysqlclient','T1','tcp')} µs, point select
 {cpu('c-libmysqlclient','T2','literal')} µs, 1M buffered rows {cpu('c-libmysqlclient','T3','text-buffered')} ns/row.
 
 ## Key findings
@@ -185,6 +220,8 @@ For comparison, libmysqlclient (C) on Percona: plain connect {cpu('c-libmysqlcli
 Superscript numbers mark results with a note; the notes follow each table.
 """ + tables(P2)
 
+exec(open("orchestrator/phase3_report.py").read())
 open("reports/phase1.md", "w").write(p1)
 open("reports/phase2.md", "w").write(p2)
-print("wrote reports/phase1.md", len(p1), "and reports/phase2.md", len(p2))
+open("reports/phase3.md", "w").write(p3)
+print("wrote reports/phase1.md", len(p1), "phase2.md", len(p2), "phase3.md", len(p3))

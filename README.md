@@ -54,20 +54,27 @@ variant), so only client-side cost differs between drivers. Exact versions: [res
 | PHP 8.5 | mysqli, PDO_MySQL (mysqlnd) |
 | Ruby 4.0 (YJIT) | mysql2 0.5.7, trilogy 2.13.3 |
 
-Next: frameworks (SQLAlchemy, Django, Hibernate, jOOQ, GORM, Prisma, Sequelize, Doctrine, ActiveRecord, EF Core, Diesel, …),
-then async drivers, ODBC and Perl.
+Frameworks (Phase 3), each on the driver named in the [Phase 3 report](reports/phase3.md): SQLAlchemy 2.1 Core/ORM,
+Django 6.1, Spring JdbcTemplate 7.1, jOOQ 3.21, Hibernate 7.4, sqlx 1.4 and GORM 1.31 (Go), Knex 3.3, Drizzle 0.45,
+TypeORM 1.1, Sequelize 6.37, Prisma 7.10, Dapper 2.1, EF Core 9.0 (Pomelo), Doctrine DBAL 4.6 and ORM 3.8, Eloquent 13.43,
+Sequel 5.110, ActiveRecord 8.1, Diesel 2.4, SeaORM 2.0. Later: async drivers, ODBC and Perl.
 
 ## Status
 
-- **All 24 drivers measured** (C, C++, Go, Rust, Java, .NET, Python, Node.js, PHP, Ruby) on both servers, CPU and memory.
-  Reports: [Phase 1 — C, Go, Java, Python](reports/phase1.md) · [Phase 2 — C++, Rust, .NET, Node.js, PHP, Ruby](reports/phase2.md).
+- **All 24 drivers and 22 frameworks measured** (C, C++, Go, Rust, Java, .NET, Python, Node.js, PHP, Ruby) on both
+  servers, CPU and memory. Reports: [Phase 1 — C, Go, Java, Python](reports/phase1.md) ·
+  [Phase 2 — C++, Rust, .NET, Node.js, PHP, Ruby](reports/phase2.md) · [Phase 3 — frameworks](reports/phase3.md).
+- 2026-11-26: steady-state correction for JIT runtimes (warm-up could stop on a plateau of unoptimized code; 90 cells
+  rerun) and for the Node.js drivers' streamed rows; see the correction section in each report.
 - `results/summary.json` (timed runs) and `results/summary-mem.json` (memory pass) aggregate `results/raw/` and `results/raw-mem/`.
-- Next: profiling pass (where the time goes), then frameworks (SQLAlchemy, Hibernate, GORM, Prisma, …).
+- Next: profiling pass (where the time goes).
 
 ## Updating the results page
 
 `docs/` is the GitHub Pages site. After a run: `python3 orchestrator/report.py results/raw > s.json`,
-`python3 orchestrator/artifact_data.py s.json docs/data/cells.json`, and copy `reports/notes.json` to `docs/data/`.
+`python3 orchestrator/artifact_data.py s.json docs/data/cells.json --mem summary-mem.json`, copy `reports/notes.json` and
+`reports/tuned.json` to `docs/data/`, then `python3 orchestrator/build_site.py`. Reports: `python3 orchestrator/build_reports.py
+results/summary.json results/summary-mem.json` (framework tax: `orchestrator/fwtax.py`).
 Notes are rules in `reports/notes.json` matched against server, driver, test, variant and config.
 
 ## Layout

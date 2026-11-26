@@ -127,7 +127,10 @@ public class Fw {
             for (int st = 1; st <= 1000000; st += 1000) {
                 if (TUNED) {
                     org.hibernate.Transaction tx = ss.beginTransaction();
-                    for (int i = st; i < st + 1000; i++) ss.insert(new Entities.TBulk(i, i * 3, rowB(i), i * 0.5));
+                    // insertMultiple(): stateless inserts as one JDBC batch (hibernate.jdbc.batch_size=1000); ss.insert() executes per row
+                    List<Entities.TBulk> rows = new ArrayList<>(1000);
+                    for (int i = st; i < st + 1000; i++) rows.add(new Entities.TBulk(i, i * 3, rowB(i), i * 0.5));
+                    ss.insertMultiple(rows);
                     tx.commit();
                 } else {
                     org.hibernate.Transaction tx = s.beginTransaction();

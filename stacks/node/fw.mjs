@@ -130,7 +130,8 @@ FW.typeorm = () => {
   return {
     name: "node-typeorm", lib: `TypeORM ${pkgVersion("typeorm")} on mysql2 ${pkgVersion("mysql2")}`,
     async open(tls) {
-      ds = new DataSource({ type: "mysql", ...conn(), ssl: sslOpt(tls), entities: Object.values(E_), synchronize: false, logging: false,
+      const { user, ...rest } = conn();   // TypeORM calls it "username"
+      ds = new DataSource({ type: "mysql", ...rest, username: user, ssl: sslOpt(tls), entities: Object.values(E_), synchronize: false, logging: false,
         poolSize: 1, extra: { jsonStrings: true }, supportBigNumbers: true, bigNumberStrings: false });
       await ds.initialize();
       for (const [k, e] of Object.entries(E_)) R[k] = ds.getRepository(e);

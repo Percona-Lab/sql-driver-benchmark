@@ -17,7 +17,19 @@ NAME = {"c-libmysqlclient": "libmysqlclient 9.7", "c-mariadb-connc": "MariaDB Co
         "dotnet-mysqlconnector": "MySqlConnector 3.0", "dotnet-mysql-data": "MySql.Data 26.10",
         "node-mysql2": "mysql2 3.24 (Node)", "node-mariadb": "mariadb 3.5 (Node)", "node-mysql": "mysql 2.18 (Node, legacy)",
         "php-mysqli": "mysqli (PHP 8.5)", "php-pdo-mysql": "PDO_MySQL (PHP 8.5)",
-        "rb-mysql2": "mysql2 0.5 (Ruby)", "rb-trilogy": "trilogy 2.13 (Ruby)"}
+        "rb-mysql2": "mysql2 0.5 (Ruby)", "rb-trilogy": "trilogy 2.13 (Ruby)",
+        # Phase 3 frameworks
+        "py-sqlalchemy-core": "SQLAlchemy 2.1 Core", "py-sqlalchemy-orm": "SQLAlchemy 2.1 ORM", "py-django-orm": "Django 6.1 ORM",
+        "java-jdbctemplate": "Spring JdbcTemplate 7.1", "java-jooq": "jOOQ 3.21", "java-hibernate": "Hibernate 7.4",
+        "go-sqlx": "sqlx 1.4 (Go)", "go-gorm": "GORM 1.31",
+        "node-knex": "Knex 3.3", "node-drizzle": "Drizzle 0.45", "node-typeorm": "TypeORM 1.1", "node-sequelize": "Sequelize 6.37",
+        "node-prisma": "Prisma 7.10",
+        "dotnet-dapper": "Dapper 2.1", "dotnet-efcore": "EF Core 9.0 (Pomelo)",
+        "php-dbal": "Doctrine DBAL 4.6", "php-doctrine-orm": "Doctrine ORM 3.8", "php-eloquent": "Eloquent 13.43",
+        "rb-sequel": "Sequel 5.110", "rb-activerecord": "ActiveRecord 8.1",
+        "rust-diesel": "Diesel 2.4", "rust-seaorm": "SeaORM 2.0"}
+sys.path.insert(0, __import__("os").path.dirname(__file__))
+from fwtax import BASE   # framework -> driver it runs on
 
 
 def sig(v, n=3):
@@ -51,6 +63,7 @@ for r in rows:
         continue
     unit, div = UNIT[r["test"]]
     o = {"server": r["server"], "stack": st, "driver": NAME.get(st, st), "lang": LANG[st.split("-")[0]],
+         "kind": "framework" if st in BASE else "driver", "base": BASE.get(st),
          "test": r["test"], "variant": r["variant"], "config": r["config"], "unit": unit}
     if "status" in r:
         o.update(status=r["status"], reason=r["reason"], cpu=None)

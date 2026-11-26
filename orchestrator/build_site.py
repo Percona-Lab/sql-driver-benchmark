@@ -90,7 +90,7 @@ html = f"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>SQL Driver Benchmark</title>
-<meta name="description" content="Client-side CPU and memory cost of 24 MySQL and MariaDB drivers in ten languages, measured on bare metal.">
+<meta name="description" content="Client-side CPU and memory cost of 24 MySQL and MariaDB drivers and 22 frameworks in ten languages, measured on bare metal.">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Source+Serif+4:wght@400&display=swap">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>

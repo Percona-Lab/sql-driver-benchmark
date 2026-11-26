@@ -27,7 +27,12 @@ UNIT = {"T0": ("ms", 1e6), "T1": ("µs/connect", 1e3), "T2": ("µs/query", 1e3),
 ORDER = ["c-libmysqlclient", "c-mariadb-connc", "cpp-mysql-connector", "cpp-mariadb", "go-sql-driver", "go-mysql", "java-connector-j", "java-mariadb-j",
          "rust-mysql", "rust-sqlx", "dotnet-mysqlconnector", "dotnet-mysql-data", "node-mysql2", "node-mariadb", "node-mysql",
          "php-mysqli", "php-pdo-mysql", "rb-mysql2", "rb-trilogy",
-         "py-mysqlclient", "py-mysql-connector-c", "py-mariadb", "py-pymysql", "py-mysql-connector-pure"]
+         "py-mysqlclient", "py-mysql-connector-c", "py-mariadb", "py-pymysql", "py-mysql-connector-pure",
+         # Phase 3 frameworks
+         "py-sqlalchemy-core", "py-sqlalchemy-orm", "py-django-orm", "java-jdbctemplate", "java-jooq", "java-hibernate",
+         "go-sqlx", "go-gorm", "node-knex", "node-drizzle", "node-typeorm", "node-sequelize", "node-prisma",
+         "dotnet-dapper", "dotnet-efcore", "php-dbal", "php-doctrine-orm", "php-eloquent", "rb-sequel", "rb-activerecord",
+         "rust-diesel", "rust-seaorm"]
 
 ap = argparse.ArgumentParser()
 ap.add_argument("summary")
@@ -37,7 +42,8 @@ ap.add_argument("--stacks", help="comma-separated stack prefixes to include")
 a = ap.parse_args()
 rows = json.load(open(a.summary))
 if a.stacks:
-    rows = [r for r in rows if any(r["stack"].startswith(p) for p in a.stacks.split(","))]
+    want = a.stacks.split(",")
+    rows = [r for r in rows if r["stack"] in want or any(p.endswith("-") and r["stack"].startswith(p) for p in want)]
 MEM = a.metric.startswith("mem_")
 if MEM:
     rows = [r for r in rows if "status" in r or a.metric in r]

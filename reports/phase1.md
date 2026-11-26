@@ -16,7 +16,26 @@ start. It reads near zero when a runtime keeps freed memory between iterations (
 so for those *memory growth* is the better measure: the highest peak minus the memory right after connecting, before warm-up.
 Growth of JIT/GC runtimes includes heap the runtime chose to keep (the JVM sizes its heap up to a quarter of RAM by default).
 
-## Corrections to the first version of this report
+## Correction: steady state for JIT runtimes (2026-11-26)
+
+The adaptive warm-up stopped once three iterations agreed within 5%. Three equal iterations can be a plateau of
+not-yet-optimized code: .NET ran streamed reads at about 600 ms per iteration for several iterations, then about 120 ms
+once optimized code arrived, so the reported median mixed both. Every timed JIT process is now checked after it runs (first
+measured iteration more than 10% above the median of the last three → rerun with 10, 20, then 40 warm-up iterations), and
+the 90 earlier JIT cells whose median was more than 5% above their late-iteration level were rerun this way
+([SPEC.md](../SPEC.md) section 6). Examples (Percona unless noted, before → after): MySqlConnector streamed rows
+480 → **120 ns/row**,
+MySql.Data 1,078 → 600 ns/row,
+Connector/J buffered rows on MariaDB 272 →
+160 ns/row, MariaDB Connector/J 1 KB documents on MariaDB
+1,107 → 399 ns/KB. A few JIT cells
+still vary between or within processes (GC cycles, or different JIT outcomes per process); they carry the "noisy" note.
+The Node.js drivers' streamed results also changed: the runner consumed the driver's stream through an extra async
+generator (one more promise per row); it now iterates the driver's stream directly, as an application would (mysql2
+288 → 152 ns/row, mariadb
+165 → 91.5 ns/row).
+
+## Earlier corrections
 
 - **PyMySQL was not slow to connect.** PyMySQL negotiates TLS by default whenever the server offers it, and the first runner
   did not turn that off, so every non-TLS PyMySQL result ran over TLS. With `ssl_disabled=True` a plain connect costs
@@ -51,7 +70,7 @@ Growth of JIT/GC runtimes includes heap the runtime chose to keep (the JVM sizes
 **Large result sets (1M ints, buffered text protocol)**
 - **MariaDB Connector/J 26.1 ns/row, cheaper than libmysqlclient
   (37.1 ns):** it keeps the raw bytes and converts only on `getInt()`, while
-  libmysqlclient copies every row into its own structures (310 vs 736 instructions per row). Connector/J
+  libmysqlclient copies every row into its own structures (453 vs 736 instructions per row). Connector/J
   268 ns.
 - **libmysqlclient over TLS: 78.3 ns/row** (two `SSL_read` calls per row);
   MariaDB Connector/C 38 ns.
@@ -75,6 +94,14 @@ Growth of JIT/GC runtimes includes heap the runtime chose to keep (the JVM sizes
 - MariaDB's bulk protocol: MariaDB Connector/Python `executemany` 608 µs on MariaDB,
   13,733 µs on Percona (one execute per row).
 
+## What "tuned" changes
+
+Every "tuned" result uses exactly these changes from the library defaults (server settings are never tuned). Stacks not listed have no tuned configuration.
+
+- **go-sql-driver**: interpolateParams=true (client-side parameter interpolation instead of prepare + execute + close per call).
+- **java-connector-j**: useServerPrepStmts=true, cachePrepStmts=true, prepStmtCacheSize=250, rewriteBatchedStatements=true, cacheServerConfiguration=true, useLocalSessionState=true, maintainTimeStats=false.
+- **java-mariadb-j**: useServerPrepStmts=true, cachePrepStmts=true, prepStmtCacheSize=250, useBulkStmts=true.
+
 ## Tables
 
 Superscript numbers mark results with a note; the notes follow each table.
@@ -89,7 +116,7 @@ Superscript numbers mark results with a note; the notes follow each table.
 | go-sql-driver | tuned | 17.2³ / 14.5³ | 31.7³ / 26.6³ | 285 / 2,557¹ | 233 / 2,562¹ | 395 / 2,618¹ | 236 / 2,622¹ | n/a / n/a¹⁰ |
 | go-mysql | default | 25³ / 22.4³ | 39.4³ / 34.7³ | 314 / 2,606¹ | 265 / 2,608¹ | 452 / 2,690¹ | 292 / 2,701¹ | n/a / 69.5 |
 | java-connector-j | default | n/a³ / n/a³ | 71.6³ / 67.2³ | 1,527¹⁵ / 7,421¹ | n/a / n/a¹ | 4,233 / 9,653¹˒¹⁶ | n/a / n/a¹ | n/a / n/a |
-| java-connector-j | tuned | n/a³ / n/a³ | 55.4³ / 51.4³ | 1,699¹⁵ / 7,562¹ | n/a / n/a¹ | 4,213 / 10,152¹ | n/a / n/a¹ | n/a / n/a |
+| java-connector-j | tuned | n/a³ / n/a³ | 55.4³ / 51.4³ | 1,392 / 7,562¹ | n/a / n/a¹ | 4,213 / 10,152¹ | n/a / n/a¹ | n/a / n/a |
 | java-mariadb-j | default | 40.1³ / 34.6³ | 57.1³ / 49.7³ | 1,466¹⁵ / 7,143¹ | n/a / n/a¹ | 1,630¹⁵ / 7,186¹ | n/a / n/a¹ | n/a / 146 |
 | java-mariadb-j | tuned | 53.6³ / 48.1³ | 71.5³ / 63.2³ | 1,512¹⁵ / 6,972¹˒¹⁵ | n/a / n/a¹ | 1,561¹⁵ / 7,047¹˒¹⁵ | n/a / n/a¹ | n/a / 161 |
 | py-mysqlclient | default | 29.6³ / 28.9³ | 46.6³ / 44.4³ | 3,684² / 3,954¹˒² | n/a² / n/a¹˒² | 816 / 1,103¹ | n/a / n/a¹ | n/a / n/a |
@@ -138,10 +165,10 @@ Superscript numbers mark results with a note; the notes follow each table.
 | go-sql-driver | default | n/a / n/a | 85.7 / 85.5 | n/a / n/a | n/a / n/a | 101 / 100 | 103 / 105 |
 | go-sql-driver | tuned | n/a / n/a | 85.8 / 85.6 | n/a / n/a | n/a / n/a | 101 / 101 | 102 / 107 |
 | go-mysql | default | 69.3 / 69.8 | 65.7 / 65.9 | 83.4 / 83.1 | 84.3 / 85.7 | 78.7 / 81.4 | 80.6 / 83.9 |
-| java-connector-j | default | 253 / 254 | 143 / 143 | 268 / 272 | 259¹⁵˒¹⁶ / 236¹⁵ | 149 / 149 | 150 / 148 |
-| java-connector-j | tuned | 223 / 220 | 121 / 121 | 233 / 242¹⁵ | 172¹⁵˒¹⁶ / 149¹⁵ | 120 / 120 | 125 / 120 |
+| java-connector-j | default | 253 / 254 | 143 / 143 | 268 / 160¹⁶ | 175¹⁵˒¹⁶ / 164¹⁶ | 149 / 149 | 150 / 148 |
+| java-connector-j | tuned | 223 / 220 | 121 / 121 | 233 / 130¹⁵˒¹⁶ | 172¹⁵˒¹⁶ / 135¹⁵˒¹⁶ | 120 / 120 | 125 / 120 |
 | java-mariadb-j | default | 33.3 / 31.9¹⁵ | 19.2 / 19.8 | 26.1 / 26.3 | 27.7¹⁵ / 27.5 | 16.7 / 16.6 | 19.2 / 19.4 |
-| java-mariadb-j | tuned | 33.3 / 33.5 | 19.5 / 19.2 | 26 / 26.4 | 28.4 / 28 | 16.5 / 16.7 | 19 / 19.4¹⁵ |
+| java-mariadb-j | tuned | 33.3 / 33.5 | 19.5 / 19.2 | 26 / 26.4 | 25 / 28 | 16.5 / 16.7 | 19 / 19.4¹⁵ |
 | py-mysqlclient | default | n/a / n/a | n/a / n/a | 218 / 219 | 260 / 260 | 320 / 319 | 425 / 427 |
 | py-mysql-connector-c | default | 1,300 / 1,313 | 1,291 / 1,321 | 500 / 506 | 575 / 585 | 989 / 999 | 1,102 / 1,118 |
 | py-mariadb | default | 306 / 305 | 400 / 409 | 196 / 197 | 196 / 197 | 396 / 401 | 402 / 405 |
@@ -161,10 +188,10 @@ Superscript numbers mark results with a note; the notes follow each table.
 | go-sql-driver | default | 35.4 / 35.2 | 50.3 / 50.7 | 48.6 / 48.6 | 61.9 / 61.9 |
 | go-sql-driver | tuned | 35.4 / 35.3 | 50.4 / 51 | 48.3 / 48.5 | 61.4 / 61.6 |
 | go-mysql | default | 8.96 / 8.79 | 21.8 / 21.9 | 53.5 / 53 | 25.6 / 25.9 |
-| java-connector-j | default | 67.1 / 67.7 | 72.4 / 71.4 | 76.1¹⁵˒¹⁶ / 87.6¹⁵ | 87.3 / 87.4¹⁵ |
-| java-connector-j | tuned | 66.1 / 66.9 | 75.2 / 76.5¹⁵ | 75.2¹⁵˒¹⁶ / 66.5¹⁵˒¹⁶ | 84.9¹⁶ / 88.3 |
-| java-mariadb-j | default | 7.74¹⁵ / 7.39 | 8.74 / 8.47 | 24.6 / 25 | 33.3¹⁵ / 33.2¹⁵ |
-| java-mariadb-j | tuned | 8.05¹⁵ / 11¹⁵ | 8.54 / 8.65 | 23.7 / 24.6¹⁵ | 32.5 / 30.7 |
+| java-connector-j | default | 67.1 / 67.7 | 72.4 / 71.4 | 64.6¹⁵˒¹⁶ / 87.6¹⁵ | 87.3 / 87.4¹⁵ |
+| java-connector-j | tuned | 66.1 / 66.9 | 75.2 / 72.9 | 75.2¹⁵˒¹⁶ / 66.5¹⁵˒¹⁶ | 89 / 88.3 |
+| java-mariadb-j | default | 7.74¹⁵ / 7.39 | 8.74 / 8.47 | 24.6 / 24¹⁵˒¹⁶ | 30.1¹⁵˒¹⁶ / 30.6¹⁵˒¹⁶ |
+| java-mariadb-j | tuned | 7.69 / 7.61 | 8.54 / 8.65 | 23.7 / 24.6¹⁵ | 32.5 / 30.7 |
 | py-mysqlclient | default | n/a / n/a | 66.8 / 66.9 | n/a / n/a | 197 / 196 |
 | py-mysql-connector-c | default | 107 / 108 | 95.4 / 95.5 | 262 / 261 | 242 / 241 |
 | py-mariadb | default | 61.6 / 61.5 | 110 / 109 | 83.2 / 81.3 | 148 / 148 |
@@ -183,9 +210,9 @@ Superscript numbers mark results with a note; the notes follow each table.
 | go-sql-driver | default | 184⁵ / 147 | 375⁵ / 388 | 148 / 147 | 332⁵ / 255 | 257 / 256 | 526⁵ / 480 | 485 / 485 | 264⁵ / 199 | 199 / 199 | 16,364⁵ / 17,641 |
 | go-sql-driver | tuned | 185⁵ / 147 | 373⁵ / 387 | 149 / 148 | 332⁵ / 254 | 257 / 257 | 522⁵ / 477 | 479 / 484 | 264⁵ / 199 | 199 / 199 | 16,378⁵ / 17,576 |
 | go-mysql | default | 237⁵ / 225 | 439⁵ / 403 | 223 / 226 | 349⁵˒¹⁵ / 265 | 266 / 268 | 424⁵ / 380 | 377 / 382 | 251⁵ / 204 | 196 / 201 | 14,796⁵ / 16,069 |
-| java-connector-j | default | 205⁵ / 208 | 435⁵ / 466 | 200 / 198 | 397⁵˒¹⁵ / 392 | 385¹⁵ / 376 | 555⁵˒¹⁵ / 1,601¹⁵ | 578¹⁵˒¹⁶ / 1,226¹⁵˒¹⁶ | 344⁵ / 336¹⁵ | 325¹⁵ / 308¹⁵ | n/a⁵ / n/a |
-| java-connector-j | tuned | 204⁵ / 209 | 436⁵ / 467 | 198 / 193 | 393⁵ / 384¹⁵˒¹⁶ | 371¹⁵ / 377¹⁵ | 612⁵˒¹⁵˒¹⁶ / 1,528¹⁵˒¹⁶ | 724¹⁵˒¹⁶ / 627¹⁵˒¹⁶ | 345⁵ / 347 | 313¹⁵ / 327¹⁵˒¹⁶ | n/a⁵ / n/a |
-| java-mariadb-j | default | 331⁵ / 363 | 588⁵ / 608 | 326 / 300 | 416⁵ / 402¹⁵ | 394 / 394¹⁵ | 454⁵˒¹⁵ / 768¹⁵ | 543¹⁵˒¹⁶ / 1,107¹⁵ | 327⁵ / 312 | 299 / 301 | n/a⁵ / n/a |
+| java-connector-j | default | 205⁵ / 208 | 435⁵ / 466 | 200 / 198 | 397⁵˒¹⁵ / 392 | 385¹⁵ / 376 | 555⁵˒¹⁵ / 1,601¹⁵ | 578¹⁵˒¹⁶ / 478¹⁵˒¹⁶ | 344⁵ / 336¹⁵ | 325¹⁵ / 308¹⁵ | n/a⁵ / n/a |
+| java-connector-j | tuned | 204⁵ / 209 | 436⁵ / 467 | 198 / 193 | 393⁵ / 384¹⁵˒¹⁶ | 371¹⁵ / 377¹⁵ | 544⁵˒¹⁵˒¹⁶ / 1,528¹⁵˒¹⁶ | 724¹⁵˒¹⁶ / 495¹⁵˒¹⁶ | 345⁵ / 331 | 313¹⁵ / 327¹⁵˒¹⁶ | n/a⁵ / n/a |
+| java-mariadb-j | default | 331⁵ / 363 | 588⁵ / 608 | 326 / 300 | 416⁵ / 402¹⁵ | 394 / 394¹⁵ | 454⁵˒¹⁵ / 385¹⁶ | 345¹⁵ / 399¹⁵ | 327⁵ / 312 | 299 / 311 | n/a⁵ / n/a |
 | java-mariadb-j | tuned | 350⁵ / 352 | 587⁵ / 604 | 330 / 330 | 414⁵ / 401¹⁵ | 372 / 368¹⁵ | 392⁵˒¹⁵ / 369¹⁵ | 509¹⁵ / 371¹⁵ | 328⁵ / 310 | 303¹⁵ / 298¹⁵ | n/a⁵ / n/a |
 | py-mysqlclient | default | 351⁵ / 354 | 477⁵ / 486 | 253 / 254 | 463⁵ / 462 | 349 / 350 | 736⁵ / 708 | 516 / 521 | 457⁵ / 349 | 232 / 232 | 3,962⁵ / 4,372 |
 | py-mysql-connector-c | default | 376⁵ / 386 | 501⁵ / 499 | 274 / 269 | 515⁵ / 509 | 399 / 393 | 1,604⁵ / 1,599 | 1,346 / 1,350 | 519⁵ / 403 | 281 / 281 | 3,999⁵ / 4,296 |
@@ -210,7 +237,7 @@ Superscript numbers mark results with a note; the notes follow each table.
 | java-connector-j | default | 397 / 389 | 108 / 105¹⁵ | 5,665⁹ / 5,505⁹ |
 | java-connector-j | tuned | 293 / 268 | 106 / 98¹⁵ | 1,504⁹ / 1,422⁹ |
 | java-mariadb-j | default | 132 / 131 | 81.6 / 80.1 | 3,957⁸ / 114⁸ |
-| java-mariadb-j | tuned | 99.7 / 104 | 80.9 / 80 | 3,890⁸ / 116⁸ |
+| java-mariadb-j | tuned | 99.7 / 99.2 | 80.9 / 80 | 3,890⁸ / 116⁸ |
 | py-mysqlclient | default | 1,811 / 1,837 | 813 / 821 | 2,326 / 2,351 |
 | py-mysql-connector-c | default | 1,208 / 1,219 | 806 / 814 | 2,079 / 2,098 |
 | py-mariadb | default | 1,351 / 1,396 | 608 / 612 | 13,733⁸ / 608⁸˒¹⁵ |

@@ -122,6 +122,12 @@ on the native parts of the others.
   Ruby YJIT) warm up adaptively: iterations continue until the last 3 agree within 5% of their median (minimum 3, cap
   40 iterations or 120 s), then 2 more measured iterations than the native stacks. Each result records the warm-up
   count and whether it stabilised (`warmup`, `warmup_adaptive`, `warmup_stable`); an unstable one gets a note.
+  **Plateau check (added 2026-11-26).** Three equal iterations can be a plateau of not-yet-optimized code (.NET ran
+  streamed reads at ~600 ms per iteration for several iterations, then ~120 ms once tier-1 code arrived). After each timed
+  JIT process the orchestrator checks the measured iterations; if the first is more than 10% above the median of the last
+  three, the process is rerun with twice the minimum warm-up (10, 20, 40). Cells from earlier runs whose reported median
+  was more than 5% above the median of their last three iterations (90 of the JIT cells) were rerun this way with a
+  minimum warm-up of 10 (`run.py --min-warmup 10`); each result records `min_warmup`.
   Introduced 2026-11-19 after the first Java run showed 26–45% spread within a process with a fixed 5-iteration
   warm-up; Java, .NET and Node were rerun with it.
 - A cell is accepted when the coefficient of variation across the 5 processes is ≤ 3%; otherwise it is re-run once and flagged if still noisy.

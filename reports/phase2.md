@@ -17,6 +17,25 @@ start. It reads near zero when a runtime keeps freed memory between iterations (
 so for those *memory growth* is the better measure: the highest peak minus the memory right after connecting, before warm-up.
 Growth of JIT/GC runtimes includes heap the runtime chose to keep (the JVM sizes its heap up to a quarter of RAM by default).
 
+## Correction: steady state for JIT runtimes (2026-11-26)
+
+The adaptive warm-up stopped once three iterations agreed within 5%. Three equal iterations can be a plateau of
+not-yet-optimized code: .NET ran streamed reads at about 600 ms per iteration for several iterations, then about 120 ms
+once optimized code arrived, so the reported median mixed both. Every timed JIT process is now checked after it runs (first
+measured iteration more than 10% above the median of the last three → rerun with 10, 20, then 40 warm-up iterations), and
+the 90 earlier JIT cells whose median was more than 5% above their late-iteration level were rerun this way
+([SPEC.md](../SPEC.md) section 6). Examples (Percona unless noted, before → after): MySqlConnector streamed rows
+480 → **120 ns/row**,
+MySql.Data 1,078 → 600 ns/row,
+Connector/J buffered rows on MariaDB 272 →
+160 ns/row, MariaDB Connector/J 1 KB documents on MariaDB
+1,107 → 399 ns/KB. A few JIT cells
+still vary between or within processes (GC cycles, or different JIT outcomes per process); they carry the "noisy" note.
+The Node.js drivers' streamed results also changed: the runner consumed the driver's stream through an extra async
+generator (one more promise per row); it now iterates the driver's stream directly, as an application would (mysql2
+288 → 152 ns/row, mariadb
+165 → 91.5 ns/row).
+
 For comparison, libmysqlclient (C) on Percona: plain connect 23.9 µs, point select
 4.32 µs, 1M buffered rows 37.1 ns/row.
 
@@ -28,8 +47,8 @@ For comparison, libmysqlclient (C) on Percona: plain connect 23.9 µs, point sel
   numeric arrays and native types.
 - **Oracle's MySql.Data costs several times MySqlConnector:** plain connect 760 vs
   80.2 µs, point select 21.2 vs
-  5.41 µs, streamed rows 1,078 vs
-  480 ns/row. MySql.Data also cannot verify a server against a CA file
+  5.41 µs, streamed rows 600 vs
+  120 ns/row. MySql.Data also cannot verify a server against a CA file
   without a client certificate.
 - **Rust: cheapest TLS and near-C binary decoding.** The `mysql` crate: verified TLS connect
   243 µs (rustls), wide mixed-type binary rows 17.3 ns/cell.
@@ -38,7 +57,7 @@ For comparison, libmysqlclient (C) on Percona: plain connect 23.9 µs, point sel
   connections to the Unix socket (`prefer_socket`).
 - **Row format matters in scripting languages.** Returning rows as arrays instead of objects/hashes: Node mysql2
   107 → 49.9 ns/row, Ruby trilogy
-  173 → 62.9 ns/row.
+  169 → 62.9 ns/row.
 - **Ruby mysql2's prepared-statement streaming costs 4,268 ns/row**, about 20× its text
   path (198).
 - **Ruby mysql2 tuned (`as: :array, cache_rows: false`) runs out of memory on 100 KB documents**: past the 8 GB client cap on
@@ -55,16 +74,27 @@ For comparison, libmysqlclient (C) on Percona: plain connect 23.9 µs, point sel
   PHP 43.3 MB, .NET 64.3 MB,
   Node 75.5–79.9 MB.
 
+## What "tuned" changes
+
+Every "tuned" result uses exactly these changes from the library defaults (server settings are never tuned). Stacks not listed have no tuned configuration.
+
+- **node-mysql2**: rowsAsArray=true (rows as arrays instead of objects).
+- **node-mariadb**: rowsAsArray=true (rows as arrays instead of objects).
+- **php-mysqli**: MYSQLI_OPT_INT_AND_FLOAT_NATIVE=1 and fetch_row() (numeric arrays, native int/float) instead of fetch_assoc() with strings.
+- **php-pdo-mysql**: PDO::ATTR_DEFAULT_FETCH_MODE = PDO::FETCH_NUM instead of the default FETCH_BOTH (which builds every row twice).
+- **rb-mysql2**: as: :array, cache_rows: false (arrays instead of hashes, no row cache).
+- **rb-trilogy**: result.rows (arrays) instead of each_hash (hashes).
+
 ## Tables
 
 Superscript numbers mark results with a note; the notes follow each table.
 
 ### T1 — client CPU, µs/connect (Percona / MariaDB)
 
-| stack | config | socket | tcp | tcp@ed25519 | tls | tls-verify | tls-resume | tls-verify-resume |
+| stack | config | socket | tcp | tcp@ed25519 | tls | tls-verify | tls-verify-resume | tls-resume |
 |---|---|---|---|---|---|---|---|---|
-| cpp-mysql-connector | default | 30.9³ / 27.2³ | 45.1³ / 39.8³ | n/a / n/a | 3,631² / 3,890¹˒² | 762 / 1,052¹ | n/a² / n/a¹˒² | n/a / n/a¹ |
-| cpp-mariadb | default | 27.4³˒⁴ / 26.5³˒⁴ | 45.1³˒⁴ / 42.8³˒⁴ | n/a⁴ / 90⁴ | 3,694²˒⁴ / 3,902¹˒²˒⁴ | 749⁴ / 1,039¹˒⁴ | n/a²˒⁴ / n/a¹˒²˒⁴ | n/a⁴ / n/a¹˒⁴ |
+| cpp-mysql-connector | default | 30.9³ / 27.2³ | 45.1³ / 39.8³ | n/a / n/a | 3,631² / 3,890¹˒² | 762 / 1,052¹ | n/a / n/a¹ | n/a² / n/a¹˒² |
+| cpp-mariadb | default | 27.4³˒⁴ / 26.5³˒⁴ | 45.1³˒⁴ / 42.8³˒⁴ | n/a⁴ / 90⁴ | 3,694²˒⁴ / 3,902¹˒²˒⁴ | 749⁴ / 1,039¹˒⁴ | n/a⁴ / n/a¹˒⁴ | n/a²˒⁴ / n/a¹˒²˒⁴ |
 | rust-mysql | default | 19.1³ / 18.3³ | 34.1³ / 34.9³ | n/a / n/a | 147 / 274¹ | 243 / 371¹ | n/a / n/a¹ | n/a / n/a¹ |
 | rust-sqlx | default | 17.2³ / 15.7³ | 29.4³ / 26.7³ | n/a / n/a | 178 / 692¹ | 239 / 755¹ | n/a / n/a¹ | n/a / n/a¹ |
 | dotnet-mysqlconnector | default | 37.5³ / 30.8³ | 80.2³ / 78.7³˒¹⁵ | n/a / 107 | 1,088 / 1,046¹ | 1,336 / 1,272¹ | n/a / n/a¹ | n/a / n/a¹ |
@@ -78,10 +108,10 @@ Superscript numbers mark results with a note; the notes follow each table.
 | php-mysqli | tuned | 11.6³ / 10.1³ | 25.6³ / 22.6³ | n/a / n/a | 629 / 908¹ | 743 / 1,032¹ | n/a / n/a¹ | n/a / n/a¹ |
 | php-pdo-mysql | default | 11.4³ / 10³ | 25.6³ / 22.7³ | n/a / n/a | 636 / 913¹ | 746 / 1,034¹ | n/a / n/a¹ | n/a / n/a¹ |
 | php-pdo-mysql | tuned | 11.5³ / 10³ | 25.7³ / 22.7³ | n/a / n/a | 635 / 913¹ | 747 / 1,033¹ | n/a / n/a¹ | n/a / n/a¹ |
-| rb-mysql2 | default | 17.8³ / 16.9³ | 31.7³ / 29.4³ | n/a / n/a | 3,704² / 3,975¹˒² | 788 / 1,080¹ | n/a² / n/a¹˒² | n/a / n/a¹ |
-| rb-mysql2 | tuned | 17.9³ / 16.9³ | 31.7³ / 29.3³ | n/a / n/a | 3,708² / 3,975¹˒² | 788 / 1,080¹ | n/a² / n/a¹˒² | n/a / n/a¹ |
-| rb-trilogy | default | 16³ / 13.4³ | 31.1³ / 27.3³ | n/a / n/a | 3,659² / 3,912¹˒² | 867 / 1,148¹ | n/a² / n/a¹˒² | n/a / n/a¹ |
-| rb-trilogy | tuned | 16³ / 13.3³ | 31.1³ / 27.2³ | n/a / n/a | 3,656² / 3,910¹˒² | 866 / 1,149¹ | n/a² / n/a¹˒² | n/a / n/a¹ |
+| rb-mysql2 | default | 17.8³ / 16.9³ | 31.7³ / 29.4³ | n/a / n/a | 3,704² / 3,975¹˒² | 788 / 1,080¹ | n/a / n/a¹ | n/a² / n/a¹˒² |
+| rb-mysql2 | tuned | 17.9³ / 16.9³ | 31.7³ / 29.3³ | n/a / n/a | 3,708² / 3,975¹˒² | 788 / 1,080¹ | n/a / n/a¹ | n/a² / n/a¹˒² |
+| rb-trilogy | default | 16³ / 13.4³ | 31.1³ / 27.3³ | n/a / n/a | 3,659² / 3,912¹˒² | 867 / 1,148¹ | n/a / n/a¹ | n/a² / n/a¹˒² |
+| rb-trilogy | tuned | 16³ / 13.3³ | 31.1³ / 27.2³ | n/a / n/a | 3,656² / 3,910¹˒² | 866 / 1,149¹ | n/a / n/a¹ | n/a² / n/a¹˒² |
 
 ¹ **MariaDB TLS key exchange.** MariaDB 12.3 negotiates ECDH on P-521 (secp521r1); Percona Server uses P-256. Much of the extra client CPU per TLS connect on MariaDB is that server-side choice, not the driver.  
 ² **TLS without a CA loads the system trust store.** With no CA configured, libmysqlclient, MariaDB Connector/C and the drivers built on them (Connector/C++, mysqlclient, MariaDB Connector/Python, Ruby mysql2) and trilogy load and parse the full system CA bundle (120 certificates) on every connection although they verify nothing.  
@@ -121,12 +151,12 @@ Superscript numbers mark results with a note; the notes follow each table.
 | cpp-mariadb | default | 86.7 / 85.7 | 59.9 / 59.3 | 79.1 / 78.3 | 77.1 / 76.9 | 87.2 / 86.7 | 86.7 / 86.6 |
 | rust-mysql | default | 79.9 / 79.8 | 76.5 / 77.3 | 89.4 / 87.5 | 88.9 / 89.2 | 91 / 90.6 | 91.8 / 91.6 |
 | rust-sqlx | default | 293 / 293 | 277 / 274 | 270 / 269 | 272 / 272 | 253 / 256 | 255 / 258 |
-| dotnet-mysqlconnector | default | n/a / n/a | 375 / 346¹⁵ | n/a / n/a | n/a / n/a | 480¹⁵ / 492 | 475¹⁵ / 471¹⁵ |
-| dotnet-mysql-data | default | n/a / n/a | 607 / 597 | n/a / n/a | n/a / n/a | 1,078¹⁵ / 646¹⁵ | 482¹⁵ / 450¹⁵ |
-| node-mysql2 | default | 113 / 107 | n/a / n/a | 107 / 107¹⁶ | 111 / 109¹⁶ | 288¹⁵ / 291 | 287¹⁵ / 288¹⁵ |
-| node-mysql2 | tuned | 123¹⁵ / 65.3¹⁵˒¹⁶ | n/a / n/a | 49.9¹⁵ / 129¹⁵˒¹⁶ | 132¹⁶ / 64.4¹⁵ | 279 / 284¹⁵ | 285¹⁵ / 283 |
-| node-mariadb | default | 92.2¹⁶ / 88¹⁶ | 171 / 176¹⁵ | 98.6¹⁶ / 98.5¹⁶ | 97.8¹⁶ / 99 | 165¹⁵ / 165 | 173 / 166 |
-| node-mariadb | tuned | 111¹⁵˒¹⁶ / 115¹⁵˒¹⁶ | 176 / 172¹⁵ | 114¹⁶ / 114¹⁵˒¹⁶ | 122¹⁶ / 124¹⁵˒¹⁶ | 167 / 168 | 172 / 182 |
+| dotnet-mysqlconnector | default | n/a / n/a | 121 / 121 | n/a / n/a | n/a / n/a | 120 / 120 | 122 / 122 |
+| dotnet-mysql-data | default | n/a / n/a | 607 / 597 | n/a / n/a | n/a / n/a | 600 / 646¹⁵ | 482¹⁵ / 450¹⁵ |
+| node-mysql2 | default | 103¹⁵˒¹⁶ / 107 | n/a / n/a | 107 / 106¹⁶ | 111 / 109¹⁶ | 152¹⁵ / 152¹⁵ | 147 / 152 |
+| node-mysql2 | tuned | 123¹⁵ / 65.3¹⁵˒¹⁶ | n/a / n/a | 49.9¹⁵ / 125¹⁵˒¹⁶ | 132¹⁶ / 136¹⁶ | 157¹⁵ / 143¹⁵ | 150 / 150¹⁵ |
+| node-mariadb | default | 92.2¹⁶ / 88¹⁶ | 171 / 176¹⁵ | 98.6¹⁶ / 98.5¹⁶ | 97.8¹⁶ / 99 | 91.5¹⁵ / 91.9 | 92.4 / 94.2 |
+| node-mariadb | tuned | 111¹⁵˒¹⁶ / 116¹⁶ | 176 / 172¹⁵ | 114¹⁶ / 114¹⁵˒¹⁶ | 122¹⁶ / 124¹⁵˒¹⁶ | 91.8 / 93.4 | 93.8 / 95.1 |
 | node-mysql | default | n/a / n/a | n/a / n/a | n/a / 205¹⁵ | n/a / 216¹⁶ | n/a / 274 | n/a / 287¹⁵ |
 | php-mysqli | default | 130 / 128 | 100 / 99.9 | 147 / 146 | 148 / 148 | 142 / 141 | 146 / 146 |
 | php-mysqli | tuned | 112 / 112 | 100 / 100 | 121 / 121 | 123 / 123 | 117 / 117 | 119 / 118 |
@@ -134,7 +164,7 @@ Superscript numbers mark results with a note; the notes follow each table.
 | php-pdo-mysql | tuned | 121 / 121 | 116 / 116 | 124 / 123 | 125 / 125 | 119 / 119 | 121 / 121 |
 | rb-mysql2 | default | 244 / 243 | 4,268 / 4,313 | 232 / 233 | 278 / 277 | 198 / 198 | 260 / 261 |
 | rb-mysql2 | tuned | 189 / 190 | 4,186 / 4,261 | 180 / 180 | 224 / 223 | 164 / 163 | 212 / 211 |
-| rb-trilogy | default | n/a / n/a | n/a / n/a | 173 / 170¹⁵ | 163 / 159¹⁵ | n/a / n/a | n/a / n/a |
+| rb-trilogy | default | n/a / n/a | n/a / n/a | 169¹⁶ / 170¹⁶ | 163 / 159¹⁵ | n/a / n/a | n/a / n/a |
 | rb-trilogy | tuned | n/a / n/a | n/a / n/a | 62.9¹⁶ / 62.9¹⁶ | 68.9 / 68.8 | n/a / n/a | n/a / n/a |
 
 ¹⁵ **Higher run-to-run spread.** The 5 processes for this result differ by more than 5% (coefficient of variation). Small differences against it are not meaningful.  
@@ -150,8 +180,8 @@ Superscript numbers mark results with a note; the notes follow each table.
 | rust-sqlx | default | 29.6 / 29.7 | 32.8 / 32.9 | 132 / 131 | 75.5 / 75.5 |
 | dotnet-mysqlconnector | default | 103 / 103 | 80.2 / 79.6 | 124 / 122 | 122 / 123 |
 | dotnet-mysql-data | default | 148 / 149 | 161 / 161 | 212 / 210 | 258 / 255 |
-| node-mysql2 | default | 38.6 / 41¹⁵ | 41.2 / 41.2 | 119 / 118 | 131¹⁶ / 140¹⁶ |
-| node-mysql2 | tuned | 15.4¹⁵˒¹⁶ / 13.6 | 19.4¹⁶ / 18.6¹⁶ | 86.1¹⁶ / 86.9¹⁶ | 99¹⁶ / 97¹⁶ |
+| node-mysql2 | default | 38.6 / 41¹⁵ | 41.2 / 41.2 | 119 / 118 | 131¹⁶ / 129¹⁶ |
+| node-mysql2 | tuned | 13.6¹⁶ / 13.6 | 19.4¹⁶ / 18.6¹⁶ | 86.1¹⁶ / 86.9¹⁶ | 99¹⁶ / 97¹⁶ |
 | node-mariadb | default | 85.4 / 83¹⁵ | 85.3 / 86.2 | 193¹⁶ / 191¹⁶ | 216 / 213 |
 | node-mariadb | tuned | 12.5¹⁶ / 12.4¹⁵˒¹⁶ | 17¹⁶ / 15.5¹⁵˒¹⁶ | 92.1¹⁶ / 94.3¹⁶ | 111¹⁶ / 113¹⁶ |
 | node-mysql | default | n/a / n/a | n/a / 176 | n/a / n/a | n/a / 288¹⁶ |
@@ -178,8 +208,8 @@ Superscript numbers mark results with a note; the notes follow each table.
 | dotnet-mysqlconnector | default | 417⁵ / 264 | 585⁵ / 526 | 256 / 253 | 381⁵ / 351 | 300 / 297 | 1,034⁵ / 1,003 | 925 / 914 | 387⁵ / 392 | 296 / 296 | 2,200⁵˒¹⁵ / 2,172¹⁵ |
 | dotnet-mysql-data | default | 698⁵˒¹⁵ / 283 | 927⁵ / 519 | 160¹⁵ / 152 | 1,947⁵ / 342 | 330 / 330¹⁵ | 2,801⁵ / 1,401 | 1,441 / 1,456 | 1,266⁵˒¹⁵˒¹⁶ / 466 | 365 / 355 | 3,019⁵˒¹⁵ / 3,058¹⁵ |
 | node-mysql2 | default | 443⁵ / 449 | 599⁵ / 600 | 403 / 395 | 550⁵ / 422¹⁶ | 505 / 496 | 590⁵˒¹⁵ / 572 | 482¹⁵ / 453¹⁵ | 429⁵ / 363¹⁵˒¹⁶ | 460 / 456 | 2,336⁵˒¹⁵ / 2,396 |
-| node-mysql2 | tuned | 436⁵ / 443 | 601⁵ / 595 | 398 / 396 | 525⁵ / 442¹⁶ | 494 / 506¹⁶ | 555⁵ / 578 | 467¹⁵˒¹⁶ / 426¹⁵˒¹⁶ | 421⁵ / 369¹⁶ | 445 / 456 | 2,352⁵ / 2,352 |
-| node-mariadb | default | 441⁵ / 451 | 600⁵ / 601 | 385 / 381 | 552⁵˒¹⁵˒¹⁶ / 445 | 514 / 515¹⁵ | 587⁵˒¹⁵ / 618¹⁵ | 468¹⁵ / 465¹⁵˒¹⁶ | 426⁵˒¹⁵ / 372¹⁵ | 443 / 445 | 2,321⁵˒¹⁵ / 2,327 |
+| node-mysql2 | tuned | 436⁵ / 443 | 601⁵ / 595 | 398 / 396 | 525⁵ / 429¹⁶ | 500¹⁶ / 506¹⁶ | 555⁵ / 594 | 448¹⁵˒¹⁶ / 426¹⁵˒¹⁶ | 421⁵ / 369¹⁶ | 449 / 456 | 2,352⁵ / 2,352 |
+| node-mariadb | default | 441⁵ / 451 | 600⁵ / 601 | 385 / 381 | 552⁵˒¹⁵˒¹⁶ / 451 | 514 / 515¹⁵ | 587⁵˒¹⁵ / 618¹⁵ | 468¹⁵ / 465¹⁵˒¹⁶ | 426⁵˒¹⁵ / 372¹⁵ | 443 / 445 | 2,321⁵˒¹⁵ / 2,327 |
 | node-mariadb | tuned | 438⁵ / 444 | 590⁵ / 594 | 388 / 381 | 528⁵ / 420 | 498 / 504¹⁶ | 508⁵˒¹⁵˒¹⁶ / 540 | 398¹⁵˒¹⁶ / 425¹⁵˒¹⁶ | 415⁵ / 364¹⁵˒¹⁶ | 433¹⁵ / 425¹⁵ | 2,392⁵˒¹⁵ / 2,328 |
 | node-mysql | default | n/a⁵ / 460 | n/a⁵ / 602 | n/a / 530 | n/a⁵ / 592 | n/a / 668 | n/a⁵ / 746¹⁵˒¹⁶ | n/a / 1,083¹⁵˒¹⁶ | n/a⁵ / 439¹⁶ | n/a / 661 | n/a⁵ / 2,411 |
 | php-mysqli | default | 509⁵ / 539 | 651⁵ / 676 | 532 / 541 | 569⁵ / 560 | 561 / 561 | 595⁵ / 579 | 620 / 621 | 483⁵ / 463 | 457 / 461 | 5,594⁵ / 5,960 |
@@ -230,10 +260,10 @@ Superscript numbers mark results with a note; the notes follow each table.
 | rust-sqlx | default | 76.2 / 82.1 | 0 / 0 | 76.2 / 76.2 | 76.2 / 76.2 | 0 / 0 | 0 / 0 |
 | dotnet-mysqlconnector | default | n/a / n/a | 0 / 0 | n/a / n/a | n/a / n/a | 0.0664 / 0 | 0 / 0 |
 | dotnet-mysql-data | default | n/a / n/a | 0 / 0 | n/a / n/a | n/a / n/a | 0 / 0 | 0 / 0 |
-| node-mysql2 | default | 24.2 / 22.7 | n/a / n/a | 21.4 / 21.5 | 21.8¹⁶ / 21.2 | 0.0508 / 0.0742 | 0.0977 / 0.0938 |
-| node-mysql2 | tuned | 15.2 / 22.4 | n/a / n/a | 21.1 / 23.8 | 10.9 / 2.29 | 0.0781 / 0.0586 | 0.0898 / 0.0898 |
-| node-mariadb | default | 21.6¹⁶ / 21.2 | 0 / 0 | 21.5 / 21.9 | 20.9 / 17.4¹⁶ | 0 / 0 | 0.145 / 0.0781 |
-| node-mariadb | tuned | 21.9 / 21.2 | 0 / 0 | 21.5 / 21 | 23.5¹⁶ / 6.64¹⁶ | 0 / 0 | 0.0781 / 0.102 |
+| node-mysql2 | default | 24.2 / 22.7 | n/a / n/a | 21.4 / 21.5 | 21.8¹⁶ / 21.2 | 0.0703 / 0.082 | 0.082 / 0.102 |
+| node-mysql2 | tuned | 15.2 / 22.4 | n/a / n/a | 21.1 / 23.8 | 10.9 / 2.29 | 0.102 / 0.0742 | 0.0742 / 0.0664 |
+| node-mariadb | default | 21.6¹⁶ / 21.2 | 0 / 0 | 21.5 / 21.9 | 20.9 / 17.4¹⁶ | 0 / 0 | 0.0742 / 0.0625 |
+| node-mariadb | tuned | 21.9 / 21.2 | 0 / 0 | 21.5 / 21 | 23.5¹⁶ / 6.64¹⁶ | 0.0664 / 0 | 0.0703 / 0 |
 | node-mysql | default | n/a / n/a | n/a / n/a | n/a / 28.2 | n/a / 25.4¹⁶ | n/a / 0 | n/a / 0 |
 | php-mysqli | default | 31.9 / 32 | 0 / 0 | 31.9 / 31.9 | 31.9 / 31.9 | 0 / 0 | 0 / 0 |
 | php-mysqli | tuned | 31.9 / 32 | 0 / 0 | 31.9 / 31.9 | 31.9 / 31.9 | 0 / 0 | 0 / 0 |
@@ -334,10 +364,10 @@ Superscript numbers mark results with a note; the notes follow each table.
 | rust-sqlx | default | 117 / 116 | 0 / 0 | 118 / 118 | 122 / 122 | 0.0547 / 0.0586 | 0.0859 / 0.0977 |
 | dotnet-mysqlconnector | default | n/a / n/a | 2.73 / 2.91 | n/a / n/a | n/a / n/a | 3.13 / 2.83 | 2.72 / 2.51 |
 | dotnet-mysql-data | default | n/a / n/a | 19.3 / 19.4 | n/a / n/a | n/a / n/a | 20.3 / 19.3 | 17.8 / 17.5 |
-| node-mysql2 | default | 409 / 412 | n/a / n/a | 473 / 415 | 385¹⁶ / 381 | 67 / 75.3 | 68.7 / 67.6 |
-| node-mysql2 | tuned | 441 / 493 | n/a / n/a | 464 / 376 | 392 / 349 | 67.8 / 76.9 | 78.4 / 67.8 |
-| node-mariadb | default | 410¹⁶ / 400 | 115 / 115 | 403 / 396 | 397 / 389¹⁶ | 116 / 74.2 | 117 / 77.4 |
-| node-mariadb | tuned | 456 / 401 | 79.5 / 113 | 423 / 396 | 477¹⁶ / 427¹⁶ | 75.6 / 116 | 111 / 80.1 |
+| node-mysql2 | default | 409 / 412 | n/a / n/a | 473 / 415 | 385¹⁶ / 381 | 67.5 / 95.6 | 63.3 / 36.8 |
+| node-mysql2 | tuned | 441 / 493 | n/a / n/a | 464 / 376 | 392 / 349 | 72.1 / 72.1 | 35.5 / 37.1 |
+| node-mariadb | default | 410¹⁶ / 400 | 115 / 115 | 403 / 396 | 397 / 389¹⁶ | 72.5 / 39.4 | 38.8 / 39.7 |
+| node-mariadb | tuned | 456 / 401 | 79.5 / 113 | 423 / 396 | 477¹⁶ / 427¹⁶ | 74.3 / 42.7 | 40.6 / 23.5 |
 | node-mysql | default | n/a / n/a | n/a / n/a | n/a / 399 | n/a / 300¹⁶ | n/a / 46.9 | n/a / 49.2 |
 | php-mysqli | default | 35.1 / 35.1 | 0 / 0 | 35 / 35.1 | 35 / 35 | 0 / 0 | 0 / 0 |
 | php-mysqli | tuned | 35.1 / 35.1 | 0 / 0 | 35 / 35.1 | 35 / 35 | 0 / 0 | 0 / 0 |

@@ -53,6 +53,8 @@ STACKS["php-mysqli"] = ("stacks/php", ["php", "runner.php", "--driver", "mysqli"
 STACKS["php-pdo-mysql"] = ("stacks/php", ["php", "runner.php", "--driver", "pdo"], False)
 for _d in ("mysql2", "trilogy"):
     STACKS["rb-" + _d] = ("stacks/ruby", ["./run", "--driver", _d], True)
+for _f in ("activerecord", "sequel"):
+    STACKS["rb-" + _f] = ("stacks/ruby", ["./fw", "--fw", _f], True)
 STACKS["dotnet-mysqlconnector"] = ("stacks/dotnet", ["./run", "--driver", "mysqlconnector"], True)
 STACKS["dotnet-mysql-data"] = ("stacks/dotnet", ["./run", "--driver", "mysql-data"], True)
 # Phase 3: frameworks (each on a Phase 1/2 driver)
@@ -73,6 +75,8 @@ STACKS["cpp-mysql-connector"] = ("stacks/cpp", ["./run-mysql-connector"], False)
 STACKS["cpp-mariadb"] = ("stacks/cpp", ["./run-mariadb"], False)
 for _d in ("mysql", "sqlx"):
     STACKS["rust-" + _d] = ("stacks/rust", ["./target/release/runner", "--driver", _d], False)
+for _f in ("diesel", "seaorm"):
+    STACKS["rust-" + _f] = ("stacks/rust", ["./fw/target/release/fwrunner", "--fw", _f], False)
 
 # Hardware counter sets (<= 6 HW counters each so the PMU never multiplexes; NMI watchdog is off)
 EVENTS = {
@@ -109,7 +113,7 @@ def parse_perf(path):
     return out
 
 
-def run_one(server, stack, test, variant, config, rep, pid, exp, args):
+def run_one(server, stack, test, variant, config, rep, pid, exp, args, min_warmup=None):
     cwd, argv, jit = STACKS[stack]
     srv = SERVERS[server]
     base = variant.split("+")[0].split("@")[0]
@@ -126,7 +130,7 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
     iters = ITERS[test]
     if jit and test != "T0":
         env["ADAPTIVE_WARMUP"] = "1"   # runner warms up until stable (SPEC section 6)
-        warmup, iters = 3, iters + 2
+        warmup, iters = min_warmup or args.min_warmup, iters + 2
     if args.quick:
         warmup, iters = 0, 1
         env.pop("ADAPTIVE_WARMUP", None)
@@ -174,7 +178,7 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
         return "fail", f"TLS state mismatch: wanted {'TLS' if want_tls else 'no TLS'}, got {d.get('tls')}"
     want = expected_checksum(exp, test, variant)
     bad = [it["checksum"] for it in d["iters"] if want is not None and it["checksum"] != want]
-    d.update(variant=variant, rep=rep, event_set=evset, perf=parse_perf(perfout) if evset else None,
+    d.update(variant=variant, rep=rep, event_set=evset, perf=parse_perf(perfout) if evset else None, min_warmup=warmup,
              elapsed_s=round(time.time() - t0, 2), checksum_ok=not bad, expected=want)
     json.dump(d, open(res, "w"))
     if evset:
@@ -183,6 +187,13 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args):
         return "fail", f"checksum {bad[0]} != {want}"
     cpu = sorted(it["cpu_ns"] for it in d["iters"])[len(d["iters"]) // 2]
     return "ok", f"cpu/op {cpu / d['ops_per_iter'] / 1000:.3f} us  tls={d['tls']}"
+
+
+def trending(server, stack, test, variant, config, rep, args):
+    label = f"{test}-{variant}-{config}-{rep}".replace("/", "_")
+    d = json.load(open(f"{args.results}/{server}/{stack}/{label}.json"))
+    it = [i["cpu_ns"] for i in d["iters"]]
+    return len(it) >= 4 and it[0] > 1.10 * sorted(it[-3:])[1]
 
 
 def server_pid(server):
@@ -202,6 +213,7 @@ def main():
     ap.add_argument("--quick", action="store_true", help="smoke test: 1 process, 1 iteration, no warm-up")
     ap.add_argument("--results", default=RESULTS)
     ap.add_argument("--no-counters", action="store_true", help="skip the two hardware-counter processes per cell")
+    ap.add_argument("--min-warmup", type=int, default=3, help="JIT runtimes: minimum warm-up iterations before the stability test")
     args = ap.parse_args()
     if args.quick:
         args.repeats, args.results = 1, f"{ROOT}/results-smoke"
@@ -225,6 +237,15 @@ def main():
                             reps += ["cA", "cB"]   # hardware-counter processes (not used for timing)
                         for rep in reps:
                             status, msg = run_one(server, stack, test, variant, config, rep, pid, exp, args)
+                            # steady-state check (JIT runtimes): a process whose measured iterations still get faster
+                            # (first > 1.10 x median of the last three) stopped warming up on a plateau; rerun it with
+                            # twice the minimum warm-up, up to the 40-iteration cap. See SPEC.md section 6.
+                            mw, retries = args.min_warmup, 0
+                            while (status == "ok" and STACKS[stack][2] and test != "T0" and not args.quick
+                                   and str(rep) not in ("cA", "cB") and mw < 40 and trending(server, stack, test, variant, config, rep, args)):
+                                mw, retries = min(40, mw * 2 if mw >= 5 else 10), retries + 1
+                                status, msg = run_one(server, stack, test, variant, config, rep, pid, exp, args, min_warmup=mw)
+                                msg += f"  (rerun: min warm-up {mw})"
                             now = server_pid(server)
                             if now != pid:   # the server died (e.g. OOM) and systemd restarted it: re-prime, flag the cell
                                 status, msg = "fail", f"database server restarted during this run ({msg})"
