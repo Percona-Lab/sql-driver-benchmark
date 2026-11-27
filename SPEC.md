@@ -163,3 +163,16 @@ profiles/<server>/<stack>/<test>-<variant>.{svg,folded,categories.json}
 
 A report generator builds per-test tables and charts: absolute values, multiple of
 the C floor, and for wrappers the **wrapper tax** over the same underlying driver.
+
+## Profiling pass (2026-11-26)
+
+`run.py --profile` runs one process per cell under `perf record -F 2999 --call-graph fp`, gated by the runner's control
+fifo so only the measured iterations are sampled (warm-up and start-up are not). JIT runtimes write perf maps
+(`JAVA_TOOL_OPTIONS=-XX:+PreserveFramePointer -XX:+UnlockDiagnosticVMOptions -XX:+DumpPerfMapAtExit`,
+`NODE_OPTIONS=--perf-basic-prof --interpreted-frames-native-stack`, `PYTHONPERFSUPPORT=1`, `DOTNET_PerfMapEnabled=1` with
+`DOTNET_EnableWriteXorExecute=0` so JIT code is not hidden behind a memfd double mapping, `RUBYOPT=--yjit-perf`); Rust is
+profiled from a frame-pointer build of the same code. Native libraries are symbolized with debug symbols (Oracle
+`libmysqlclient24-dbgsym` 9.7.4 matching the measured build ID, Ubuntu ddebs for libc/OpenSSL/libstdc++, `python3.14-dbg`,
+PHP 8.5 dbgsym from Launchpad). `collapse_perf.py` folds stacks keeping each frame's library; `profile_report.py` classifies
+samples by kind of work (leaf frame, kernel samples by the system call or fault that entered the kernel) and by owner
+(innermost driver / framework / benchmark frame). Sampling adds overhead: profiles give shares, the timed runs give costs.

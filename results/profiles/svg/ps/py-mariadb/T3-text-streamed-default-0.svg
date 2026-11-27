@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="1366" onload="init(evt)" viewBox="0 0 1200 1366" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="1366" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">py-mariadb/T3-text-streamed-default-0.folded (Percona, default; sampled CPU cycles)</text><text id="details" fill="rgb(0,0,0)" x="10" y="1349.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="1349.00"> </text><svg id="frames" x="10" width="1180" total_samples="10727893922"><g><title>mthd_my_read_one_row{libmariadb.so.3} (27,955,814 cycles, 0.26%)</title><rect x="0.2584%" y="1253" width="0.2606%" height="15" fill="rgb(227,0,7)" fg:x="27719729" fg:w="27955814"/><text x="0.5084%" y="1263.50"></text></g><g><title>ma_pvio_cache_read{libmariadb.so.3} (32,174,891 cycles, 0.30%)</title><rect x="1.6432%" y="1189" width="0.2999%" height="15" fill="rgb(217,0,24)" fg:x="176283785" fg:w="32174891"/><text x="1.8932%" y="1199.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (38,020,566 cycles, 0.35%)</title><rect x="2.6395%" y="1173" width="0.3544%" height="15" fill="rgb(221,193,54)" fg:x="283162487" fg:w="38020566"/><text x="2.8895%" y="1183.50"></text></g><g><title>ma_pvio_cache_read{libmariadb.so.3} (27,849,811 cycles, 0.26%)</title><rect x="2.9939%" y="1173" width="0.2596%" height="15" fill="rgb(248,212,6)" fg:x="321183053" fg:w="27849811"/><text x="3.2439%" y="1183.50"></text></g><g><title>ma_net_read{libmariadb.so.3} (192,985,794 cycles, 1.80%)</title><rect x="1.4780%" y="1205" width="1.7989%" height="15" fill="rgb(208,68,35)" fg:x="158558176" fg:w="192985794"/><text x="1.7280%" y="1215.50">m..</text></g><g><title>ma_real_read{libmariadb.so.3} (143,085,294 cycles, 1.33%)</title><rect x="1.9431%" y="1189" width="1.3338%" height="15" fill="rgb(232,128,0)" fg:x="208458676" fg:w="143085294"/><text x="2.1931%" y="1199.50"></text></g><g><title>mthd_my_read_one_row{libmariadb.so.3} (288,285,358 cycles, 2.69%)</title><rect x="0.6369%" y="1237" width="2.6873%" height="15" fill="rgb(207,160,47)" fg:x="68321952" fg:w="288285358"/><text x="0.8869%" y="1247.50">mt..</text></g><g><title>ma_net_safe_read{libmariadb.so.3} (234,717,436 cycles, 2.19%)</title><rect x="1.1362%" y="1221" width="2.1879%" height="15" fill="rgb(228,23,34)" fg:x="121889874" fg:w="234717436"/><text x="1.3862%" y="1231.50">m..</text></g><g><title>MrdbCursor_fetchinternal{_mariadb.cpython-314-x86_64-linux-gnu.so} (368,164,312 cycles, 3.43%)</title><rect x="0.0235%" y="1269" width="3.4318%" height="15" fill="rgb(218,30,26)" fg:x="2526417" fg:w="368164312"/><text x="0.2735%" y="1279.50">Mrd..</text></g><g><title>mysql_fetch_row{libmariadb.so.3} (315,015,186 cycles, 2.94%)</title><rect x="0.5190%" y="1253" width="2.9364%" height="15" fill="rgb(220,122,19)" fg:x="55675543" fg:w="315015186"/><text x="0.7690%" y="1263.50">my..</text></g><g><title>_PyObject_GC_TRACK{inlined} (30,417,174 cycles, 0.28%)</title><rect x="3.6188%" y="1205" width="0.2835%" height="15" fill="rgb(250,228,42)" fg:x="388223321" fg:w="30417174"/><text x="3.8688%" y="1215.50"></text></g><g><title>PyTuple_New{python3.14} (54,396,732 cycles, 0.51%)</title><rect x="3.5608%" y="1221" width="0.5071%" height="15" fill="rgb(240,193,28)" fg:x="381995036" fg:w="54396732"/><text x="3.8108%" y="1231.50"></text></g><g><title>MrdbCursor_fetchone{_mariadb.cpython-314-x86_64-linux-gnu.so} (79,674,491 cycles, 0.74%)</title><rect x="3.4554%" y="1269" width="0.7427%" height="15" fill="rgb(216,20,37)" fg:x="370690729" fg:w="79674491"/><text x="3.7054%" y="1279.50"></text></g><g><title>mariadb_get_sequence_or_tuple{inlined} (70,910,471 cycles, 0.66%)</title><rect x="3.5371%" y="1253" width="0.6610%" height="15" fill="rgb(206,188,39)" fg:x="379454749" fg:w="70910471"/><text x="3.7871%" y="1263.50"></text></g><g><title>mariadb_get_sequence_or_tuple{inlined} (70,910,471 cycles, 0.66%)</title><rect x="3.5371%" y="1237" width="0.6610%" height="15" fill="rgb(217,207,13)" fg:x="379454749" fg:w="70910471"/><text x="3.7871%" y="1247.50"></text></g><g><title>[unknown]{unknown} (516,192,419 cycles, 4.81%)</title><rect x="0.0235%" y="1285" width="4.8117%" height="15" fill="rgb(231,73,38)" fg:x="2526417" fg:w="516192419"/><text x="0.2735%" y="1295.50">[unkno..</text></g><g><title>__strlen_evex{libc.so.6} (156,835,892 cycles, 1.46%)</title><rect x="4.8352%" y="1285" width="1.4619%" height="15" fill="rgb(225,20,46)" fg:x="518718836" fg:w="156835892"/><text x="5.0852%" y="1295.50"></text></g><g><title>PyObject_Malloc{inlined} (123,128,744 cycles, 1.15%)</title><rect x="8.0254%" y="677" width="1.1477%" height="15" fill="rgb(210,31,41)" fg:x="860954833" fg:w="123128744"/><text x="8.2754%" y="687.50"></text></g><g><title>_PyObject_Malloc{inlined} (121,839,656 cycles, 1.14%)</title><rect x="8.0374%" y="661" width="1.1357%" height="15" fill="rgb(221,200,47)" fg:x="862243921" fg:w="121839656"/><text x="8.2874%" y="671.50"></text></g><g><title>pymalloc_alloc{inlined} (109,001,831 cycles, 1.02%)</title><rect x="8.1571%" y="645" width="1.0161%" height="15" fill="rgb(226,26,5)" fg:x="875081746" fg:w="109001831"/><text x="8.4071%" y="655.50"></text></g><g><title>pymalloc_pool_extend{inlined} (21,529,210 cycles, 0.20%)</title><rect x="8.9724%" y="629" width="0.2007%" height="15" fill="rgb(249,33,26)" fg:x="962554367" fg:w="21529210"/><text x="9.2224%" y="639.50"></text></g><g><title>long_alloc{inlined} (165,970,793 cycles, 1.55%)</title><rect x="7.9551%" y="693" width="1.5471%" height="15" fill="rgb(235,183,28)" fg:x="853411145" fg:w="165970793"/><text x="8.2051%" y="703.50"></text></g><g><title>_PyObject_Init{inlined} (34,116,363 cycles, 0.32%)</title><rect x="9.1841%" y="677" width="0.3180%" height="15" fill="rgb(221,5,38)" fg:x="985265575" fg:w="34116363"/><text x="9.4341%" y="687.50"></text></g><g><title>PyStackRef_CLOSE_SPECIALIZED{inlined} (226,979,586 cycles, 2.12%)</title><rect x="7.6231%" y="725" width="2.1158%" height="15" fill="rgb(247,18,42)" fg:x="817795271" fg:w="226979586"/><text x="7.8731%" y="735.50">P..</text></g><g><title>x_add.lto_priv.0{python3.14} (223,242,688 cycles, 2.08%)</title><rect x="7.6579%" y="709" width="2.0810%" height="15" fill="rgb(241,131,45)" fg:x="821532169" fg:w="223242688"/><text x="7.9079%" y="719.50">x..</text></g><g><title>long_normalize{inlined} (25,392,919 cycles, 0.24%)</title><rect x="9.5022%" y="693" width="0.2367%" height="15" fill="rgb(249,31,29)" fg:x="1019381938" fg:w="25392919"/><text x="9.7522%" y="703.50"></text></g><g><title>PyObject_RichCompare{python3.14} (88,941,865 cycles, 0.83%)</title><rect x="10.3937%" y="677" width="0.8291%" height="15" fill="rgb(225,111,53)" fg:x="1115030029" fg:w="88941865"/><text x="10.6437%" y="687.50"></text></g><g><title>do_richcompare{inlined} (67,416,708 cycles, 0.63%)</title><rect x="10.5944%" y="661" width="0.6284%" height="15" fill="rgb(238,160,17)" fg:x="1136555186" fg:w="67416708"/><text x="10.8444%" y="671.50"></text></g><g><title>PyObject_RichCompareBool{python3.14} (108,098,354 cycles, 1.01%)</title><rect x="10.2506%" y="693" width="1.0076%" height="15" fill="rgb(214,148,48)" fg:x="1099678094" fg:w="108098354"/><text x="10.5006%" y="703.50"></text></g><g><title>PyUnstable_Code_GetExtra{python3.14} (25,343,796 cycles, 0.24%)</title><rect x="11.6216%" y="597" width="0.2362%" height="15" fill="rgb(232,36,49)" fg:x="1246749836" fg:w="25343796"/><text x="11.8716%" y="607.50"></text></g><g><title>_PyEvalFramePushAndInit{inlined} (28,209,064 cycles, 0.26%)</title><rect x="11.8578%" y="581" width="0.2630%" height="15" fill="rgb(209,103,24)" fg:x="1272093632" fg:w="28209064"/><text x="12.1078%" y="591.50"></text></g><g><title>_PyEval_Vector{inlined} (34,648,302 cycles, 0.32%)</title><rect x="11.8578%" y="597" width="0.3230%" height="15" fill="rgb(229,88,8)" fg:x="1272093632" fg:w="34648302"/><text x="12.1078%" y="607.50"></text></g><g><title>PyObject_GetAttr{python3.14} (24,086,926 cycles, 0.22%)</title><rect x="12.2035%" y="581" width="0.2245%" height="15" fill="rgb(213,181,19)" fg:x="1309181053" fg:w="24086926"/><text x="12.4535%" y="591.50"></text></g><g><title>_PyType_LookupStackRefAndVersion{inlined} (48,281,265 cycles, 0.45%)</title><rect x="16.9803%" y="533" width="0.4501%" height="15" fill="rgb(254,191,54)" fg:x="1821628358" fg:w="48281265"/><text x="17.2303%" y="543.50"></text></g><g><title>_PyObject_GenericGetAttrWithDict{python3.14} (133,408,101 cycles, 1.24%)</title><rect x="16.4590%" y="549" width="1.2436%" height="15" fill="rgb(241,83,37)" fg:x="1765701672" fg:w="133408101"/><text x="16.7090%" y="559.50"></text></g><g><title>member_get.lto_priv.0{python3.14} (25,331,721 cycles, 0.24%)</title><rect x="17.4664%" y="533" width="0.2361%" height="15" fill="rgb(233,36,39)" fg:x="1873778052" fg:w="25331721"/><text x="17.7164%" y="543.50"></text></g><g><title>PyObject_GetAttr{python3.14} (180,692,643 cycles, 1.68%)</title><rect x="16.0783%" y="565" width="1.6843%" height="15" fill="rgb(226,3,54)" fg:x="1724866239" fg:w="180692643"/><text x="16.3283%" y="575.50"></text></g><g><title>PyUnstable_Code_GetExtra{python3.14} (48,123,298 cycles, 0.45%)</title><rect x="18.1869%" y="485" width="0.4486%" height="15" fill="rgb(245,192,40)" fg:x="1951069327" fg:w="48123298"/><text x="18.4369%" y="495.50"></text></g><g><title>_PyFrame_Initialize{inlined} (27,933,089 cycles, 0.26%)</title><rect x="18.8566%" y="453" width="0.2604%" height="15" fill="rgb(238,167,29)" fg:x="2022914130" fg:w="27933089"/><text x="19.1066%" y="463.50"></text></g><g><title>_PyEvalFramePushAndInit{inlined} (109,019,933 cycles, 1.02%)</title><rect x="18.7186%" y="469" width="1.0162%" height="15" fill="rgb(232,182,51)" fg:x="2008108022" fg:w="109019933"/><text x="18.9686%" y="479.50"></text></g><g><title>initialize_locals.lto_priv.0{python3.14} (57,314,540 cycles, 0.53%)</title><rect x="19.2005%" y="453" width="0.5343%" height="15" fill="rgb(231,60,39)" fg:x="2059813415" fg:w="57314540"/><text x="19.4505%" y="463.50"></text></g><g><title>_PyEval_Vector{inlined} (129,455,982 cycles, 1.21%)</title><rect x="18.6355%" y="485" width="1.2067%" height="15" fill="rgb(208,69,12)" fg:x="1999192625" fg:w="129455982"/><text x="18.8855%" y="495.50"></text></g><g><title>PyObject_GetAttr{python3.14} (114,804,214 cycles, 1.07%)</title><rect x="19.9142%" y="469" width="1.0701%" height="15" fill="rgb(235,93,37)" fg:x="2136370171" fg:w="114804214"/><text x="20.1642%" y="479.50"></text></g><g><title>Py_DECREF{inlined} (53,454,214 cycles, 0.50%)</title><rect x="27.7116%" y="421" width="0.4983%" height="15" fill="rgb(213,116,39)" fg:x="2972867101" fg:w="53454214"/><text x="27.9616%" y="431.50"></text></g><g><title>_Py_IsImmortal{inlined} (53,454,214 cycles, 0.50%)</title><rect x="27.7116%" y="405" width="0.4983%" height="15" fill="rgb(222,207,29)" fg:x="2972867101" fg:w="53454214"/><text x="27.9616%" y="415.50"></text></g><g><title>_PyType_LookupStackRefAndVersion{inlined} (36,740,224 cycles, 0.34%)</title><rect x="28.2808%" y="421" width="0.3425%" height="15" fill="rgb(206,96,30)" fg:x="3033937611" fg:w="36740224"/><text x="28.5308%" y="431.50"></text></g><g><title>_PyObject_GenericGetAttrWithDict{python3.14} (214,825,021 cycles, 2.00%)</title><rect x="26.9896%" y="437" width="2.0025%" height="15" fill="rgb(218,138,4)" fg:x="2895419375" fg:w="214825021"/><text x="27.2396%" y="447.50">_..</text></g><g><title>member_get.lto_priv.0{python3.14} (35,819,375 cycles, 0.33%)</title><rect x="28.6582%" y="421" width="0.3339%" height="15" fill="rgb(250,191,14)" fg:x="3074425021" fg:w="35819375"/><text x="28.9082%" y="431.50"></text></g><g><title>PyObject_GetAttr{python3.14} (261,448,364 cycles, 2.44%)</title><rect x="26.7200%" y="453" width="2.4371%" height="15" fill="rgb(239,60,40)" fg:x="2866490537" fg:w="261448364"/><text x="26.9700%" y="463.50">Py..</text></g><g><title>_PyEvalFramePushAndInit{inlined} (51,675,876 cycles, 0.48%)</title><rect x="29.6049%" y="357" width="0.4817%" height="15" fill="rgb(206,27,48)" fg:x="3175987579" fg:w="51675876"/><text x="29.8549%" y="367.50"></text></g><g><title>initialize_locals.lto_priv.0{python3.14} (32,904,169 cycles, 0.31%)</title><rect x="29.7799%" y="341" width="0.3067%" height="15" fill="rgb(225,35,8)" fg:x="3194759286" fg:w="32904169"/><text x="30.0299%" y="351.50"></text></g><g><title>_PyEval_Vector{inlined} (58,060,096 cycles, 0.54%)</title><rect x="29.5809%" y="373" width="0.5412%" height="15" fill="rgb(250,213,24)" fg:x="3173406205" fg:w="58060096"/><text x="29.8309%" y="383.50"></text></g><g><title>Py_DECREF{inlined} (24,283,754 cycles, 0.23%)</title><rect x="36.0057%" y="309" width="0.2264%" height="15" fill="rgb(247,123,22)" fg:x="3862648524" fg:w="24283754"/><text x="36.2557%" y="319.50"></text></g><g><title>_PyType_LookupStackRefAndVersion{inlined} (41,701,985 cycles, 0.39%)</title><rect x="36.5034%" y="309" width="0.3887%" height="15" fill="rgb(231,138,38)" fg:x="3916043891" fg:w="41701985"/><text x="36.7534%" y="319.50"></text></g><g><title>_PyVectorcall_FunctionInline{inlined} (26,782,049 cycles, 0.25%)</title><rect x="37.5085%" y="261" width="0.2496%" height="15" fill="rgb(231,145,46)" fg:x="4023869132" fg:w="26782049"/><text x="37.7585%" y="271.50"></text></g><g><title>_PyFrame_Initialize{inlined} (38,101,099 cycles, 0.36%)</title><rect x="38.5756%" y="181" width="0.3552%" height="15" fill="rgb(251,118,11)" fg:x="4138354609" fg:w="38101099"/><text x="38.8256%" y="191.50"></text></g><g><title>_PyEvalFramePushAndInit{inlined} (91,620,988 cycles, 0.85%)</title><rect x="38.5756%" y="197" width="0.8540%" height="15" fill="rgb(217,147,25)" fg:x="4138354609" fg:w="91620988"/><text x="38.8256%" y="207.50"></text></g><g><title>initialize_locals.lto_priv.0{python3.14} (34,344,168 cycles, 0.32%)</title><rect x="39.1096%" y="181" width="0.3201%" height="15" fill="rgb(247,81,37)" fg:x="4195631429" fg:w="34344168"/><text x="39.3596%" y="191.50"></text></g><g><title>_PyEval_Vector{inlined} (134,945,631 cycles, 1.26%)</title><rect x="38.3028%" y="213" width="1.2579%" height="15" fill="rgb(209,12,38)" fg:x="4109084310" fg:w="134945631"/><text x="38.5528%" y="223.50"></text></g><g><title>_PyType_LookupStackRefAndVersion{inlined} (26,142,093 cycles, 0.24%)</title><rect x="42.7273%" y="149" width="0.2437%" height="15" fill="rgb(227,1,9)" fg:x="4583744188" fg:w="26142093"/><text x="42.9773%" y="159.50"></text></g><g><title>_PyObject_GenericGetAttrWithDict{python3.14} (81,096,188 cycles, 0.76%)</title><rect x="42.3586%" y="165" width="0.7559%" height="15" fill="rgb(248,47,43)" fg:x="4544182502" fg:w="81096188"/><text x="42.6086%" y="175.50"></text></g><g><title>PyObject_GetAttr{python3.14} (113,969,095 cycles, 1.06%)</title><rect x="42.1459%" y="181" width="1.0624%" height="15" fill="rgb(221,10,30)" fg:x="4521365948" fg:w="113969095"/><text x="42.3959%" y="191.50"></text></g><g><title>_PyFrame_Initialize{inlined} (22,770,502 cycles, 0.21%)</title><rect x="43.7414%" y="69" width="0.2123%" height="15" fill="rgb(210,229,1)" fg:x="4692533520" fg:w="22770502"/><text x="43.9914%" y="79.50"></text></g><g><title>_PyEval_Vector{inlined} (79,942,503 cycles, 0.75%)</title><rect x="43.6106%" y="101" width="0.7452%" height="15" fill="rgb(222,148,37)" fg:x="4678493951" fg:w="79942503"/><text x="43.8606%" y="111.50"></text></g><g><title>_PyEvalFramePushAndInit{inlined} (70,925,915 cycles, 0.66%)</title><rect x="43.6946%" y="85" width="0.6611%" height="15" fill="rgb(234,67,33)" fg:x="4687510539" fg:w="70925915"/><text x="43.9446%" y="95.50"></text></g><g><title>initialize_locals.lto_priv.0{python3.14} (36,910,672 cycles, 0.34%)</title><rect x="44.0117%" y="69" width="0.3441%" height="15" fill="rgb(247,98,35)" fg:x="4721525782" fg:w="36910672"/><text x="44.2617%" y="79.50"></text></g><g><title>_PyType_LookupStackRefAndVersion{inlined} (25,419,187 cycles, 0.24%)</title><rect x="46.7292%" y="37" width="0.2369%" height="15" fill="rgb(247,138,52)" fg:x="5013056111" fg:w="25419187"/><text x="46.9792%" y="47.50"></text></g><g><title>_PyObject_GenericGetAttrWithDict{python3.14} (129,383,011 cycles, 1.21%)</title><rect x="45.8554%" y="53" width="1.2060%" height="15" fill="rgb(213,79,30)" fg:x="4919315736" fg:w="129383011"/><text x="46.1054%" y="63.50"></text></g><g><title>PyObject_GetAttr{python3.14} (142,273,360 cycles, 1.33%)</title><rect x="45.7833%" y="69" width="1.3262%" height="15" fill="rgb(246,177,23)" fg:x="4911583136" fg:w="142273360"/><text x="46.0333%" y="79.50"></text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (328,328,338 cycles, 3.06%)</title><rect x="44.5333%" y="85" width="3.0605%" height="15" fill="rgb(230,62,27)" fg:x="4777489902" fg:w="328328338"/><text x="44.7833%" y="95.50">_Py..</text></g><g><title>py::Connection._check_closed:/root/bench/src/stacks/python/venv/lib/python3.14/site-packages/mariadb/connections.py{jit} (351,210,859 cycles, 3.27%)</title><rect x="44.3557%" y="101" width="3.2738%" height="15" fill="rgb(216,154,8)" fg:x="4758436454" fg:w="351210859"/><text x="44.6057%" y="111.50">py:..</text></g><g><title>_PyFunction_Vectorcall{python3.14} (494,776,217 cycles, 4.61%)</title><rect x="43.3141%" y="117" width="4.6121%" height="15" fill="rgb(244,35,45)" fg:x="4646685400" fg:w="494776217"/><text x="43.5641%" y="127.50">_PyFu..</text></g><g><title>py_trampoline_evaluator.lto_priv.0{python3.14} (31,814,304 cycles, 0.30%)</title><rect x="47.6295%" y="101" width="0.2966%" height="15" fill="rgb(251,115,12)" fg:x="5109647313" fg:w="31814304"/><text x="47.8795%" y="111.50"></text></g><g><title>PyObject_Vectorcall{python3.14} (549,301,161 cycles, 5.12%)</title><rect x="43.2082%" y="181" width="5.1203%" height="15" fill="rgb(240,54,50)" fg:x="4635335043" fg:w="549301161"/><text x="43.4582%" y="191.50">PyObje..</text></g><g><title>_PyObject_VectorcallTstate{inlined} (545,543,997 cycles, 5.09%)</title><rect x="43.2433%" y="165" width="5.0853%" height="15" fill="rgb(233,84,52)" fg:x="4639092207" fg:w="545543997"/><text x="43.4933%" y="175.50">_PyObj..</text></g><g><title>_Py_CheckFunctionResult{inlined} (539,222,382 cycles, 5.03%)</title><rect x="43.3022%" y="149" width="5.0264%" height="15" fill="rgb(207,117,47)" fg:x="4645413822" fg:w="539222382"/><text x="43.5522%" y="159.50">_Py_Ch..</text></g><g><title>_PyErr_Occurred{inlined} (537,950,804 cycles, 5.01%)</title><rect x="43.3141%" y="133" width="5.0145%" height="15" fill="rgb(249,43,39)" fg:x="4646685400" fg:w="537950804"/><text x="43.5641%" y="143.50">_PyErr..</text></g><g><title>py_trampoline_evaluator.lto_priv.0{python3.14} (36,841,506 cycles, 0.34%)</title><rect x="47.9851%" y="117" width="0.3434%" height="15" fill="rgb(209,38,44)" fg:x="5147794698" fg:w="36841506"/><text x="48.2351%" y="127.50"></text></g><g><title>_PyFrame_GetStackPointer{inlined} (28,995,408 cycles, 0.27%)</title><rect x="48.5872%" y="181" width="0.2703%" height="15" fill="rgb(236,212,23)" fg:x="5212378276" fg:w="28995408"/><text x="48.8372%" y="191.50"></text></g><g><title>_PyEval_FrameClearAndPop{python3.14} (26,715,861 cycles, 0.25%)</title><rect x="48.6084%" y="165" width="0.2490%" height="15" fill="rgb(242,79,21)" fg:x="5214657823" fg:w="26715861"/><text x="48.8584%" y="175.50"></text></g><g><title>py::Connection.thread_id:/root/bench/src/stacks/python/venv/lib/python3.14/site-packages/mariadb/connections.py{jit} (1,009,973,520 cycles, 9.41%)</title><rect x="39.5726%" y="213" width="9.4145%" height="15" fill="rgb(211,96,35)" fg:x="4245311597" fg:w="1009973520"/><text x="39.8226%" y="223.50">py::Connectio..</text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (994,816,560 cycles, 9.27%)</title><rect x="39.7139%" y="197" width="9.2732%" height="15" fill="rgb(253,215,40)" fg:x="4260468557" fg:w="994816560"/><text x="39.9639%" y="207.50">_PyEval_EvalF..</text></g><g><title>py::Cursor.connection:/root/bench/src/stacks/python/venv/lib/python3.14/site-packages/mariadb/cursors.py{jit} (194,846,330 cycles, 1.82%)</title><rect x="48.9871%" y="213" width="1.8163%" height="15" fill="rgb(211,81,21)" fg:x="5255285117" fg:w="194846330"/><text x="49.2371%" y="223.50">p..</text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (194,846,330 cycles, 1.82%)</title><rect x="48.9871%" y="197" width="1.8163%" height="15" fill="rgb(208,190,38)" fg:x="5255285117" fg:w="194846330"/><text x="49.2371%" y="207.50">_..</text></g><g><title>_PyFunction_Vectorcall{python3.14} (1,418,444,928 cycles, 13.22%)</title><rect x="37.7581%" y="229" width="13.2220%" height="15" fill="rgb(235,213,38)" fg:x="4050651181" fg:w="1418444928"/><text x="38.0081%" y="239.50">_PyFunction_Vectorca..</text></g><g><title>_PyObject_GenericGetAttrWithDict{python3.14} (1,712,075,574 cycles, 15.96%)</title><rect x="35.2825%" y="325" width="15.9591%" height="15" fill="rgb(237,122,38)" fg:x="3785068021" fg:w="1712075574"/><text x="35.5325%" y="335.50">_PyObject_GenericGetAttrW..</text></g><g><title>property_descr_get.lto_priv.0{python3.14} (1,536,872,081 cycles, 14.33%)</title><rect x="36.9156%" y="309" width="14.3259%" height="15" fill="rgb(244,218,35)" fg:x="3960271514" fg:w="1536872081"/><text x="37.1656%" y="319.50">property_descr_get.lto..</text></g><g><title>PyObject_CallOneArg{inlined} (1,507,458,012 cycles, 14.05%)</title><rect x="37.1898%" y="293" width="14.0518%" height="15" fill="rgb(240,68,47)" fg:x="3989685583" fg:w="1507458012"/><text x="37.4398%" y="303.50">PyObject_CallOneArg{i..</text></g><g><title>_PyObject_VectorcallTstate{inlined} (1,506,248,916 cycles, 14.04%)</title><rect x="37.2011%" y="277" width="14.0405%" height="15" fill="rgb(210,16,53)" fg:x="3990894679" fg:w="1506248916"/><text x="37.4511%" y="287.50">_PyObject_VectorcallT..</text></g><g><title>_Py_CheckFunctionResult{inlined} (1,446,492,414 cycles, 13.48%)</title><rect x="37.7581%" y="261" width="13.4835%" height="15" fill="rgb(235,124,12)" fg:x="4050651181" fg:w="1446492414"/><text x="38.0081%" y="271.50">_Py_CheckFunctionRes..</text></g><g><title>_PyErr_Occurred{inlined} (1,446,492,414 cycles, 13.48%)</title><rect x="37.7581%" y="245" width="13.4835%" height="15" fill="rgb(224,169,11)" fg:x="4050651181" fg:w="1446492414"/><text x="38.0081%" y="255.50">_PyErr_Occurred{inli..</text></g><g><title>py_trampoline_evaluator.lto_priv.0{python3.14} (21,630,942 cycles, 0.20%)</title><rect x="51.0400%" y="229" width="0.2016%" height="15" fill="rgb(250,166,2)" fg:x="5475512653" fg:w="21630942"/><text x="51.2900%" y="239.50"></text></g><g><title>PyObject_GetAttr{python3.14} (1,752,611,045 cycles, 16.34%)</title><rect x="35.1407%" y="341" width="16.3370%" height="15" fill="rgb(242,216,29)" fg:x="3769860968" fg:w="1752611045"/><text x="35.3907%" y="351.50">PyObject_GetAttr{python3...</text></g><g><title>property_descr_get.lto_priv.0{python3.14} (21,500,854 cycles, 0.20%)</title><rect x="51.2773%" y="325" width="0.2004%" height="15" fill="rgb(230,116,27)" fg:x="5500971159" fg:w="21500854"/><text x="51.5273%" y="335.50"></text></g><g><title>_PyEvalFramePushAndInit{inlined} (69,031,033 cycles, 0.64%)</title><rect x="51.8311%" y="245" width="0.6435%" height="15" fill="rgb(228,99,48)" fg:x="5560389956" fg:w="69031033"/><text x="52.0811%" y="255.50"></text></g><g><title>initialize_locals.lto_priv.0{python3.14} (42,139,888 cycles, 0.39%)</title><rect x="52.0818%" y="229" width="0.3928%" height="15" fill="rgb(253,11,6)" fg:x="5587281101" fg:w="42139888"/><text x="52.3318%" y="239.50"></text></g><g><title>_PyEval_Vector{inlined} (88,165,565 cycles, 0.82%)</title><rect x="51.7470%" y="261" width="0.8218%" height="15" fill="rgb(247,143,39)" fg:x="5551361649" fg:w="88165565"/><text x="51.9970%" y="271.50"></text></g><g><title>_PyObject_GenericGetAttrWithDict{python3.14} (63,405,402 cycles, 0.59%)</title><rect x="54.9118%" y="213" width="0.5910%" height="15" fill="rgb(236,97,10)" fg:x="5890884507" fg:w="63405402"/><text x="55.1618%" y="223.50"></text></g><g><title>PyObject_GetAttr{python3.14} (145,452,459 cycles, 1.36%)</title><rect x="54.1700%" y="229" width="1.3558%" height="15" fill="rgb(233,208,19)" fg:x="5811298495" fg:w="145452459"/><text x="54.4200%" y="239.50"></text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (340,100,911 cycles, 3.17%)</title><rect x="52.7709%" y="245" width="3.1702%" height="15" fill="rgb(216,164,2)" fg:x="5661203051" fg:w="340100911"/><text x="53.0209%" y="255.50">_Py..</text></g><g><title>py::Connection._check_closed:/root/bench/src/stacks/python/venv/lib/python3.14/site-packages/mariadb/connections.py{jit} (365,626,966 cycles, 3.41%)</title><rect x="52.5688%" y="261" width="3.4082%" height="15" fill="rgb(220,129,5)" fg:x="5639527214" fg:w="365626966"/><text x="52.8188%" y="271.50">py:..</text></g><g><title>_PyFunction_Vectorcall{python3.14} (505,253,925 cycles, 4.71%)</title><rect x="51.5829%" y="277" width="4.7097%" height="15" fill="rgb(242,17,10)" fg:x="5533762350" fg:w="505253925"/><text x="51.8329%" y="287.50">_PyFu..</text></g><g><title>py_trampoline_evaluator.lto_priv.0{python3.14} (33,862,095 cycles, 0.32%)</title><rect x="55.9770%" y="261" width="0.3156%" height="15" fill="rgb(242,107,0)" fg:x="6005154180" fg:w="33862095"/><text x="56.2270%" y="271.50"></text></g><g><title>PyObject_Vectorcall{python3.14} (530,643,550 cycles, 4.95%)</title><rect x="51.4777%" y="341" width="4.9464%" height="15" fill="rgb(251,28,31)" fg:x="5522472013" fg:w="530643550"/><text x="51.7277%" y="351.50">PyObje..</text></g><g><title>_PyObject_VectorcallTstate{inlined} (529,354,339 cycles, 4.93%)</title><rect x="51.4897%" y="325" width="4.9344%" height="15" fill="rgb(233,223,10)" fg:x="5523761224" fg:w="529354339"/><text x="51.7397%" y="335.50">_PyObj..</text></g><g><title>_Py_CheckFunctionResult{inlined} (521,848,151 cycles, 4.86%)</title><rect x="51.5597%" y="309" width="4.8644%" height="15" fill="rgb(215,21,27)" fg:x="5531267412" fg:w="521848151"/><text x="51.8097%" y="319.50">_Py_Ch..</text></g><g><title>_PyErr_Occurred{inlined} (519,353,213 cycles, 4.84%)</title><rect x="51.5829%" y="293" width="4.8411%" height="15" fill="rgb(232,23,21)" fg:x="5533762350" fg:w="519353213"/><text x="51.8329%" y="303.50">_PyErr..</text></g><g><title>PyStackRef_XCLOSE{inlined} (21,469,214 cycles, 0.20%)</title><rect x="56.8818%" y="341" width="0.2001%" height="15" fill="rgb(244,5,23)" fg:x="6102222607" fg:w="21469214"/><text x="57.1318%" y="351.50"></text></g><g><title>_PyFrame_GetStackPointer{inlined} (26,878,587 cycles, 0.25%)</title><rect x="57.0940%" y="341" width="0.2505%" height="15" fill="rgb(226,81,46)" fg:x="6124978967" fg:w="26878587"/><text x="57.3440%" y="351.50"></text></g><g><title>_PyEval_FrameClearAndPop{python3.14} (21,716,682 cycles, 0.20%)</title><rect x="57.1421%" y="325" width="0.2024%" height="15" fill="rgb(247,70,30)" fg:x="6130140872" fg:w="21716682"/><text x="57.3921%" y="335.50"></text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (2,961,951,135 cycles, 27.61%)</title><rect x="30.2839%" y="357" width="27.6098%" height="15" fill="rgb(212,68,19)" fg:x="3248824972" fg:w="2961951135"/><text x="30.5339%" y="367.50">_PyEval_EvalFrameDefault{python3.14}</text></g><g><title>py::Cursor.check_closed:/root/bench/src/stacks/python/venv/lib/python3.14/site-packages/mariadb/cursors.py{jit} (2,986,844,542 cycles, 27.84%)</title><rect x="30.1221%" y="373" width="27.8419%" height="15" fill="rgb(240,187,13)" fg:x="3231466301" fg:w="2986844542"/><text x="30.3721%" y="383.50">py::Cursor.check_closed:/root/bench/src/stack..</text></g><g><title>_PyFunction_Vectorcall{python3.14} (3,097,874,621 cycles, 28.88%)</title><rect x="29.3937%" y="389" width="28.8768%" height="15" fill="rgb(223,113,26)" fg:x="3153329526" fg:w="3097874621"/><text x="29.6437%" y="399.50">_PyFunction_Vectorcall{python3.14}</text></g><g><title>py_trampoline_evaluator.lto_priv.0{python3.14} (32,893,304 cycles, 0.31%)</title><rect x="57.9639%" y="373" width="0.3066%" height="15" fill="rgb(206,192,2)" fg:x="6218310843" fg:w="32893304"/><text x="58.2139%" y="383.50"></text></g><g><title>method_check_args{inlined} (25,442,908 cycles, 0.24%)</title><rect x="58.3514%" y="373" width="0.2372%" height="15" fill="rgb(241,108,4)" fg:x="6259878904" fg:w="25442908"/><text x="58.6014%" y="383.50"></text></g><g><title>method_vectorcall_NOARGS.lto_priv.0{python3.14} (39,232,944 cycles, 0.37%)</title><rect x="58.2706%" y="389" width="0.3657%" height="15" fill="rgb(247,173,49)" fg:x="6251204147" fg:w="39232944"/><text x="58.5206%" y="399.50"></text></g><g><title>PyObject_Vectorcall{python3.14} (3,166,369,119 cycles, 29.52%)</title><rect x="29.1571%" y="453" width="29.5153%" height="15" fill="rgb(224,114,35)" fg:x="3127938901" fg:w="3166369119"/><text x="29.4071%" y="463.50">PyObject_Vectorcall{python3.14}</text></g><g><title>_PyObject_VectorcallTstate{inlined} (3,166,369,119 cycles, 29.52%)</title><rect x="29.1571%" y="437" width="29.5153%" height="15" fill="rgb(245,159,27)" fg:x="3127938901" fg:w="3166369119"/><text x="29.4071%" y="447.50">_PyObject_VectorcallTstate{inlined}</text></g><g><title>_Py_CheckFunctionResult{inlined} (3,147,388,849 cycles, 29.34%)</title><rect x="29.3340%" y="421" width="29.3384%" height="15" fill="rgb(245,172,44)" fg:x="3146919171" fg:w="3147388849"/><text x="29.5840%" y="431.50">_Py_CheckFunctionResult{inlined}</text></g><g><title>_PyErr_Occurred{inlined} (3,142,268,589 cycles, 29.29%)</title><rect x="29.3817%" y="405" width="29.2906%" height="15" fill="rgb(236,23,11)" fg:x="3152039431" fg:w="3142268589"/><text x="29.6317%" y="415.50">_PyErr_Occurred{inlined}</text></g><g><title>PyStackRef_FromPyObjectSteal{inlined} (22,110,428 cycles, 0.21%)</title><rect x="58.8268%" y="453" width="0.2061%" height="15" fill="rgb(205,117,38)" fg:x="6310874464" fg:w="22110428"/><text x="59.0768%" y="463.50"></text></g><g><title>PyStackRef_XCLOSE{inlined} (30,625,558 cycles, 0.29%)</title><rect x="59.0551%" y="453" width="0.2855%" height="15" fill="rgb(237,72,25)" fg:x="6335372839" fg:w="30625558"/><text x="59.3051%" y="463.50"></text></g><g><title>_PyFrame_ClearExceptCode{inlined} (23,012,203 cycles, 0.21%)</title><rect x="59.4711%" y="405" width="0.2145%" height="15" fill="rgb(244,70,9)" fg:x="6379992403" fg:w="23012203"/><text x="59.7211%" y="415.50"></text></g><g><title>_PyEval_FrameClearAndPop{python3.14} (35,606,278 cycles, 0.33%)</title><rect x="59.4362%" y="437" width="0.3319%" height="15" fill="rgb(217,125,39)" fg:x="6376250910" fg:w="35606278"/><text x="59.6862%" y="447.50"></text></g><g><title>clear_thread_frame{inlined} (31,864,785 cycles, 0.30%)</title><rect x="59.4711%" y="421" width="0.2970%" height="15" fill="rgb(235,36,10)" fg:x="6379992403" fg:w="31864785"/><text x="59.7211%" y="431.50"></text></g><g><title>_Py_NewRef{inlined} (27,888,457 cycles, 0.26%)</title><rect x="60.7740%" y="357" width="0.2600%" height="15" fill="rgb(251,123,47)" fg:x="6519774133" fg:w="27888457"/><text x="61.0240%" y="367.50"></text></g><g><title>Py_INCREF{inlined} (27,888,457 cycles, 0.26%)</title><rect x="60.7740%" y="341" width="0.2600%" height="15" fill="rgb(221,13,13)" fg:x="6519774133" fg:w="27888457"/><text x="61.0240%" y="351.50"></text></g><g><title>_PyDict_GetItemRef_KnownHash{inlined} (126,783,241 cycles, 1.18%)</title><rect x="60.3957%" y="373" width="1.1818%" height="15" fill="rgb(238,131,9)" fg:x="6479186908" fg:w="126783241"/><text x="60.6457%" y="383.50"></text></g><g><title>_Py_dict_lookup{python3.14} (58,307,559 cycles, 0.54%)</title><rect x="61.0340%" y="357" width="0.5435%" height="15" fill="rgb(211,50,8)" fg:x="6547662590" fg:w="58307559"/><text x="61.2840%" y="367.50"></text></g><g><title>unicodekeys_lookup_unicode{inlined} (42,968,708 cycles, 0.40%)</title><rect x="61.1770%" y="341" width="0.4005%" height="15" fill="rgb(245,182,24)" fg:x="6563001441" fg:w="42968708"/><text x="61.4270%" y="351.50"></text></g><g><title>do_lookup{inlined} (42,968,708 cycles, 0.40%)</title><rect x="61.1770%" y="325" width="0.4005%" height="15" fill="rgb(242,14,37)" fg:x="6563001441" fg:w="42968708"/><text x="61.4270%" y="335.50"></text></g><g><title>PyDict_GetItemRef{inlined} (139,325,040 cycles, 1.30%)</title><rect x="60.2906%" y="389" width="1.2987%" height="15" fill="rgb(246,228,12)" fg:x="6467915174" fg:w="139325040"/><text x="60.5406%" y="399.50"></text></g><g><title>do_super_lookup{inlined} (191,602,723 cycles, 1.79%)</title><rect x="59.9576%" y="421" width="1.7860%" height="15" fill="rgb(213,55,15)" fg:x="6432182780" fg:w="191602723"/><text x="60.2076%" y="431.50">d..</text></g><g><title>_super_lookup_descr{inlined} (161,000,360 cycles, 1.50%)</title><rect x="60.2428%" y="405" width="1.5008%" height="15" fill="rgb(209,9,3)" fg:x="6462785143" fg:w="161000360"/><text x="60.4928%" y="415.50"></text></g><g><title>_PyFrame_GetStackPointer{inlined} (254,201,004 cycles, 2.37%)</title><rect x="59.4220%" y="453" width="2.3695%" height="15" fill="rgb(230,59,30)" fg:x="6374726019" fg:w="254201004"/><text x="59.6720%" y="463.50">_P..</text></g><g><title>_PySuper_Lookup{python3.14} (217,069,835 cycles, 2.02%)</title><rect x="59.7681%" y="437" width="2.0234%" height="15" fill="rgb(209,121,21)" fg:x="6411857188" fg:w="217069835"/><text x="60.0181%" y="447.50">_..</text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (4,437,062,835 cycles, 41.36%)</title><rect x="21.0679%" y="469" width="41.3601%" height="15" fill="rgb(220,109,13)" fg:x="2260145573" fg:w="4437062835"/><text x="21.3179%" y="479.50">_PyEval_EvalFrameDefault{python3.14}</text></g><g><title>py::Cursor._fetch_row:/root/bench/src/stacks/python/venv/lib/python3.14/site-packages/mariadb/cursors.py{jit} (4,574,795,696 cycles, 42.64%)</title><rect x="19.8901%" y="485" width="42.6439%" height="15" fill="rgb(232,18,1)" fg:x="2133793376" fg:w="4574795696"/><text x="20.1401%" y="495.50">py::Cursor._fetch_row:/root/bench/src/stacks/python/venv/lib/python3.1..</text></g><g><title>PyObject_GetAttr{python3.14} (44,681,454 cycles, 0.42%)</title><rect x="62.5461%" y="469" width="0.4165%" height="15" fill="rgb(215,41,42)" fg:x="6709879939" fg:w="44681454"/><text x="62.7961%" y="479.50"></text></g><g><title>_PyStackRef_FromPyObjectNew{inlined} (50,932,275 cycles, 0.47%)</title><rect x="70.1678%" y="405" width="0.4748%" height="15" fill="rgb(224,123,36)" fg:x="7527526185" fg:w="50932275"/><text x="70.4178%" y="415.50"></text></g><g><title>_PyType_LookupStackRefAndVersion{inlined} (92,514,340 cycles, 0.86%)</title><rect x="69.8145%" y="421" width="0.8624%" height="15" fill="rgb(240,125,3)" fg:x="7489627538" fg:w="92514340"/><text x="70.0645%" y="431.50"></text></g><g><title>_PyVectorcall_FunctionInline{inlined} (37,720,117 cycles, 0.35%)</title><rect x="71.2967%" y="373" width="0.3516%" height="15" fill="rgb(205,98,50)" fg:x="7648634984" fg:w="37720117"/><text x="71.5467%" y="383.50"></text></g><g><title>_PyFrame_Initialize{inlined} (21,774,924 cycles, 0.20%)</title><rect x="72.5416%" y="293" width="0.2030%" height="15" fill="rgb(205,185,37)" fg:x="7782185708" fg:w="21774924"/><text x="72.7916%" y="303.50"></text></g><g><title>_PyEvalFramePushAndInit{inlined} (79,942,557 cycles, 0.75%)</title><rect x="72.4731%" y="309" width="0.7452%" height="15" fill="rgb(238,207,15)" fg:x="7774836665" fg:w="79942557"/><text x="72.7231%" y="319.50"></text></g><g><title>initialize_locals.lto_priv.0{python3.14} (38,016,028 cycles, 0.35%)</title><rect x="72.8639%" y="293" width="0.3544%" height="15" fill="rgb(213,199,42)" fg:x="7816763194" fg:w="38016028"/><text x="73.1139%" y="303.50"></text></g><g><title>_PyEval_Vector{inlined} (98,976,553 cycles, 0.92%)</title><rect x="72.3551%" y="325" width="0.9226%" height="15" fill="rgb(235,201,11)" fg:x="7762178548" fg:w="98976553"/><text x="72.6051%" y="335.50"></text></g><g><title>PyLong_FromUnsignedLong{python3.14} (23,803,703 cycles, 0.22%)</title><rect x="75.8408%" y="261" width="0.2219%" height="15" fill="rgb(207,46,11)" fg:x="8136120153" fg:w="23803703"/><text x="76.0908%" y="271.50"></text></g><g><title>_PyObject_GenericGetAttrWithDict{python3.14} (79,591,204 cycles, 0.74%)</title><rect x="75.6872%" y="277" width="0.7419%" height="15" fill="rgb(241,35,35)" fg:x="8119641767" fg:w="79591204"/><text x="75.9372%" y="287.50"></text></g><g><title>PyObject_GetAttr{python3.14} (121,511,148 cycles, 1.13%)</title><rect x="75.4497%" y="293" width="1.1327%" height="15" fill="rgb(243,32,47)" fg:x="8094167328" fg:w="121511148"/><text x="75.6997%" y="303.50"></text></g><g><title>_PyEvalFramePushAndInit{inlined} (63,039,666 cycles, 0.59%)</title><rect x="76.9253%" y="197" width="0.5876%" height="15" fill="rgb(247,202,23)" fg:x="8252467246" fg:w="63039666"/><text x="77.1753%" y="207.50"></text></g><g><title>initialize_locals.lto_priv.0{python3.14} (35,238,188 cycles, 0.33%)</title><rect x="77.1845%" y="181" width="0.3285%" height="15" fill="rgb(219,102,11)" fg:x="8280268724" fg:w="35238188"/><text x="77.4345%" y="191.50"></text></g><g><title>_PyEval_Vector{inlined} (74,492,065 cycles, 0.69%)</title><rect x="76.8664%" y="213" width="0.6944%" height="15" fill="rgb(243,110,44)" fg:x="8246141998" fg:w="74492065"/><text x="77.1164%" y="223.50"></text></g><g><title>PyObject_GetAttr{python3.14} (39,352,352 cycles, 0.37%)</title><rect x="77.5955%" y="197" width="0.3668%" height="15" fill="rgb(222,74,54)" fg:x="8324360549" fg:w="39352352"/><text x="77.8455%" y="207.50"></text></g><g><title>Py_DECREF{inlined} (25,403,684 cycles, 0.24%)</title><rect x="80.0148%" y="149" width="0.2368%" height="15" fill="rgb(216,99,12)" fg:x="8583902541" fg:w="25403684"/><text x="80.2648%" y="159.50"></text></g><g><title>_Py_IsImmortal{inlined} (25,403,684 cycles, 0.24%)</title><rect x="80.0148%" y="133" width="0.2368%" height="15" fill="rgb(226,22,26)" fg:x="8583902541" fg:w="25403684"/><text x="80.2648%" y="143.50"></text></g><g><title>_PyType_LookupStackRefAndVersion{inlined} (29,163,937 cycles, 0.27%)</title><rect x="80.3115%" y="149" width="0.2719%" height="15" fill="rgb(217,163,10)" fg:x="8615737020" fg:w="29163937"/><text x="80.5615%" y="159.50"></text></g><g><title>PyMember_GetOne{inlined} (45,372,079 cycles, 0.42%)</title><rect x="80.6189%" y="133" width="0.4229%" height="15" fill="rgb(213,25,53)" fg:x="8648713777" fg:w="45372079"/><text x="80.8689%" y="143.50"></text></g><g><title>PyBool_FromLong{inlined} (36,634,817 cycles, 0.34%)</title><rect x="80.7004%" y="117" width="0.3415%" height="15" fill="rgb(252,105,26)" fg:x="8657451039" fg:w="36634817"/><text x="80.9504%" y="127.50"></text></g><g><title>_PyObject_GenericGetAttrWithDict{python3.14} (221,997,192 cycles, 2.07%)</title><rect x="79.0547%" y="165" width="2.0693%" height="15" fill="rgb(220,39,43)" fg:x="8480907522" fg:w="221997192"/><text x="79.3047%" y="175.50">_..</text></g><g><title>member_get.lto_priv.0{python3.14} (58,003,757 cycles, 0.54%)</title><rect x="80.5834%" y="149" width="0.5407%" height="15" fill="rgb(229,68,48)" fg:x="8644900957" fg:w="58003757"/><text x="80.8334%" y="159.50"></text></g><g><title>PyObject_GetAttr{python3.14} (237,372,327 cycles, 2.21%)</title><rect x="79.0187%" y="181" width="2.2127%" height="15" fill="rgb(252,8,32)" fg:x="8477043875" fg:w="237372327"/><text x="79.2687%" y="191.50">P..</text></g><g><title>py::Connection._check_closed:/root/bench/src/stacks/python/venv/lib/python3.14/site-packages/mariadb/connections.py{jit} (449,735,510 cycles, 4.19%)</title><rect x="77.5607%" y="213" width="4.1922%" height="15" fill="rgb(223,20,43)" fg:x="8320634063" fg:w="449735510"/><text x="77.8107%" y="223.50">py::C..</text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (406,656,672 cycles, 3.79%)</title><rect x="77.9623%" y="197" width="3.7906%" height="15" fill="rgb(229,81,49)" fg:x="8363712901" fg:w="406656672"/><text x="78.2123%" y="207.50">_PyE..</text></g><g><title>_PyFunction_Vectorcall{python3.14} (607,745,972 cycles, 5.67%)</title><rect x="76.6774%" y="229" width="5.6651%" height="15" fill="rgb(236,28,36)" fg:x="8225870791" fg:w="607745972"/><text x="76.9274%" y="239.50">_PyFunc..</text></g><g><title>py_trampoline_evaluator.lto_priv.0{python3.14} (63,247,190 cycles, 0.59%)</title><rect x="81.7529%" y="213" width="0.5896%" height="15" fill="rgb(249,185,26)" fg:x="8770369573" fg:w="63247190"/><text x="82.0029%" y="223.50"></text></g><g><title>PyObject_Vectorcall{python3.14} (635,662,226 cycles, 5.93%)</title><rect x="76.5824%" y="293" width="5.9253%" height="15" fill="rgb(249,174,33)" fg:x="8215678476" fg:w="635662226"/><text x="76.8324%" y="303.50">PyObject..</text></g><g><title>_PyObject_VectorcallTstate{inlined} (634,372,422 cycles, 5.91%)</title><rect x="76.5944%" y="277" width="5.9133%" height="15" fill="rgb(233,201,37)" fg:x="8216968280" fg:w="634372422"/><text x="76.8444%" y="287.50">_PyObjec..</text></g><g><title>_Py_CheckFunctionResult{inlined} (625,469,911 cycles, 5.83%)</title><rect x="76.6774%" y="261" width="5.8303%" height="15" fill="rgb(221,78,26)" fg:x="8225870791" fg:w="625469911"/><text x="76.9274%" y="271.50">_Py_Che..</text></g><g><title>_PyErr_Occurred{inlined} (625,469,911 cycles, 5.83%)</title><rect x="76.6774%" y="245" width="5.8303%" height="15" fill="rgb(250,127,30)" fg:x="8225870791" fg:w="625469911"/><text x="76.9274%" y="255.50">_PyErr_..</text></g><g><title>py::Connection.thread_id:/root/bench/src/stacks/python/venv/lib/python3.14/site-packages/mariadb/connections.py{jit} (1,069,707,447 cycles, 9.97%)</title><rect x="73.2777%" y="325" width="9.9713%" height="15" fill="rgb(230,49,44)" fg:x="7861155101" fg:w="1069707447"/><text x="73.5277%" y="335.50">py::Connection..</text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (1,051,907,368 cycles, 9.81%)</title><rect x="73.4436%" y="309" width="9.8053%" height="15" fill="rgb(229,67,23)" fg:x="7878955180" fg:w="1051907368"/><text x="73.6936%" y="319.50">_PyEval_EvalFr..</text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (145,820,266 cycles, 1.36%)</title><rect x="83.2730%" y="309" width="1.3593%" height="15" fill="rgb(249,83,47)" fg:x="8933444229" fg:w="145820266"/><text x="83.5230%" y="319.50"></text></g><g><title>py::Cursor.connection:/root/bench/src/stacks/python/venv/lib/python3.14/site-packages/mariadb/cursors.py{jit} (152,036,773 cycles, 1.42%)</title><rect x="83.2490%" y="325" width="1.4172%" height="15" fill="rgb(215,43,3)" fg:x="8930862548" fg:w="152036773"/><text x="83.4990%" y="335.50"></text></g><g><title>_PyFunction_Vectorcall{python3.14} (1,417,041,354 cycles, 13.21%)</title><rect x="71.6603%" y="341" width="13.2089%" height="15" fill="rgb(238,154,13)" fg:x="7687644465" fg:w="1417041354"/><text x="71.9103%" y="351.50">_PyFunction_Vectorca..</text></g><g><title>py_trampoline_evaluator.lto_priv.0{python3.14} (21,786,498 cycles, 0.20%)</title><rect x="84.6662%" y="325" width="0.2031%" height="15" fill="rgb(219,56,2)" fg:x="9082899321" fg:w="21786498"/><text x="84.9162%" y="335.50"></text></g><g><title>_PyObject_GenericGetAttrWithDict{python3.14} (1,788,048,306 cycles, 16.67%)</title><rect x="68.6165%" y="437" width="16.6673%" height="15" fill="rgb(233,0,4)" fg:x="7361102730" fg:w="1788048306"/><text x="68.8665%" y="447.50">_PyObject_GenericGetAttrWi..</text></g><g><title>property_descr_get.lto_priv.0{python3.14} (1,561,940,922 cycles, 14.56%)</title><rect x="70.7241%" y="421" width="14.5596%" height="15" fill="rgb(235,30,7)" fg:x="7587210114" fg:w="1561940922"/><text x="70.9741%" y="431.50">property_descr_get.lto..</text></g><g><title>PyObject_CallOneArg{inlined} (1,547,977,256 cycles, 14.43%)</title><rect x="70.8543%" y="405" width="14.4295%" height="15" fill="rgb(250,79,13)" fg:x="7601173780" fg:w="1547977256"/><text x="71.1043%" y="415.50">PyObject_CallOneArg{in..</text></g><g><title>_PyObject_VectorcallTstate{inlined} (1,533,805,517 cycles, 14.30%)</title><rect x="70.9864%" y="389" width="14.2974%" height="15" fill="rgb(211,146,34)" fg:x="7615345519" fg:w="1533805517"/><text x="71.2364%" y="399.50">_PyObject_VectorcallTs..</text></g><g><title>_Py_CheckFunctionResult{inlined} (1,462,795,935 cycles, 13.64%)</title><rect x="71.6483%" y="373" width="13.6354%" height="15" fill="rgb(228,22,38)" fg:x="7686355101" fg:w="1462795935"/><text x="71.8983%" y="383.50">_Py_CheckFunctionResu..</text></g><g><title>_PyErr_Occurred{inlined} (1,462,795,935 cycles, 13.64%)</title><rect x="71.6483%" y="357" width="13.6354%" height="15" fill="rgb(235,168,5)" fg:x="7686355101" fg:w="1462795935"/><text x="71.8983%" y="367.50">_PyErr_Occurred{inlin..</text></g><g><title>py_trampoline_evaluator.lto_priv.0{python3.14} (22,660,976 cycles, 0.21%)</title><rect x="85.0725%" y="341" width="0.2112%" height="15" fill="rgb(221,155,16)" fg:x="9126490060" fg:w="22660976"/><text x="85.3225%" y="351.50"></text></g><g><title>PyObject_GetAttr{python3.14} (1,818,400,949 cycles, 16.95%)</title><rect x="68.4649%" y="453" width="16.9502%" height="15" fill="rgb(215,215,53)" fg:x="7344841045" fg:w="1818400949"/><text x="68.7149%" y="463.50">PyObject_GetAttr{python3.1..</text></g><g><title>_PyEvalFramePushAndInit{inlined} (63,081,358 cycles, 0.59%)</title><rect x="85.7806%" y="357" width="0.5880%" height="15" fill="rgb(223,4,10)" fg:x="9202450375" fg:w="63081358"/><text x="86.0306%" y="367.50"></text></g><g><title>initialize_locals.lto_priv.0{python3.14} (35,152,412 cycles, 0.33%)</title><rect x="86.0409%" y="341" width="0.3277%" height="15" fill="rgb(234,103,6)" fg:x="9230379321" fg:w="35152412"/><text x="86.2909%" y="351.50"></text></g><g><title>_PyEval_Vector{inlined} (90,904,265 cycles, 0.85%)</title><rect x="85.7453%" y="373" width="0.8474%" height="15" fill="rgb(227,97,0)" fg:x="9198661203" fg:w="90904265"/><text x="85.9953%" y="383.50"></text></g><g><title>PyObject_GetAttr{python3.14} (82,619,258 cycles, 0.77%)</title><rect x="86.6519%" y="357" width="0.7701%" height="15" fill="rgb(234,150,53)" fg:x="9295927823" fg:w="82619258"/><text x="86.9019%" y="367.50"></text></g><g><title>_PyObject_GenericGetAttrWithDict{python3.14} (44,668,038 cycles, 0.42%)</title><rect x="88.9410%" y="325" width="0.4164%" height="15" fill="rgb(228,201,54)" fg:x="9541491455" fg:w="44668038"/><text x="89.1910%" y="335.50"></text></g><g><title>PyObject_GetAttr{python3.14} (51,089,626 cycles, 0.48%)</title><rect x="88.9172%" y="341" width="0.4762%" height="15" fill="rgb(222,22,37)" fg:x="9538941023" fg:w="51089626"/><text x="89.1672%" y="351.50"></text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (274,797,444 cycles, 2.56%)</title><rect x="87.4221%" y="357" width="2.5615%" height="15" fill="rgb(237,53,32)" fg:x="9378547081" fg:w="274797444"/><text x="87.6721%" y="367.50">_P..</text></g><g><title>py::Connection._check_closed:/root/bench/src/stacks/python/venv/lib/python3.14/site-packages/mariadb/connections.py{jit} (365,016,381 cycles, 3.40%)</title><rect x="86.5926%" y="373" width="3.4025%" height="15" fill="rgb(233,25,53)" fg:x="9289565468" fg:w="365016381"/><text x="86.8426%" y="383.50">py:..</text></g><g><title>_PyFunction_Vectorcall{python3.14} (502,559,892 cycles, 4.68%)</title><rect x="85.5214%" y="389" width="4.6846%" height="15" fill="rgb(210,40,34)" fg:x="9174642525" fg:w="502559892"/><text x="85.7714%" y="399.50">_PyFu..</text></g><g><title>py_trampoline_evaluator.lto_priv.0{python3.14} (22,620,568 cycles, 0.21%)</title><rect x="89.9951%" y="373" width="0.2109%" height="15" fill="rgb(241,220,44)" fg:x="9654581849" fg:w="22620568"/><text x="90.2451%" y="383.50"></text></g><g><title>PyObject_Vectorcall{python3.14} (520,339,278 cycles, 4.85%)</title><rect x="85.4151%" y="453" width="4.8503%" height="15" fill="rgb(235,28,35)" fg:x="9163241994" fg:w="520339278"/><text x="85.6651%" y="463.50">PyObje..</text></g><g><title>_PyObject_VectorcallTstate{inlined} (515,186,850 cycles, 4.80%)</title><rect x="85.4631%" y="437" width="4.8023%" height="15" fill="rgb(210,56,17)" fg:x="9168394422" fg:w="515186850"/><text x="85.7131%" y="447.50">_PyObj..</text></g><g><title>_Py_CheckFunctionResult{inlined} (511,405,427 cycles, 4.77%)</title><rect x="85.4984%" y="421" width="4.7671%" height="15" fill="rgb(224,130,29)" fg:x="9172175845" fg:w="511405427"/><text x="85.7484%" y="431.50">_Py_Ch..</text></g><g><title>_PyErr_Occurred{inlined} (508,938,747 cycles, 4.74%)</title><rect x="85.5214%" y="405" width="4.7441%" height="15" fill="rgb(235,212,8)" fg:x="9174642525" fg:w="508938747"/><text x="85.7714%" y="415.50">_PyErr..</text></g><g><title>PyStackRef_Borrow{inlined} (31,811,411 cycles, 0.30%)</title><rect x="90.4766%" y="453" width="0.2965%" height="15" fill="rgb(223,33,50)" fg:x="9706237504" fg:w="31811411"/><text x="90.7266%" y="463.50"></text></g><g><title>_PyFrame_GetStackPointer{inlined} (26,554,084 cycles, 0.25%)</title><rect x="91.1822%" y="453" width="0.2475%" height="15" fill="rgb(219,149,13)" fg:x="9781926292" fg:w="26554084"/><text x="91.4322%" y="463.50"></text></g><g><title>_PyEval_FrameClearAndPop{python3.14} (22,773,006 cycles, 0.21%)</title><rect x="91.2174%" y="437" width="0.2123%" height="15" fill="rgb(250,156,29)" fg:x="9785707370" fg:w="22773006"/><text x="91.4674%" y="447.50"></text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (3,117,327,253 cycles, 29.06%)</title><rect x="62.9746%" y="469" width="29.0581%" height="15" fill="rgb(216,193,19)" fg:x="6755847107" fg:w="3117327253"/><text x="63.2246%" y="479.50">_PyEval_EvalFrameDefault{python3.14}</text></g><g><title>py::Cursor.check_closed:/root/bench/src/stacks/python/venv/lib/python3.14/site-packages/mariadb/cursors.py{jit} (3,167,166,201 cycles, 29.52%)</title><rect x="62.5341%" y="485" width="29.5227%" height="15" fill="rgb(216,135,14)" fg:x="6708589072" fg:w="3167166201"/><text x="62.7841%" y="495.50">py::Cursor.check_closed:/root/bench/src/stacks/p..</text></g><g><title>_PyFunction_Vectorcall{python3.14} (8,017,878,462 cycles, 74.74%)</title><rect x="17.9049%" y="501" width="74.7386%" height="15" fill="rgb(241,47,5)" fg:x="1920815219" fg:w="8017878462"/><text x="18.1549%" y="511.50">_PyFunction_Vectorcall{python3.14}</text></g><g><title>py_trampoline_evaluator.lto_priv.0{python3.14} (62,938,408 cycles, 0.59%)</title><rect x="92.0568%" y="485" width="0.5867%" height="15" fill="rgb(233,42,35)" fg:x="9875755273" fg:w="62938408"/><text x="92.3068%" y="495.50"></text></g><g><title>PyObject_Vectorcall{python3.14} (8,044,614,806 cycles, 74.99%)</title><rect x="17.7627%" y="565" width="74.9878%" height="15" fill="rgb(231,13,6)" fg:x="1905558882" fg:w="8044614806"/><text x="18.0127%" y="575.50">PyObject_Vectorcall{python3.14}</text></g><g><title>_PyObject_VectorcallTstate{inlined} (8,042,040,612 cycles, 74.96%)</title><rect x="17.7867%" y="549" width="74.9638%" height="15" fill="rgb(207,181,40)" fg:x="1908133076" fg:w="8042040612"/><text x="18.0367%" y="559.50">_PyObject_VectorcallTstate{inlined}</text></g><g><title>_Py_CheckFunctionResult{inlined} (8,030,640,611 cycles, 74.86%)</title><rect x="17.8929%" y="533" width="74.8576%" height="15" fill="rgb(254,173,49)" fg:x="1919533077" fg:w="8030640611"/><text x="18.1429%" y="543.50">_Py_CheckFunctionResult{inlined}</text></g><g><title>_PyErr_Occurred{inlined} (8,029,358,469 cycles, 74.85%)</title><rect x="17.9049%" y="517" width="74.8456%" height="15" fill="rgb(221,1,38)" fg:x="1920815219" fg:w="8029358469"/><text x="18.1549%" y="527.50">_PyErr_Occurred{inlined}</text></g><g><title>PyStackRef_Borrow{inlined} (42,384,048 cycles, 0.40%)</title><rect x="92.8202%" y="565" width="0.3951%" height="15" fill="rgb(206,124,46)" fg:x="9957651130" fg:w="42384048"/><text x="93.0702%" y="575.50"></text></g><g><title>PyStackRef_MakeHeapSafe{inlined} (25,380,795 cycles, 0.24%)</title><rect x="93.3687%" y="565" width="0.2366%" height="15" fill="rgb(249,21,11)" fg:x="10016491451" fg:w="25380795"/><text x="93.6187%" y="575.50"></text></g><g><title>PyStackRef_IsHeapSafe{inlined} (22,799,749 cycles, 0.21%)</title><rect x="93.3927%" y="549" width="0.2125%" height="15" fill="rgb(222,201,40)" fg:x="10019072497" fg:w="22799749"/><text x="93.6427%" y="559.50"></text></g><g><title>PyStackRef_XCLOSE{inlined} (24,313,600 cycles, 0.23%)</title><rect x="93.6053%" y="565" width="0.2266%" height="15" fill="rgb(235,61,29)" fg:x="10041872246" fg:w="24313600"/><text x="93.8553%" y="575.50"></text></g><g><title>_PyFrame_ClearExceptCode{inlined} (35,490,920 cycles, 0.33%)</title><rect x="93.8914%" y="517" width="0.3308%" height="15" fill="rgb(219,207,3)" fg:x="10072564930" fg:w="35490920"/><text x="94.1414%" y="527.50"></text></g><g><title>_PyFrame_ClearLocals{inlined} (34,216,465 cycles, 0.32%)</title><rect x="93.9032%" y="501" width="0.3189%" height="15" fill="rgb(222,56,46)" fg:x="10073839385" fg:w="34216465"/><text x="94.1532%" y="511.50"></text></g><g><title>_PyFrame_GetStackPointer{inlined} (44,410,851 cycles, 0.41%)</title><rect x="93.8319%" y="565" width="0.4140%" height="15" fill="rgb(239,76,54)" fg:x="10066185846" fg:w="44410851"/><text x="94.0819%" y="575.50"></text></g><g><title>_PyEval_FrameClearAndPop{python3.14} (44,410,851 cycles, 0.41%)</title><rect x="93.8319%" y="549" width="0.4140%" height="15" fill="rgb(231,124,27)" fg:x="10066185846" fg:w="44410851"/><text x="94.0819%" y="559.50"></text></g><g><title>clear_thread_frame{inlined} (41,901,712 cycles, 0.39%)</title><rect x="93.8553%" y="533" width="0.3906%" height="15" fill="rgb(249,195,6)" fg:x="10068694985" fg:w="41901712"/><text x="94.1053%" y="543.50"></text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (8,830,401,681 cycles, 82.31%)</title><rect x="12.4866%" y="581" width="82.3125%" height="15" fill="rgb(237,174,47)" fg:x="1339553930" fg:w="8830401681"/><text x="12.7366%" y="591.50">_PyEval_EvalFrameDefault{python3.14}</text></g><g><title>py::Cursor.fetchone:/root/bench/src/stacks/python/venv/lib/python3.14/site-packages/mariadb/cursors.py{jit} (8,867,025,886 cycles, 82.65%)</title><rect x="12.1808%" y="597" width="82.6539%" height="15" fill="rgb(206,201,31)" fg:x="1306741934" fg:w="8867025886"/><text x="12.4308%" y="607.50">py::Cursor.fetchone:/root/bench/src/stacks/python/venv/lib/python3.14/site-packages/mariadb/cursors.py{jit}</text></g><g><title>_PyFunction_Vectorcall{python3.14} (8,952,418,959 cycles, 83.45%)</title><rect x="11.5864%" y="613" width="83.4499%" height="15" fill="rgb(231,57,52)" fg:x="1242978298" fg:w="8952418959"/><text x="11.8364%" y="623.50">_PyFunction_Vectorcall{python3.14}</text></g><g><title>py_trampoline_evaluator.lto_priv.0{python3.14} (21,629,437 cycles, 0.20%)</title><rect x="94.8347%" y="597" width="0.2016%" height="15" fill="rgb(248,177,22)" fg:x="10173767820" fg:w="21629437"/><text x="95.0847%" y="607.50"></text></g><g><title>_PyObject_VectorcallPrepend{inlined} (8,966,356,519 cycles, 83.58%)</title><rect x="11.5041%" y="645" width="83.5798%" height="15" fill="rgb(215,211,37)" fg:x="1234152152" fg:w="8966356519"/><text x="11.7541%" y="655.50">_PyObject_VectorcallPrepend{inlined}</text></g><g><title>_PyObject_VectorcallTstate{inlined} (8,966,356,519 cycles, 83.58%)</title><rect x="11.5041%" y="629" width="83.5798%" height="15" fill="rgb(241,128,51)" fg:x="1234152152" fg:w="8966356519"/><text x="11.7541%" y="639.50">_PyObject_VectorcallTstate{inlined}</text></g><g><title>calliter_iternext.lto_priv.0{python3.14} (9,123,798,867 cycles, 85.05%)</title><rect x="10.0600%" y="709" width="85.0474%" height="15" fill="rgb(227,165,31)" fg:x="1079229512" fg:w="9123798867"/><text x="10.3100%" y="719.50">calliter_iternext.lto_priv.0{python3.14}</text></g><g><title>_PyObject_CallNoArgs{inlined} (8,995,251,931 cycles, 83.85%)</title><rect x="11.2583%" y="693" width="83.8492%" height="15" fill="rgb(228,167,24)" fg:x="1207776448" fg:w="8995251931"/><text x="11.5083%" y="703.50">_PyObject_CallNoArgs{inlined}</text></g><g><title>_PyObject_VectorcallTstate{inlined} (8,995,251,931 cycles, 83.85%)</title><rect x="11.2583%" y="677" width="83.8492%" height="15" fill="rgb(228,143,12)" fg:x="1207776448" fg:w="8995251931"/><text x="11.5083%" y="687.50">_PyObject_VectorcallTstate{inlined}</text></g><g><title>method_vectorcall.lto_priv.0{python3.14} (8,980,381,652 cycles, 83.71%)</title><rect x="11.3969%" y="661" width="83.7106%" height="15" fill="rgb(249,149,8)" fg:x="1222646727" fg:w="8980381652"/><text x="11.6469%" y="671.50">method_vectorcall.lto_priv.0{python3.14}</text></g><g><title>_PyFrame_GetStackPointer{inlined} (9,138,946,114 cycles, 85.19%)</title><rect x="9.9414%" y="725" width="85.1886%" height="15" fill="rgb(243,35,44)" fg:x="1066502014" fg:w="9138946114"/><text x="10.1914%" y="735.50">_PyFrame_GetStackPointer{inlined}</text></g><g><title>address_in_range{inlined} (97,349,001 cycles, 0.91%)</title><rect x="95.9130%" y="677" width="0.9074%" height="15" fill="rgb(246,89,9)" fg:x="10289439618" fg:w="97349001"/><text x="96.1630%" y="687.50"></text></g><g><title>arena_map_is_used{inlined} (97,349,001 cycles, 0.91%)</title><rect x="95.9130%" y="661" width="0.9074%" height="15" fill="rgb(233,213,13)" fg:x="10289439618" fg:w="97349001"/><text x="96.1630%" y="671.50"></text></g><g><title>arena_map_get{inlined} (27,898,920 cycles, 0.26%)</title><rect x="96.5603%" y="645" width="0.2601%" height="15" fill="rgb(233,141,41)" fg:x="10358889699" fg:w="27898920"/><text x="96.8103%" y="655.50"></text></g><g><title>_PyObject_Free{python3.14} (127,962,462 cycles, 1.19%)</title><rect x="95.7474%" y="709" width="1.1928%" height="15" fill="rgb(239,167,4)" fg:x="10271677097" fg:w="127962462"/><text x="95.9974%" y="719.50"></text></g><g><title>pymalloc_free{inlined} (114,048,363 cycles, 1.06%)</title><rect x="95.8771%" y="693" width="1.0631%" height="15" fill="rgb(209,217,16)" fg:x="10285591196" fg:w="114048363"/><text x="96.1271%" y="703.50"></text></g><g><title>PyObject_GC_UnTrack{inlined} (31,581,046 cycles, 0.29%)</title><rect x="97.2253%" y="693" width="0.2944%" height="15" fill="rgb(219,88,35)" fg:x="10430223866" fg:w="31581046"/><text x="97.4753%" y="703.50"></text></g><g><title>_PyObject_GC_UNTRACK{inlined} (30,300,145 cycles, 0.28%)</title><rect x="97.2372%" y="677" width="0.2824%" height="15" fill="rgb(220,193,23)" fg:x="10431504767" fg:w="30300145"/><text x="97.4872%" y="687.50"></text></g><g><title>_Py_Dealloc{python3.14} (258,873,436 cycles, 2.41%)</title><rect x="95.2613%" y="725" width="2.4131%" height="15" fill="rgb(230,90,52)" fg:x="10219532572" fg:w="258873436"/><text x="95.5113%" y="735.50">_P..</text></g><g><title>tuple_dealloc.lto_priv.0{python3.14} (60,993,954 cycles, 0.57%)</title><rect x="97.1058%" y="709" width="0.5686%" height="15" fill="rgb(252,106,19)" fg:x="10417412054" fg:w="60993954"/><text x="97.3558%" y="719.50"></text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (9,827,037,708 cycles, 91.60%)</title><rect x="6.2974%" y="741" width="91.6027%" height="15" fill="rgb(206,74,20)" fg:x="675579838" fg:w="9827037708"/><text x="6.5474%" y="751.50">_PyEval_EvalFrameDefault{python3.14}</text></g><g><title>long_dealloc.lto_priv.0{python3.14} (21,630,989 cycles, 0.20%)</title><rect x="97.6985%" y="725" width="0.2016%" height="15" fill="rgb(230,138,44)" fg:x="10480986557" fg:w="21630989"/><text x="97.9485%" y="735.50"></text></g><g><title>_start{python3.14} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1285" width="91.8402%" height="15" fill="rgb(235,182,43)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1295.50">_start{python3.14}</text></g><g><title>__libc_start_main@@GLIBC_2.34{libc.so.6} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1269" width="91.8402%" height="15" fill="rgb(242,16,51)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1279.50">__libc_start_main@@GLIBC_2.34{libc.so.6}</text></g><g><title>call_init{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1253" width="91.8402%" height="15" fill="rgb(248,9,4)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1263.50">call_init{inlined}</text></g><g><title>__libc_start_call_main{libc.so.6} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1237" width="91.8402%" height="15" fill="rgb(210,31,22)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1247.50">__libc_start_call_main{libc.so.6}</text></g><g><title>Py_BytesMain{python3.14} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1221" width="91.8402%" height="15" fill="rgb(239,54,39)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1231.50">Py_BytesMain{python3.14}</text></g><g><title>Py_RunMain{python3.14} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1205" width="91.8402%" height="15" fill="rgb(230,99,41)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1215.50">Py_RunMain{python3.14}</text></g><g><title>pymain_run_python{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1189" width="91.8402%" height="15" fill="rgb(253,106,12)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1199.50">pymain_run_python{inlined}</text></g><g><title>pymain_run_file{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1173" width="91.8402%" height="15" fill="rgb(213,46,41)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1183.50">pymain_run_file{inlined}</text></g><g><title>pymain_run_file_obj{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1157" width="91.8402%" height="15" fill="rgb(215,133,35)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1167.50">pymain_run_file_obj{inlined}</text></g><g><title>_PyRun_AnyFileObject{python3.14} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1141" width="91.8402%" height="15" fill="rgb(213,28,5)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1151.50">_PyRun_AnyFileObject{python3.14}</text></g><g><title>_PyRun_SimpleFileObject{python3.14} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1125" width="91.8402%" height="15" fill="rgb(215,77,49)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1135.50">_PyRun_SimpleFileObject{python3.14}</text></g><g><title>pyrun_file.lto_priv.0{python3.14} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1109" width="91.8402%" height="15" fill="rgb(248,100,22)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1119.50">pyrun_file.lto_priv.0{python3.14}</text></g><g><title>run_mod.lto_priv.0{python3.14} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1093" width="91.8402%" height="15" fill="rgb(208,67,9)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1103.50">run_mod.lto_priv.0{python3.14}</text></g><g><title>Py_DECREF{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1077" width="91.8402%" height="15" fill="rgb(219,133,21)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1087.50">Py_DECREF{inlined}</text></g><g><title>_Py_IsImmortal{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1061" width="91.8402%" height="15" fill="rgb(246,46,29)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1071.50">_Py_IsImmortal{inlined}</text></g><g><title>PyEval_EvalCode{python3.14} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1045" width="91.8402%" height="15" fill="rgb(246,185,52)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1055.50">PyEval_EvalCode{python3.14}</text></g><g><title>_PyEval_Vector{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1029" width="91.8402%" height="15" fill="rgb(252,136,11)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1039.50">_PyEval_Vector{inlined}</text></g><g><title>_PyEval_EvalFrame{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="1013" width="91.8402%" height="15" fill="rgb(219,138,53)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1023.50">_PyEval_EvalFrame{inlined}</text></g><g><title>py::&lt;module&gt;:/root/bench/src/stacks/python/runner.py{jit} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="997" width="91.8402%" height="15" fill="rgb(211,51,23)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="1007.50">py::&lt;module&gt;:/root/bench/src/stacks/python/runner.py{jit}</text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="981" width="91.8402%" height="15" fill="rgb(247,221,28)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="991.50">_PyEval_EvalFrameDefault{python3.14}</text></g><g><title>_PyFrame_GetStackPointer{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="965" width="91.8402%" height="15" fill="rgb(251,222,45)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="975.50">_PyFrame_GetStackPointer{inlined}</text></g><g><title>PyObject_Vectorcall{python3.14} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="949" width="91.8402%" height="15" fill="rgb(217,162,53)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="959.50">PyObject_Vectorcall{python3.14}</text></g><g><title>_PyObject_VectorcallTstate{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="933" width="91.8402%" height="15" fill="rgb(229,93,14)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="943.50">_PyObject_VectorcallTstate{inlined}</text></g><g><title>_Py_CheckFunctionResult{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="917" width="91.8402%" height="15" fill="rgb(209,67,49)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="927.50">_Py_CheckFunctionResult{inlined}</text></g><g><title>_PyErr_Occurred{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="901" width="91.8402%" height="15" fill="rgb(213,87,29)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="911.50">_PyErr_Occurred{inlined}</text></g><g><title>_PyFunction_Vectorcall{python3.14} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="885" width="91.8402%" height="15" fill="rgb(205,151,52)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="895.50">_PyFunction_Vectorcall{python3.14}</text></g><g><title>py::main:/root/bench/src/stacks/python/runner.py{jit} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="869" width="91.8402%" height="15" fill="rgb(253,215,39)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="879.50">py::main:/root/bench/src/stacks/python/runner.py{jit}</text></g><g><title>_PyEval_EvalFrameDefault{python3.14} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="853" width="91.8402%" height="15" fill="rgb(221,220,41)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="863.50">_PyEval_EvalFrameDefault{python3.14}</text></g><g><title>PyObject_Vectorcall{python3.14} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="837" width="91.8402%" height="15" fill="rgb(218,133,21)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="847.50">PyObject_Vectorcall{python3.14}</text></g><g><title>_PyObject_VectorcallTstate{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="821" width="91.8402%" height="15" fill="rgb(221,193,43)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="831.50">_PyObject_VectorcallTstate{inlined}</text></g><g><title>_Py_CheckFunctionResult{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="805" width="91.8402%" height="15" fill="rgb(240,128,52)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="815.50">_Py_CheckFunctionResult{inlined}</text></g><g><title>_PyErr_Occurred{inlined} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="789" width="91.8402%" height="15" fill="rgb(253,114,12)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="799.50">_PyErr_Occurred{inlined}</text></g><g><title>_PyFunction_Vectorcall{python3.14} (9,852,514,141 cycles, 91.84%)</title><rect x="6.2972%" y="773" width="91.8402%" height="15" fill="rgb(215,223,47)" fg:x="675554728" fg:w="9852514141"/><text x="6.5472%" y="783.50">_PyFunction_Vectorcall{python3.14}</text></g><g><title>py::t3:/root/bench/src/stacks/python/runner.py{jit} (9,852,489,031 cycles, 91.84%)</title><rect x="6.2974%" y="757" width="91.8399%" height="15" fill="rgb(248,225,23)" fg:x="675579838" fg:w="9852489031"/><text x="6.5474%" y="767.50">py::t3:/root/bench/src/stacks/python/runner.py{jit}</text></g><g><title>long_from_string_base{inlined} (106,247,331 cycles, 0.99%)</title><rect x="98.5004%" y="1253" width="0.9904%" height="15" fill="rgb(250,108,0)" fg:x="10567013434" fg:w="106247331"/><text x="98.7504%" y="1263.50"></text></g><g><title>long_from_non_binary_base{inlined} (67,082,676 cycles, 0.63%)</title><rect x="98.8654%" y="1237" width="0.6253%" height="15" fill="rgb(228,208,7)" fg:x="10606178089" fg:w="67082676"/><text x="99.1154%" y="1247.50"></text></g><g><title>field_fetch_fromtext{_mariadb.cpython-314-x86_64-linux-gnu.so} (161,687,734 cycles, 1.51%)</title><rect x="98.1373%" y="1285" width="1.5072%" height="15" fill="rgb(244,45,10)" fg:x="10528068869" fg:w="161687734"/><text x="98.3873%" y="1295.50"></text></g><g><title>PyLong_FromString{python3.14} (137,447,725 cycles, 1.28%)</title><rect x="98.3633%" y="1269" width="1.2812%" height="15" fill="rgb(207,125,25)" fg:x="10552308878" fg:w="137447725"/><text x="98.6133%" y="1279.50"></text></g><g><title>ma_convert_value{_mariadb.cpython-314-x86_64-linux-gnu.so} (25,260,349 cycles, 0.24%)</title><rect x="99.6445%" y="1285" width="0.2355%" height="15" fill="rgb(210,195,18)" fg:x="10689756603" fg:w="25260349"/><text x="99.8945%" y="1295.50"></text></g><g><title>all (10,727,893,922 cycles, 100%)</title><rect x="0.0000%" y="1317" width="100.0000%" height="15" fill="rgb(249,80,12)" fg:x="0" fg:w="10727893922"/><text x="0.2500%" y="1327.50"></text></g><g><title>python (10,727,893,922 cycles, 100.00%)</title><rect x="0.0000%" y="1301" width="100.0000%" height="15" fill="rgb(221,65,9)" fg:x="0" fg:w="10727893922"/><text x="0.2500%" y="1311.50">python</text></g></svg></svg>

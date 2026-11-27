@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="822" onload="init(evt)" viewBox="0 0 1200 822" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="822" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">rust-mysql/T3-binary-streamed-default-0.folded (Percona, default; sampled CPU cycles)</text><text id="details" fill="rgb(0,0,0)" x="10" y="805.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="805.00"> </text><svg id="frames" x="10" width="1180" total_samples="1518404020"><g><title>cfree@GLIBC_2.2.5{libc.so.6} (5,245,203 cycles, 0.35%)</title><rect x="0.0869%" y="501" width="0.3454%" height="15" fill="rgb(227,0,7)" fg:x="1319312" fg:w="5245203"/><text x="0.3369%" y="511.50"></text></g><g><title>&lt;alloc::sync::Arc&lt;[mysql_common::packets::Column]&gt; as core::clone::Clone&gt;::clone{inlined} (75,550,401 cycles, 4.98%)</title><rect x="10.2627%" y="469" width="4.9756%" height="15" fill="rgb(217,0,24)" fg:x="155829409" fg:w="75550401"/><text x="10.5127%" y="479.50">&lt;alloc..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt;{runner} (3,873,582 cycles, 0.26%)</title><rect x="33.9918%" y="277" width="0.2551%" height="15" fill="rgb(221,193,54)" fg:x="516133419" fg:w="3873582"/><text x="34.2418%" y="287.50"></text></g><g><title>&lt;bytes::bytes_mut::BytesMut&gt;::advance_unchecked{runner} (9,036,167 cycles, 0.60%)</title><rect x="34.2469%" y="277" width="0.5951%" height="15" fill="rgb(248,212,6)" fg:x="520007001" fg:w="9036167"/><text x="34.4969%" y="287.50"></text></g><g><title>&lt;alloc::vec::Vec&lt;u8&gt;&gt;::append_elements_unreserved{inlined} (5,157,482 cycles, 0.34%)</title><rect x="35.3483%" y="197" width="0.3397%" height="15" fill="rgb(208,68,35)" fg:x="536730432" fg:w="5157482"/><text x="35.5983%" y="207.50"></text></g><g><title>&lt;*mut u8&gt;::add{inlined} (5,157,482 cycles, 0.34%)</title><rect x="35.3483%" y="181" width="0.3397%" height="15" fill="rgb(232,128,0)" fg:x="536730432" fg:w="5157482"/><text x="35.5983%" y="191.50"></text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow{runner} (7,625,601 cycles, 0.50%)</title><rect x="36.4624%" y="101" width="0.5022%" height="15" fill="rgb(207,160,47)" fg:x="553646104" fg:w="7625601"/><text x="36.7124%" y="111.50"></text></g><g><title>alloc::raw_vec::layout_array{inlined} (5,041,876 cycles, 0.33%)</title><rect x="36.6325%" y="85" width="0.3321%" height="15" fill="rgb(228,23,34)" fg:x="556229829" fg:w="5041876"/><text x="36.8825%" y="95.50"></text></g><g><title>&lt;core::alloc::layout::Layout&gt;::repeat_packed{inlined} (5,041,876 cycles, 0.33%)</title><rect x="36.6325%" y="69" width="0.3321%" height="15" fill="rgb(218,30,26)" fg:x="556229829" fg:w="5041876"/><text x="36.8825%" y="79.50"></text></g><g><title>&lt;usize&gt;::checked_mul{inlined} (5,041,876 cycles, 0.33%)</title><rect x="36.6325%" y="53" width="0.3321%" height="15" fill="rgb(220,122,19)" fg:x="556229829" fg:w="5041876"/><text x="36.8825%" y="63.50"></text></g><g><title>&lt;usize&gt;::overflowing_mul{inlined} (5,041,876 cycles, 0.33%)</title><rect x="36.6325%" y="37" width="0.3321%" height="15" fill="rgb(250,228,42)" fg:x="556229829" fg:w="5041876"/><text x="36.8825%" y="47.50"></text></g><g><title>__rustc::__rust_alloc{runner} (9,354,056 cycles, 0.62%)</title><rect x="37.0473%" y="101" width="0.6160%" height="15" fill="rgb(240,193,28)" fg:x="562528421" fg:w="9354056"/><text x="37.2973%" y="111.50"></text></g><g><title>__rustc::__rust_no_alloc_shim_is_unstable_v2{runner} (10,266,485 cycles, 0.68%)</title><rect x="37.6634%" y="101" width="0.6761%" height="15" fill="rgb(216,20,37)" fg:x="571882477" fg:w="10266485"/><text x="37.9134%" y="111.50"></text></g><g><title>&lt;core::result::Result&lt;core::ptr::non_null::NonNull&lt;[u8]&gt;, alloc::collections::TryReserveError&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (51,715,417 cycles, 3.41%)</title><rect x="36.3774%" y="117" width="3.4059%" height="15" fill="rgb(206,188,39)" fg:x="552356445" fg:w="51715417"/><text x="36.6274%" y="127.50">&lt;co..</text></g><g><title>malloc{libc.so.6} (21,922,900 cycles, 1.44%)</title><rect x="38.3395%" y="101" width="1.4438%" height="15" fill="rgb(217,207,13)" fg:x="582148962" fg:w="21922900"/><text x="38.5895%" y="111.50"></text></g><g><title>tcache_get{inlined} (11,581,447 cycles, 0.76%)</title><rect x="39.0206%" y="85" width="0.7627%" height="15" fill="rgb(231,73,38)" fg:x="592490415" fg:w="11581447"/><text x="39.2706%" y="95.50"></text></g><g><title>tcache_get_n{inlined} (11,581,447 cycles, 0.76%)</title><rect x="39.0206%" y="69" width="0.7627%" height="15" fill="rgb(225,20,46)" fg:x="592490415" fg:w="11581447"/><text x="39.2706%" y="79.50"></text></g><g><title>&lt;alloc::vec::Vec&lt;u8&gt; as bytes::buf::buf_mut::BufMut&gt;::put_slice{inlined} (72,466,795 cycles, 4.77%)</title><rect x="35.3483%" y="261" width="4.7726%" height="15" fill="rgb(210,31,41)" fg:x="536730432" fg:w="72466795"/><text x="35.5983%" y="271.50">&lt;alloc..</text></g><g><title>&lt;alloc::vec::Vec&lt;u8&gt;&gt;::extend_from_slice{inlined} (72,466,795 cycles, 4.77%)</title><rect x="35.3483%" y="245" width="4.7726%" height="15" fill="rgb(221,200,47)" fg:x="536730432" fg:w="72466795"/><text x="35.5983%" y="255.50">&lt;alloc..</text></g><g><title>&lt;alloc::vec::Vec&lt;u8&gt; as alloc::vec::spec_extend::SpecExtend&lt;&amp;u8, core::slice::iter::Iter&lt;u8&gt;&gt;&gt;::spec_extend{inlined} (72,466,795 cycles, 4.77%)</title><rect x="35.3483%" y="229" width="4.7726%" height="15" fill="rgb(226,26,5)" fg:x="536730432" fg:w="72466795"/><text x="35.5983%" y="239.50">&lt;alloc..</text></g><g><title>&lt;alloc::vec::Vec&lt;u8&gt;&gt;::append_elements{inlined} (72,466,795 cycles, 4.77%)</title><rect x="35.3483%" y="213" width="4.7726%" height="15" fill="rgb(249,33,26)" fg:x="536730432" fg:w="72466795"/><text x="35.5983%" y="223.50">&lt;alloc..</text></g><g><title>&lt;alloc::vec::Vec&lt;u8&gt;&gt;::reserve{inlined} (67,309,313 cycles, 4.43%)</title><rect x="35.6880%" y="197" width="4.4329%" height="15" fill="rgb(235,183,28)" fg:x="541887914" fg:w="67309313"/><text x="35.9380%" y="207.50">&lt;allo..</text></g><g><title>&lt;alloc::raw_vec::RawVec&lt;u8&gt;&gt;::reserve{inlined} (67,309,313 cycles, 4.43%)</title><rect x="35.6880%" y="181" width="4.4329%" height="15" fill="rgb(221,5,38)" fg:x="541887914" fg:w="67309313"/><text x="35.9380%" y="191.50">&lt;allo..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::reserve{inlined} (67,309,313 cycles, 4.43%)</title><rect x="35.6880%" y="165" width="4.4329%" height="15" fill="rgb(247,18,42)" fg:x="541887914" fg:w="67309313"/><text x="35.9380%" y="175.50">&lt;allo..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt;{runner} (64,734,451 cycles, 4.26%)</title><rect x="35.8576%" y="149" width="4.2633%" height="15" fill="rgb(241,131,45)" fg:x="544462776" fg:w="64734451"/><text x="36.1076%" y="159.50">&lt;allo..</text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::grow_amortized{inlined} (59,399,791 cycles, 3.91%)</title><rect x="36.2089%" y="133" width="3.9120%" height="15" fill="rgb(249,31,29)" fg:x="549797436" fg:w="59399791"/><text x="36.4589%" y="143.50">&lt;all..</text></g><g><title>alloc::raw_vec::min_non_zero_cap{inlined} (5,125,365 cycles, 0.34%)</title><rect x="39.7833%" y="117" width="0.3375%" height="15" fill="rgb(225,111,53)" fg:x="604071862" fg:w="5125365"/><text x="40.0333%" y="127.50"></text></g><g><title>&lt;bytes::bytes_mut::BytesMut as bytes::buf::buf_impl::Buf&gt;::advance{inlined} (3,862,545 cycles, 0.25%)</title><rect x="40.1209%" y="261" width="0.2544%" height="15" fill="rgb(238,160,17)" fg:x="609197227" fg:w="3862545"/><text x="40.3709%" y="271.50"></text></g><g><title>&lt;mysql_common::proto::codec::ChunkDecoder&gt;::decode::&lt;alloc::vec::Vec&lt;u8&gt;&gt;{runner} (92,959,339 cycles, 6.12%)</title><rect x="34.8421%" y="277" width="6.1222%" height="15" fill="rgb(214,148,48)" fg:x="529043168" fg:w="92959339"/><text x="35.0921%" y="287.50">&lt;mysql_c..</text></g><g><title>&lt;bytes::bytes_mut::BytesMut&gt;::advance_unchecked{runner} (6,359,926 cycles, 0.42%)</title><rect x="40.5454%" y="261" width="0.4189%" height="15" fill="rgb(232,36,49)" fg:x="615642581" fg:w="6359926"/><text x="40.7954%" y="271.50"></text></g><g><title>&lt;core::result::Result&lt;mysql::buffer_pool::disabled::Buffer, mysql::error::Error&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (392,237,395 cycles, 25.83%)</title><rect x="15.8136%" y="421" width="25.8322%" height="15" fill="rgb(209,103,24)" fg:x="240114147" fg:w="392237395"/><text x="16.0636%" y="431.50">&lt;core::result::Result&lt;mysql::buffer_pool:..</text></g><g><title>&lt;mysql::conn::Conn&gt;::read_packet{runner} (387,068,212 cycles, 25.49%)</title><rect x="16.1540%" y="405" width="25.4918%" height="15" fill="rgb(229,88,8)" fg:x="245283330" fg:w="387068212"/><text x="16.4040%" y="415.50">&lt;mysql::conn::Conn&gt;::read_packet{runner}</text></g><g><title>&lt;mysql::conn::Conn&gt;::raw_read_packet{inlined} (283,644,580 cycles, 18.68%)</title><rect x="22.9654%" y="389" width="18.6804%" height="15" fill="rgb(213,181,19)" fg:x="348706962" fg:w="283644580"/><text x="23.2154%" y="399.50">&lt;mysql::conn::Conn&gt;::raw_read..</text></g><g><title>&lt;core::result::Result&lt;bool, mysql_common::proto::codec::error::PacketCodecError&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (283,644,580 cycles, 18.68%)</title><rect x="22.9654%" y="373" width="18.6804%" height="15" fill="rgb(254,191,54)" fg:x="348706962" fg:w="283644580"/><text x="23.2154%" y="383.50">&lt;core::result::Result&lt;bool, m..</text></g><g><title>&lt;mysql_common::proto::sync_framed::MySyncFramed&lt;mysql::io::Stream&gt;&gt;::next_packet::&lt;alloc::vec::Vec&lt;u8&gt;&gt;{runner} (259,296,227 cycles, 17.08%)</title><rect x="24.5689%" y="357" width="17.0769%" height="15" fill="rgb(241,83,37)" fg:x="373055315" fg:w="259296227"/><text x="24.8189%" y="367.50">&lt;mysql_common::proto::sync..</text></g><g><title>&lt;mysql_common::proto::codec::PacketCodec&gt;::decode::&lt;alloc::vec::Vec&lt;u8&gt;&gt;{inlined} (116,218,123 cycles, 7.65%)</title><rect x="33.9918%" y="341" width="7.6540%" height="15" fill="rgb(233,36,39)" fg:x="516133419" fg:w="116218123"/><text x="34.2418%" y="351.50">&lt;mysql_com..</text></g><g><title>&lt;mysql_common::proto::codec::PacketCodecInner&gt;::decode::&lt;alloc::vec::Vec&lt;u8&gt;&gt;{inlined} (116,218,123 cycles, 7.65%)</title><rect x="33.9918%" y="325" width="7.6540%" height="15" fill="rgb(226,3,54)" fg:x="516133419" fg:w="116218123"/><text x="34.2418%" y="335.50">&lt;mysql_com..</text></g><g><title>&lt;mysql_common::proto::codec::PlainPacketCodec&gt;::decode::&lt;alloc::vec::Vec&lt;u8&gt;&gt;{inlined} (116,218,123 cycles, 7.65%)</title><rect x="33.9918%" y="309" width="7.6540%" height="15" fill="rgb(245,192,40)" fg:x="516133419" fg:w="116218123"/><text x="34.2418%" y="319.50">&lt;mysql_com..</text></g><g><title>&lt;core::result::Result&lt;core::option::Option&lt;mysql_common::proto::codec::ChunkInfo&gt;, mysql_common::proto::codec::error::PacketCodecError&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (116,218,123 cycles, 7.65%)</title><rect x="33.9918%" y="293" width="7.6540%" height="15" fill="rgb(238,167,29)" fg:x="516133419" fg:w="116218123"/><text x="34.2418%" y="303.50">&lt;core::res..</text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (10,349,035 cycles, 0.68%)</title><rect x="40.9642%" y="277" width="0.6816%" height="15" fill="rgb(232,182,51)" fg:x="622002507" fg:w="10349035"/><text x="41.2142%" y="287.50"></text></g><g><title>&lt;core::result::Result&lt;core::option::Option&lt;mysql::buffer_pool::disabled::Buffer&gt;, mysql::error::Error&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (402,264,386 cycles, 26.49%)</title><rect x="15.2384%" y="453" width="26.4926%" height="15" fill="rgb(231,60,39)" fg:x="231379810" fg:w="402264386"/><text x="15.4884%" y="463.50">&lt;core::result::Result&lt;core::option::Option..</text></g><g><title>&lt;mysql::conn::Conn&gt;::next_row_packet{runner} (402,264,386 cycles, 26.49%)</title><rect x="15.2384%" y="437" width="26.4926%" height="15" fill="rgb(208,69,12)" fg:x="231379810" fg:w="402264386"/><text x="15.4884%" y="447.50">&lt;mysql::conn::Conn&gt;::next_row_packet{runne..</text></g><g><title>&lt;mysql_common::io::ParseBuf&gt;::checked_eat_u8{runner} (6,346,859 cycles, 0.42%)</title><rect x="51.1894%" y="437" width="0.4180%" height="15" fill="rgb(235,93,37)" fg:x="777261737" fg:w="6346859"/><text x="51.4394%" y="447.50"></text></g><g><title>&lt;mysql_common::io::ParseBuf&gt;::len{inlined} (5,113,805 cycles, 0.34%)</title><rect x="51.2706%" y="421" width="0.3368%" height="15" fill="rgb(213,116,39)" fg:x="778494791" fg:w="5113805"/><text x="51.5206%" y="431.50"></text></g><g><title>&lt;mysql_common::io::ParseBuf&gt;::checked_eat{runner} (10,186,811 cycles, 0.67%)</title><rect x="51.6074%" y="437" width="0.6709%" height="15" fill="rgb(222,207,29)" fg:x="783608596" fg:w="10186811"/><text x="51.8574%" y="447.50"></text></g><g><title>&lt;alloc::sync::Arc&lt;[mysql_common::packets::Column]&gt; as core::ops::deref::Deref&gt;::deref{inlined} (5,146,555 cycles, 0.34%)</title><rect x="66.5300%" y="421" width="0.3389%" height="15" fill="rgb(206,96,30)" fg:x="1010194236" fg:w="5146555"/><text x="66.7800%" y="431.50"></text></g><g><title>&lt;alloc::sync::Arc&lt;[mysql_common::packets::Column]&gt;&gt;::inner{inlined} (5,146,555 cycles, 0.34%)</title><rect x="66.5300%" y="405" width="0.3389%" height="15" fill="rgb(218,138,4)" fg:x="1010194236" fg:w="5146555"/><text x="66.7800%" y="415.50"></text></g><g><title>&lt;core::ptr::non_null::NonNull&lt;alloc::sync::ArcInner&lt;[mysql_common::packets::Column]&gt;&gt;&gt;::as_ref{inlined} (5,146,555 cycles, 0.34%)</title><rect x="66.5300%" y="389" width="0.3389%" height="15" fill="rgb(250,191,14)" fg:x="1010194236" fg:w="5146555"/><text x="66.7800%" y="399.50"></text></g><g><title>&lt;alloc::vec::Vec&lt;core::option::Option&lt;mysql_common::value::Value&gt;&gt;&gt;::push{inlined} (6,458,581 cycles, 0.43%)</title><rect x="66.8689%" y="421" width="0.4254%" height="15" fill="rgb(239,60,40)" fg:x="1015340791" fg:w="6458581"/><text x="67.1189%" y="431.50"></text></g><g><title>&lt;alloc::vec::Vec&lt;core::option::Option&lt;mysql_common::value::Value&gt;&gt;&gt;::push_mut{inlined} (6,458,581 cycles, 0.43%)</title><rect x="66.8689%" y="405" width="0.4254%" height="15" fill="rgb(206,27,48)" fg:x="1015340791" fg:w="6458581"/><text x="67.1189%" y="415.50"></text></g><g><title>&lt;usize&gt;::overflowing_mul{inlined} (3,865,499 cycles, 0.25%)</title><rect x="68.2213%" y="293" width="0.2546%" height="15" fill="rgb(225,35,8)" fg:x="1035874337" fg:w="3865499"/><text x="68.4713%" y="303.50"></text></g><g><title>&lt;alloc::vec::Vec&lt;core::option::Option&lt;mysql_common::value::Value&gt;&gt;&gt;::with_capacity{inlined} (19,232,313 cycles, 1.27%)</title><rect x="67.2943%" y="421" width="1.2666%" height="15" fill="rgb(250,213,24)" fg:x="1021799372" fg:w="19232313"/><text x="67.5443%" y="431.50"></text></g><g><title>&lt;alloc::vec::Vec&lt;core::option::Option&lt;mysql_common::value::Value&gt;&gt;&gt;::with_capacity_in{inlined} (19,232,313 cycles, 1.27%)</title><rect x="67.2943%" y="405" width="1.2666%" height="15" fill="rgb(247,123,22)" fg:x="1021799372" fg:w="19232313"/><text x="67.5443%" y="415.50"></text></g><g><title>&lt;alloc::raw_vec::RawVec&lt;core::option::Option&lt;mysql_common::value::Value&gt;&gt;&gt;::with_capacity_in{inlined} (5,157,348 cycles, 0.34%)</title><rect x="68.2213%" y="389" width="0.3397%" height="15" fill="rgb(231,138,38)" fg:x="1035874337" fg:w="5157348"/><text x="68.4713%" y="399.50"></text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::with_capacity_in{inlined} (5,157,348 cycles, 0.34%)</title><rect x="68.2213%" y="373" width="0.3397%" height="15" fill="rgb(231,145,46)" fg:x="1035874337" fg:w="5157348"/><text x="68.4713%" y="383.50"></text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::try_allocate_in{inlined} (5,157,348 cycles, 0.34%)</title><rect x="68.2213%" y="357" width="0.3397%" height="15" fill="rgb(251,118,11)" fg:x="1035874337" fg:w="5157348"/><text x="68.4713%" y="367.50"></text></g><g><title>alloc::raw_vec::layout_array{inlined} (5,157,348 cycles, 0.34%)</title><rect x="68.2213%" y="341" width="0.3397%" height="15" fill="rgb(217,147,25)" fg:x="1035874337" fg:w="5157348"/><text x="68.4713%" y="351.50"></text></g><g><title>&lt;core::alloc::layout::Layout&gt;::repeat_packed{inlined} (5,157,348 cycles, 0.34%)</title><rect x="68.2213%" y="325" width="0.3397%" height="15" fill="rgb(247,81,37)" fg:x="1035874337" fg:w="5157348"/><text x="68.4713%" y="335.50"></text></g><g><title>&lt;usize&gt;::checked_mul{inlined} (5,157,348 cycles, 0.34%)</title><rect x="68.2213%" y="309" width="0.3397%" height="15" fill="rgb(209,12,38)" fg:x="1035874337" fg:w="5157348"/><text x="68.4713%" y="319.50"></text></g><g><title>&lt;core::option::Option&lt;u8&gt;&gt;::ok_or_else::&lt;core::io::error::Error, mysql_common::misc::unexpected_buf_eof&gt;{inlined} (18,073,175 cycles, 1.19%)</title><rect x="68.5609%" y="421" width="1.1903%" height="15" fill="rgb(227,1,9)" fg:x="1041031685" fg:w="18073175"/><text x="68.8109%" y="431.50"></text></g><g><title>&lt;mysql_common::io::ParseBuf&gt;::checked_eat_u8{runner} (18,073,175 cycles, 1.19%)</title><rect x="68.5609%" y="405" width="1.1903%" height="15" fill="rgb(248,47,43)" fg:x="1041031685" fg:w="18073175"/><text x="68.8109%" y="415.50"></text></g><g><title>&lt;mysql_common::io::ParseBuf&gt;::eat_i8{inlined} (18,073,175 cycles, 1.19%)</title><rect x="68.5609%" y="389" width="1.1903%" height="15" fill="rgb(221,10,30)" fg:x="1041031685" fg:w="18073175"/><text x="68.8109%" y="399.50"></text></g><g><title>&lt;mysql_common::io::ParseBuf&gt;::eat{inlined} (5,163,413 cycles, 0.34%)</title><rect x="69.4111%" y="373" width="0.3401%" height="15" fill="rgb(210,229,1)" fg:x="1053941447" fg:w="5163413"/><text x="69.6611%" y="383.50"></text></g><g><title>&lt;core::result::Result&lt;mysql_common::value::Value, core::io::error::Error&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (15,436,530 cycles, 1.02%)</title><rect x="71.7960%" y="389" width="1.0166%" height="15" fill="rgb(222,148,37)" fg:x="1090153424" fg:w="15436530"/><text x="72.0460%" y="399.50"></text></g><g><title>&lt;mysql_common::constants::ColumnFlags&gt;::contains{inlined} (8,761,877 cycles, 0.58%)</title><rect x="73.3237%" y="373" width="0.5770%" height="15" fill="rgb(234,67,33)" fg:x="1113349939" fg:w="8761877"/><text x="73.5737%" y="383.50"></text></g><g><title>&lt;mysql_common::constants::_::InternalBitFlags&gt;::contains{inlined} (8,761,877 cycles, 0.58%)</title><rect x="73.3237%" y="357" width="0.5770%" height="15" fill="rgb(247,98,35)" fg:x="1113349939" fg:w="8761877"/><text x="73.5737%" y="367.50"></text></g><g><title>&lt;core::result::Result&lt;mysql_common::value::ValueDeserializer&lt;mysql_common::value::BinValue&gt;, core::io::error::Error&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (70,704,068 cycles, 4.66%)</title><rect x="69.7512%" y="421" width="4.6565%" height="15" fill="rgb(247,138,52)" fg:x="1059104860" fg:w="70704068"/><text x="70.0012%" y="431.50">&lt;core..</text></g><g><title>&lt;mysql_common::value::ValueDeserializer&lt;mysql_common::value::BinValue&gt; as mysql_common::proto::MyDeserialize&gt;::deserialize{runner} (48,563,645 cycles, 3.20%)</title><rect x="71.2093%" y="405" width="3.1983%" height="15" fill="rgb(213,79,30)" fg:x="1081245283" fg:w="48563645"/><text x="71.4593%" y="415.50">&lt;my..</text></g><g><title>&lt;mysql_common::value::Value&gt;::deserialize_bin{inlined} (24,218,974 cycles, 1.60%)</title><rect x="72.8126%" y="389" width="1.5950%" height="15" fill="rgb(246,177,23)" fg:x="1105589954" fg:w="24218974"/><text x="73.0626%" y="399.50"></text></g><g><title>&lt;mysql_common::value::Value&gt;::deserialize_long{inlined} (7,697,112 cycles, 0.51%)</title><rect x="73.9007%" y="373" width="0.5069%" height="15" fill="rgb(230,62,27)" fg:x="1122111816" fg:w="7697112"/><text x="74.1507%" y="383.50"></text></g><g><title>&lt;mysql_common::io::ParseBuf&gt;::checked_eat_i32_le{inlined} (7,697,112 cycles, 0.51%)</title><rect x="73.9007%" y="357" width="0.5069%" height="15" fill="rgb(216,154,8)" fg:x="1122111816" fg:w="7697112"/><text x="74.1507%" y="367.50"></text></g><g><title>&lt;mysql_common::io::ParseBuf&gt;::eat_i32_le{inlined} (7,697,112 cycles, 0.51%)</title><rect x="73.9007%" y="341" width="0.5069%" height="15" fill="rgb(244,35,45)" fg:x="1122111816" fg:w="7697112"/><text x="74.1507%" y="351.50"></text></g><g><title>&lt;mysql_common::packets::NullBitmap&lt;mysql_common::value::ServerSide, alloc::borrow::Cow&lt;[u8]&gt;&gt; as mysql_common::proto::MyDeserialize&gt;::deserialize{inlined} (12,725,237 cycles, 0.84%)</title><rect x="74.4077%" y="421" width="0.8381%" height="15" fill="rgb(251,115,12)" fg:x="1129808928" fg:w="12725237"/><text x="74.6577%" y="431.50"></text></g><g><title>&lt;mysql_common::io::ParseBuf&gt;::checked_eat{runner} (6,453,042 cycles, 0.42%)</title><rect x="74.8207%" y="405" width="0.4250%" height="15" fill="rgb(240,54,50)" fg:x="1136081123" fg:w="6453042"/><text x="75.0707%" y="415.50"></text></g><g><title>&lt;mysql_common::io::ParseBuf&gt;::eat{inlined} (5,161,291 cycles, 0.34%)</title><rect x="74.9058%" y="389" width="0.3399%" height="15" fill="rgb(233,84,52)" fg:x="1137372874" fg:w="5161291"/><text x="75.1558%" y="399.50"></text></g><g><title>&lt;[u8]&gt;::split_at{inlined} (5,161,291 cycles, 0.34%)</title><rect x="74.9058%" y="373" width="0.3399%" height="15" fill="rgb(207,117,47)" fg:x="1137372874" fg:w="5161291"/><text x="75.1558%" y="383.50"></text></g><g><title>&lt;[u8]&gt;::split_at_checked{inlined} (5,161,291 cycles, 0.34%)</title><rect x="74.9058%" y="357" width="0.3399%" height="15" fill="rgb(249,43,39)" fg:x="1137372874" fg:w="5161291"/><text x="75.1558%" y="367.50"></text></g><g><title>&lt;[u8]&gt;::split_at_unchecked{inlined} (5,161,291 cycles, 0.34%)</title><rect x="74.9058%" y="341" width="0.3399%" height="15" fill="rgb(209,38,44)" fg:x="1137372874" fg:w="5161291"/><text x="75.1558%" y="351.50"></text></g><g><title>&lt;*const u8&gt;::add{inlined} (5,161,291 cycles, 0.34%)</title><rect x="74.9058%" y="325" width="0.3399%" height="15" fill="rgb(236,212,23)" fg:x="1137372874" fg:w="5161291"/><text x="75.1558%" y="335.50"></text></g><g><title>&lt;mysql_common::row::RowDeserializer&lt;mysql_common::value::ServerSide, mysql_common::proto::Binary&gt; as mysql_common::proto::MyDeserialize&gt;::deserialize{runner} (356,418,783 cycles, 23.47%)</title><rect x="52.2783%" y="437" width="23.4733%" height="15" fill="rgb(242,79,21)" fg:x="793795407" fg:w="356418783"/><text x="52.5283%" y="447.50">&lt;mysql_common::row::RowDeserializer&lt;m..</text></g><g><title>&lt;mysql_common::packets::NullBitmap&lt;mysql_common::value::ServerSide, alloc::borrow::Cow&lt;[u8]&gt;&gt;&gt;::is_null{inlined} (7,680,025 cycles, 0.51%)</title><rect x="75.2457%" y="421" width="0.5058%" height="15" fill="rgb(211,96,35)" fg:x="1142534165" fg:w="7680025"/><text x="75.4957%" y="431.50"></text></g><g><title>&lt;mysql_common::value::ValueDeserializer&lt;mysql_common::value::BinValue&gt; as mysql_common::proto::MyDeserialize&gt;::deserialize{runner} (22,967,664 cycles, 1.51%)</title><rect x="75.7515%" y="437" width="1.5126%" height="15" fill="rgb(253,215,40)" fg:x="1150214190" fg:w="22967664"/><text x="76.0015%" y="447.50"></text></g><g><title>__rustc::__rdl_alloc{runner} (9,016,392 cycles, 0.59%)</title><rect x="77.2641%" y="437" width="0.5938%" height="15" fill="rgb(211,81,21)" fg:x="1173181854" fg:w="9016392"/><text x="77.5141%" y="447.50"></text></g><g><title>std::sys::alloc::unix::alloc{inlined} (9,016,392 cycles, 0.59%)</title><rect x="77.2641%" y="421" width="0.5938%" height="15" fill="rgb(208,190,38)" fg:x="1173181854" fg:w="9016392"/><text x="77.5141%" y="431.50"></text></g><g><title>__rustc::__rust_alloc{runner} (17,868,582 cycles, 1.18%)</title><rect x="77.8580%" y="437" width="1.1768%" height="15" fill="rgb(235,213,38)" fg:x="1182198246" fg:w="17868582"/><text x="78.1080%" y="447.50"></text></g><g><title>__rustc::__rust_no_alloc_shim_is_unstable_v2{runner} (21,742,483 cycles, 1.43%)</title><rect x="79.0348%" y="437" width="1.4319%" height="15" fill="rgb(237,122,38)" fg:x="1200066828" fg:w="21742483"/><text x="79.2848%" y="447.50"></text></g><g><title>checked_request2size{inlined} (10,227,002 cycles, 0.67%)</title><rect x="81.5710%" y="421" width="0.6735%" height="15" fill="rgb(244,218,35)" fg:x="1238577741" fg:w="10227002"/><text x="81.8210%" y="431.50"></text></g><g><title>&lt;core::result::Result&lt;mysql_common::row::RowDeserializer&lt;mysql_common::value::ServerSide, mysql_common::proto::Binary&gt;, core::io::error::Error&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (626,745,813 cycles, 41.28%)</title><rect x="41.7309%" y="453" width="41.2766%" height="15" fill="rgb(240,68,47)" fg:x="633644196" fg:w="626745813"/><text x="41.9809%" y="463.50">&lt;core::result::Result&lt;mysql_common::row::RowDeserializer&lt;mysql_comm..</text></g><g><title>malloc{libc.so.6} (38,580,698 cycles, 2.54%)</title><rect x="80.4667%" y="437" width="2.5409%" height="15" fill="rgb(210,16,53)" fg:x="1221809311" fg:w="38580698"/><text x="80.7167%" y="447.50">ma..</text></g><g><title>tcache_get{inlined} (11,585,266 cycles, 0.76%)</title><rect x="82.2446%" y="421" width="0.7630%" height="15" fill="rgb(235,124,12)" fg:x="1248804743" fg:w="11585266"/><text x="82.4946%" y="431.50"></text></g><g><title>tcache_get_n{inlined} (11,585,266 cycles, 0.76%)</title><rect x="82.2446%" y="405" width="0.7630%" height="15" fill="rgb(224,169,11)" fg:x="1248804743" fg:w="11585266"/><text x="82.4946%" y="415.50"></text></g><g><title>&lt;mysql_common::proto::Binary as mysql::conn::query_result::Protocol&gt;::next{runner} (1,030,301,716 cycles, 67.85%)</title><rect x="15.2384%" y="469" width="67.8543%" height="15" fill="rgb(250,166,2)" fg:x="231379810" fg:w="1030301716"/><text x="15.4884%" y="479.50">&lt;mysql_common::proto::Binary as mysql::conn::query_result::Protocol&gt;::next{runner}</text></g><g><title>&lt;mysql::conn::query_result::QueryResult&lt;mysql_common::proto::Binary&gt; as core::iter::traits::iterator::Iterator&gt;::next{runner} (1,257,698,690 cycles, 82.83%)</title><rect x="0.5174%" y="485" width="82.8303%" height="15" fill="rgb(242,216,29)" fg:x="7856007" fg:w="1257698690"/><text x="0.7674%" y="495.50">&lt;mysql::conn::query_result::QueryResult&lt;mysql_common::proto::Binary&gt; as core::iter::traits::iterator::Iterator&gt;::next{runner}</text></g><g><title>&lt;mysql_common::row::RowDeserializer&lt;mysql_common::value::ServerSide, mysql_common::proto::Binary&gt; as mysql_common::proto::MyDeserialize&gt;::deserialize{runner} (3,873,171 cycles, 0.26%)</title><rect x="83.0926%" y="469" width="0.2551%" height="15" fill="rgb(230,116,27)" fg:x="1261681526" fg:w="3873171"/><text x="83.3426%" y="479.50"></text></g><g><title>all (1,518,404,020 cycles, 100%)</title><rect x="0.0000%" y="773" width="100.0000%" height="15" fill="rgb(228,99,48)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="783.50"></text></g><g><title>runner (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="757" width="100.0000%" height="15" fill="rgb(253,11,6)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="767.50">runner</text></g><g><title>_start{runner} (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="741" width="100.0000%" height="15" fill="rgb(247,143,39)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="751.50">_start{runner}</text></g><g><title>__libc_start_main@@GLIBC_2.34{libc.so.6} (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="725" width="100.0000%" height="15" fill="rgb(236,97,10)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="735.50">__libc_start_main@@GLIBC_2.34{libc.so.6}</text></g><g><title>call_init{inlined} (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="709" width="100.0000%" height="15" fill="rgb(233,208,19)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="719.50">call_init{inlined}</text></g><g><title>__libc_start_call_main{libc.so.6} (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="693" width="100.0000%" height="15" fill="rgb(216,164,2)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="703.50">__libc_start_call_main{libc.so.6}</text></g><g><title>main{runner} (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="677" width="100.0000%" height="15" fill="rgb(220,129,5)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="687.50">main{runner}</text></g><g><title>std::rt::lang_start_internal{runner} (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="661" width="100.0000%" height="15" fill="rgb(242,17,10)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="671.50">std::rt::lang_start_internal{runner}</text></g><g><title>std::panic::catch_unwind::&lt;std::rt::lang_start_internal::{closure#0}, isize&gt;{inlined} (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="645" width="100.0000%" height="15" fill="rgb(242,107,0)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="655.50">std::panic::catch_unwind::&lt;std::rt::lang_start_internal::{closure#0}, isize&gt;{inlined}</text></g><g><title>std::panicking::catch_unwind::&lt;isize, std::rt::lang_start_internal::{closure#0}&gt;{inlined} (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="629" width="100.0000%" height="15" fill="rgb(251,28,31)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="639.50">std::panicking::catch_unwind::&lt;isize, std::rt::lang_start_internal::{closure#0}&gt;{inlined}</text></g><g><title>std::panicking::catch_unwind::do_call::&lt;std::rt::lang_start_internal::{closure#0}, isize&gt;{inlined} (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="613" width="100.0000%" height="15" fill="rgb(233,223,10)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="623.50">std::panicking::catch_unwind::do_call::&lt;std::rt::lang_start_internal::{closure#0}, isize&gt;{inlined}</text></g><g><title>std::rt::lang_start_internal::{closure#0}{inlined} (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="597" width="100.0000%" height="15" fill="rgb(215,21,27)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="607.50">std::rt::lang_start_internal::{closure#0}{inlined}</text></g><g><title>std::rt::lang_start::&lt;()&gt;::{closure#0}{runner} (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="581" width="100.0000%" height="15" fill="rgb(232,23,21)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="591.50">std::rt::lang_start::&lt;()&gt;::{closure#0}{runner}</text></g><g><title>std::sys::backtrace::__rust_begin_short_backtrace::&lt;fn(),{runner} (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="565" width="100.0000%" height="15" fill="rgb(244,5,23)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="575.50">std::sys::backtrace::__rust_begin_short_backtrace::&lt;fn(),{runner}</text></g><g><title>runner::main{runner} (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="549" width="100.0000%" height="15" fill="rgb(226,81,46)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="559.50">runner::main{runner}</text></g><g><title>runner::run{inlined} (1,518,404,020 cycles, 100.00%)</title><rect x="0.0000%" y="533" width="100.0000%" height="15" fill="rgb(247,70,30)" fg:x="0" fg:w="1518404020"/><text x="0.2500%" y="543.50">runner::run{inlined}</text></g><g><title>&lt;core::result::Result&lt;alloc::string::String, alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (1,518,376,195 cycles, 100.00%)</title><rect x="0.0018%" y="517" width="99.9982%" height="15" fill="rgb(212,68,19)" fg:x="27825" fg:w="1518376195"/><text x="0.2518%" y="527.50">&lt;core::result::Result&lt;alloc::string::String, alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt; as core::ops::try_trait::Try&gt;::branch{inlined}</text></g><g><title>runner::sync_drv::step{runner} (1,511,839,505 cycles, 99.57%)</title><rect x="0.4323%" y="501" width="99.5677%" height="15" fill="rgb(240,187,13)" fg:x="6564515" fg:w="1511839505"/><text x="0.6823%" y="511.50">runner::sync_drv::step{runner}</text></g><g><title>core::ptr::drop_glue::&lt;mysql_common::row::Row&gt;{inlined} (252,849,323 cycles, 16.65%)</title><rect x="83.3477%" y="485" width="16.6523%" height="15" fill="rgb(223,113,26)" fg:x="1265554697" fg:w="252849323"/><text x="83.5977%" y="495.50">core::ptr::drop_glue::&lt;mys..</text></g><g><title>core::ptr::drop_glue::&lt;alloc::sync::Arc&lt;[mysql_common::packets::Column]&gt;&gt;{inlined} (252,849,323 cycles, 16.65%)</title><rect x="83.3477%" y="469" width="16.6523%" height="15" fill="rgb(206,192,2)" fg:x="1265554697" fg:w="252849323"/><text x="83.5977%" y="479.50">core::ptr::drop_glue::&lt;all..</text></g><g><title>&lt;alloc::sync::Arc&lt;[mysql_common::packets::Column]&gt; as core::ops::drop::Drop&gt;::drop{inlined} (252,849,323 cycles, 16.65%)</title><rect x="83.3477%" y="453" width="16.6523%" height="15" fill="rgb(241,108,4)" fg:x="1265554697" fg:w="252849323"/><text x="83.5977%" y="463.50">&lt;alloc::sync::Arc&lt;[mysql_c..</text></g><g><title>&lt;core::sync::atomic::Atomic&lt;usize&gt;&gt;::fetch_sub{inlined} (252,849,323 cycles, 16.65%)</title><rect x="83.3477%" y="437" width="16.6523%" height="15" fill="rgb(247,173,49)" fg:x="1265554697" fg:w="252849323"/><text x="83.5977%" y="447.50">&lt;core::sync::atomic::Atomi..</text></g><g><title>core::sync::atomic::atomic_sub::&lt;usize, usize&gt;{inlined} (252,849,323 cycles, 16.65%)</title><rect x="83.3477%" y="421" width="16.6523%" height="15" fill="rgb(224,114,35)" fg:x="1265554697" fg:w="252849323"/><text x="83.5977%" y="431.50">core::sync::atomic::atomic..</text></g></svg></svg>

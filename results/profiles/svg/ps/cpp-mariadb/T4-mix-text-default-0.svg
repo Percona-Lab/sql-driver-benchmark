@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="1142" onload="init(evt)" viewBox="0 0 1200 1142" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="1142" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">cpp-mariadb/T4-mix-text-default-0.folded (Percona, default; sampled CPU cycles)</text><text id="details" fill="rgb(0,0,0)" x="10" y="1125.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="1125.00"> </text><svg id="frames" x="10" width="1180" total_samples="1632712794"><g><title>sql::SQLString::length() const{libmariadbcpp.so} (3,877,415 cycles, 0.24%)</title><rect x="0.0200%" y="981" width="0.2375%" height="15" fill="rgb(227,0,7)" fg:x="326666" fg:w="3877415"/><text x="0.2700%" y="991.50"></text></g><g><title>sql::SQLString::~SQLString(){libmariadbcpp.so} (3,847,684 cycles, 0.24%)</title><rect x="0.2575%" y="981" width="0.2357%" height="15" fill="rgb(217,0,24)" fg:x="4204081" fg:w="3847684"/><text x="0.5075%" y="991.50"></text></g><g><title>sql::mariadb::RowProtocol::lastValueWasNull(){libmariadbcpp.so} (12,112,748 cycles, 0.74%)</title><rect x="0.4932%" y="981" width="0.7419%" height="15" fill="rgb(221,193,54)" fg:x="8051765" fg:w="12112748"/><text x="0.7432%" y="991.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetCapi::getLong(int) const{libmariadbcpp.so} (8,891,836 cycles, 0.54%)</title><rect x="1.2350%" y="981" width="0.5446%" height="15" fill="rgb(248,212,6)" fg:x="20164513" fg:w="8891836"/><text x="1.4850%" y="991.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetCapi::isNull(int) const{libmariadbcpp.so} (31,259,508 cycles, 1.91%)</title><rect x="1.9379%" y="981" width="1.9146%" height="15" fill="rgb(208,68,35)" fg:x="31640059" fg:w="31259508"/><text x="2.1879%" y="991.50">s..</text></g><g><title>cfree@GLIBC_2.2.5{libc.so.6} (12,773,266 cycles, 0.78%)</title><rect x="5.9168%" y="965" width="0.7823%" height="15" fill="rgb(232,128,0)" fg:x="96604116" fg:w="12773266"/><text x="6.1668%" y="975.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (28,474,373 cycles, 1.74%)</title><rect x="6.6991%" y="837" width="1.7440%" height="15" fill="rgb(207,160,47)" fg:x="109377382" fg:w="28474373"/><text x="6.9491%" y="847.50"></text></g><g><title>skb_copy_datagram_iter{kernel} (6,939,879 cycles, 0.43%)</title><rect x="13.2560%" y="517" width="0.4251%" height="15" fill="rgb(228,23,34)" fg:x="216433177" fg:w="6939879"/><text x="13.5060%" y="527.50"></text></g><g><title>__skb_datagram_iter{kernel} (6,939,879 cycles, 0.43%)</title><rect x="13.2560%" y="501" width="0.4251%" height="15" fill="rgb(218,30,26)" fg:x="216433177" fg:w="6939879"/><text x="13.5060%" y="511.50"></text></g><g><title>simple_copy_to_iter{kernel} (6,314,159 cycles, 0.39%)</title><rect x="13.2944%" y="485" width="0.3867%" height="15" fill="rgb(220,122,19)" fg:x="217058897" fg:w="6314159"/><text x="13.5444%" y="495.50"></text></g><g><title>_copy_to_iter{kernel} (4,631,114 cycles, 0.28%)</title><rect x="13.3975%" y="469" width="0.2836%" height="15" fill="rgb(250,228,42)" fg:x="218741942" fg:w="4631114"/><text x="13.6475%" y="479.50"></text></g><g><title>__ip_local_out{kernel} (8,645,043 cycles, 0.53%)</title><rect x="14.0219%" y="389" width="0.5295%" height="15" fill="rgb(240,193,28)" fg:x="228938136" fg:w="8645043"/><text x="14.2719%" y="399.50"></text></g><g><title>nf_hook_slow{kernel} (7,484,700 cycles, 0.46%)</title><rect x="14.0930%" y="373" width="0.4584%" height="15" fill="rgb(216,20,37)" fg:x="230098479" fg:w="7484700"/><text x="14.3430%" y="383.50"></text></g><g><title>nft_do_chain_ipv4{kernel} (6,097,235 cycles, 0.37%)</title><rect x="14.1780%" y="357" width="0.3734%" height="15" fill="rgb(206,188,39)" fg:x="231485944" fg:w="6097235"/><text x="14.4280%" y="367.50"></text></g><g><title>nft_do_chain{kernel} (6,097,235 cycles, 0.37%)</title><rect x="14.1780%" y="341" width="0.3734%" height="15" fill="rgb(217,207,13)" fg:x="231485944" fg:w="6097235"/><text x="14.4280%" y="351.50"></text></g><g><title>tcp_ack{kernel} (3,270,231 cycles, 0.20%)</title><rect x="15.3106%" y="37" width="0.2003%" height="15" fill="rgb(231,73,38)" fg:x="249977353" fg:w="3270231"/><text x="15.5606%" y="47.50"></text></g><g><title>ip_protocol_deliver_rcu{kernel} (8,941,596 cycles, 0.55%)</title><rect x="14.9805%" y="101" width="0.5477%" height="15" fill="rgb(225,20,46)" fg:x="244589022" fg:w="8941596"/><text x="15.2305%" y="111.50"></text></g><g><title>tcp_v4_rcv{kernel} (8,012,787 cycles, 0.49%)</title><rect x="15.0374%" y="85" width="0.4908%" height="15" fill="rgb(210,31,41)" fg:x="245517831" fg:w="8012787"/><text x="15.2874%" y="95.50"></text></g><g><title>tcp_v4_do_rcv{kernel} (6,051,005 cycles, 0.37%)</title><rect x="15.1576%" y="69" width="0.3706%" height="15" fill="rgb(221,200,47)" fg:x="247479613" fg:w="6051005"/><text x="15.4076%" y="79.50"></text></g><g><title>tcp_rcv_established{kernel} (6,051,005 cycles, 0.37%)</title><rect x="15.1576%" y="53" width="0.3706%" height="15" fill="rgb(226,26,5)" fg:x="247479613" fg:w="6051005"/><text x="15.4076%" y="63.50"></text></g><g><title>ip_local_deliver_finish{kernel} (9,363,207 cycles, 0.57%)</title><rect x="14.9805%" y="117" width="0.5735%" height="15" fill="rgb(249,33,26)" fg:x="244589022" fg:w="9363207"/><text x="15.2305%" y="127.50"></text></g><g><title>ip_local_deliver{kernel} (12,499,070 cycles, 0.77%)</title><rect x="14.9575%" y="133" width="0.7655%" height="15" fill="rgb(235,183,28)" fg:x="244212757" fg:w="12499070"/><text x="15.2075%" y="143.50"></text></g><g><title>__netif_receive_skb{kernel} (14,959,365 cycles, 0.92%)</title><rect x="14.8766%" y="181" width="0.9162%" height="15" fill="rgb(221,5,38)" fg:x="242892485" fg:w="14959365"/><text x="15.1266%" y="191.50"></text></g><g><title>__netif_receive_skb_one_core{kernel} (13,639,093 cycles, 0.84%)</title><rect x="14.9575%" y="165" width="0.8354%" height="15" fill="rgb(247,18,42)" fg:x="244212757" fg:w="13639093"/><text x="15.2075%" y="175.50"></text></g><g><title>ip_rcv{kernel} (13,639,093 cycles, 0.84%)</title><rect x="14.9575%" y="149" width="0.8354%" height="15" fill="rgb(241,131,45)" fg:x="244212757" fg:w="13639093"/><text x="15.2075%" y="159.50"></text></g><g><title>__napi_poll{kernel} (17,364,369 cycles, 1.06%)</title><rect x="14.8499%" y="213" width="1.0635%" height="15" fill="rgb(249,31,29)" fg:x="242456451" fg:w="17364369"/><text x="15.0999%" y="223.50"></text></g><g><title>process_backlog{kernel} (17,364,369 cycles, 1.06%)</title><rect x="14.8499%" y="197" width="1.0635%" height="15" fill="rgb(225,111,53)" fg:x="242456451" fg:w="17364369"/><text x="15.0999%" y="207.50"></text></g><g><title>__local_bh_enable_ip{kernel} (19,509,118 cycles, 1.19%)</title><rect x="14.7547%" y="293" width="1.1949%" height="15" fill="rgb(238,160,17)" fg:x="240902535" fg:w="19509118"/><text x="15.0047%" y="303.50"></text></g><g><title>do_softirq.part.0{kernel} (19,509,118 cycles, 1.19%)</title><rect x="14.7547%" y="277" width="1.1949%" height="15" fill="rgb(214,148,48)" fg:x="240902535" fg:w="19509118"/><text x="15.0047%" y="287.50"></text></g><g><title>__do_softirq{kernel} (19,509,118 cycles, 1.19%)</title><rect x="14.7547%" y="261" width="1.1949%" height="15" fill="rgb(232,36,49)" fg:x="240902535" fg:w="19509118"/><text x="15.0047%" y="271.50"></text></g><g><title>handle_softirqs{kernel} (19,509,118 cycles, 1.19%)</title><rect x="14.7547%" y="245" width="1.1949%" height="15" fill="rgb(209,103,24)" fg:x="240902535" fg:w="19509118"/><text x="15.0047%" y="255.50"></text></g><g><title>net_rx_action{kernel} (19,509,118 cycles, 1.19%)</title><rect x="14.7547%" y="229" width="1.1949%" height="15" fill="rgb(229,88,8)" fg:x="240902535" fg:w="19509118"/><text x="15.0047%" y="239.50"></text></g><g><title>__ip_finish_output{kernel} (25,048,186 cycles, 1.53%)</title><rect x="14.5514%" y="357" width="1.5341%" height="15" fill="rgb(213,181,19)" fg:x="237583179" fg:w="25048186"/><text x="14.8014%" y="367.50"></text></g><g><title>ip_finish_output2{kernel} (23,755,745 cycles, 1.45%)</title><rect x="14.6306%" y="341" width="1.4550%" height="15" fill="rgb(254,191,54)" fg:x="238875620" fg:w="23755745"/><text x="14.8806%" y="351.50"></text></g><g><title>neigh_hh_output{kernel} (22,142,445 cycles, 1.36%)</title><rect x="14.7294%" y="325" width="1.3562%" height="15" fill="rgb(241,83,37)" fg:x="240488920" fg:w="22142445"/><text x="14.9794%" y="335.50"></text></g><g><title>__dev_queue_xmit{kernel} (22,142,445 cycles, 1.36%)</title><rect x="14.7294%" y="309" width="1.3562%" height="15" fill="rgb(233,36,39)" fg:x="240488920" fg:w="22142445"/><text x="14.9794%" y="319.50"></text></g><g><title>ip_finish_output{kernel} (25,332,194 cycles, 1.55%)</title><rect x="14.5514%" y="373" width="1.5515%" height="15" fill="rgb(226,3,54)" fg:x="237583179" fg:w="25332194"/><text x="14.8014%" y="383.50"></text></g><g><title>ip_output{kernel} (25,926,989 cycles, 1.59%)</title><rect x="14.5514%" y="389" width="1.5880%" height="15" fill="rgb(245,192,40)" fg:x="237583179" fg:w="25926989"/><text x="14.8014%" y="399.50"></text></g><g><title>tcp_cleanup_rbuf{kernel} (40,126,604 cycles, 2.46%)</title><rect x="13.7169%" y="517" width="2.4577%" height="15" fill="rgb(238,167,29)" fg:x="223957173" fg:w="40126604"/><text x="13.9669%" y="527.50">tc..</text></g><g><title>__tcp_cleanup_rbuf{kernel} (40,126,604 cycles, 2.46%)</title><rect x="13.7169%" y="501" width="2.4577%" height="15" fill="rgb(232,182,51)" fg:x="223957173" fg:w="40126604"/><text x="13.9669%" y="511.50">__..</text></g><g><title>tcp_send_ack{kernel} (39,822,061 cycles, 2.44%)</title><rect x="13.7355%" y="485" width="2.4390%" height="15" fill="rgb(231,60,39)" fg:x="224261716" fg:w="39822061"/><text x="13.9855%" y="495.50">tc..</text></g><g><title>__tcp_send_ack.part.0{kernel} (39,822,061 cycles, 2.44%)</title><rect x="13.7355%" y="469" width="2.4390%" height="15" fill="rgb(208,69,12)" fg:x="224261716" fg:w="39822061"/><text x="13.9855%" y="479.50">__..</text></g><g><title>__tcp_transmit_skb{kernel} (37,731,557 cycles, 2.31%)</title><rect x="13.8636%" y="453" width="2.3110%" height="15" fill="rgb(235,93,37)" fg:x="226352220" fg:w="37731557"/><text x="14.1136%" y="463.50">_..</text></g><g><title>ip_queue_xmit{kernel} (35,851,835 cycles, 2.20%)</title><rect x="13.9787%" y="437" width="2.1958%" height="15" fill="rgb(213,116,39)" fg:x="228231942" fg:w="35851835"/><text x="14.2287%" y="447.50">i..</text></g><g><title>__ip_queue_xmit{kernel} (35,851,835 cycles, 2.20%)</title><rect x="13.9787%" y="421" width="2.1958%" height="15" fill="rgb(222,207,29)" fg:x="228231942" fg:w="35851835"/><text x="14.2287%" y="431.50">_..</text></g><g><title>ip_local_out{kernel} (35,145,641 cycles, 2.15%)</title><rect x="14.0219%" y="405" width="2.1526%" height="15" fill="rgb(206,96,30)" fg:x="228938136" fg:w="35145641"/><text x="14.2719%" y="415.50">i..</text></g><g><title>entry_SYSCALL_64_after_hwframe{kernel} (54,256,818 cycles, 3.32%)</title><rect x="12.8971%" y="661" width="3.3231%" height="15" fill="rgb(218,138,4)" fg:x="210573015" fg:w="54256818"/><text x="13.1471%" y="671.50">ent..</text></g><g><title>do_syscall_64{kernel} (53,973,909 cycles, 3.31%)</title><rect x="12.9145%" y="645" width="3.3058%" height="15" fill="rgb(250,191,14)" fg:x="210855924" fg:w="53973909"/><text x="13.1645%" y="655.50">do_..</text></g><g><title>x64_sys_call{kernel} (53,129,268 cycles, 3.25%)</title><rect x="12.9662%" y="629" width="3.2540%" height="15" fill="rgb(239,60,40)" fg:x="211700565" fg:w="53129268"/><text x="13.2162%" y="639.50">x64..</text></g><g><title>__x64_sys_recvfrom{kernel} (53,129,268 cycles, 3.25%)</title><rect x="12.9662%" y="613" width="3.2540%" height="15" fill="rgb(206,27,48)" fg:x="211700565" fg:w="53129268"/><text x="13.2162%" y="623.50">__x..</text></g><g><title>__sys_recvfrom{kernel} (53,129,268 cycles, 3.25%)</title><rect x="12.9662%" y="597" width="3.2540%" height="15" fill="rgb(225,35,8)" fg:x="211700565" fg:w="53129268"/><text x="13.2162%" y="607.50">__s..</text></g><g><title>sock_recvmsg{kernel} (52,332,804 cycles, 3.21%)</title><rect x="13.0150%" y="581" width="3.2053%" height="15" fill="rgb(250,213,24)" fg:x="212497029" fg:w="52332804"/><text x="13.2650%" y="591.50">soc..</text></g><g><title>inet_recvmsg{kernel} (52,332,804 cycles, 3.21%)</title><rect x="13.0150%" y="565" width="3.2053%" height="15" fill="rgb(247,123,22)" fg:x="212497029" fg:w="52332804"/><text x="13.2650%" y="575.50">ine..</text></g><g><title>tcp_recvmsg{kernel} (52,332,804 cycles, 3.21%)</title><rect x="13.0150%" y="549" width="3.2053%" height="15" fill="rgb(231,138,38)" fg:x="212497029" fg:w="52332804"/><text x="13.2650%" y="559.50">tcp..</text></g><g><title>tcp_recvmsg_locked{kernel} (50,805,525 cycles, 3.11%)</title><rect x="13.1085%" y="533" width="3.1117%" height="15" fill="rgb(231,145,46)" fg:x="214024308" fg:w="50805525"/><text x="13.3585%" y="543.50">tcp..</text></g><g><title>ma_recv{inlined} (56,932,260 cycles, 3.49%)</title><rect x="12.7543%" y="725" width="3.4870%" height="15" fill="rgb(251,118,11)" fg:x="208241049" fg:w="56932260"/><text x="13.0043%" y="735.50">ma_..</text></g><g><title>recv{libc.so.6} (55,080,406 cycles, 3.37%)</title><rect x="12.8677%" y="709" width="3.3736%" height="15" fill="rgb(217,147,25)" fg:x="210092903" fg:w="55080406"/><text x="13.1177%" y="719.50">rec..</text></g><g><title>__syscall_cancel{libc.so.6} (55,080,406 cycles, 3.37%)</title><rect x="12.8677%" y="693" width="3.3736%" height="15" fill="rgb(247,81,37)" fg:x="210092903" fg:w="55080406"/><text x="13.1177%" y="703.50">__s..</text></g><g><title>__internal_syscall_cancel{inlined} (55,080,406 cycles, 3.37%)</title><rect x="12.8677%" y="677" width="3.3736%" height="15" fill="rgb(209,12,38)" fg:x="210092903" fg:w="55080406"/><text x="13.1177%" y="687.50">__i..</text></g><g><title>finish_task_switch.isra.0{kernel} (3,424,405 cycles, 0.21%)</title><rect x="16.5751%" y="469" width="0.2097%" height="15" fill="rgb(227,1,9)" fg:x="270624142" fg:w="3424405"/><text x="16.8251%" y="479.50"></text></g><g><title>poll_schedule_timeout.constprop.0{kernel} (12,400,336 cycles, 0.76%)</title><rect x="16.3563%" y="549" width="0.7595%" height="15" fill="rgb(248,47,43)" fg:x="267051117" fg:w="12400336"/><text x="16.6063%" y="559.50"></text></g><g><title>schedule_hrtimeout_range{kernel} (11,938,274 cycles, 0.73%)</title><rect x="16.3846%" y="533" width="0.7312%" height="15" fill="rgb(221,10,30)" fg:x="267513179" fg:w="11938274"/><text x="16.6346%" y="543.50"></text></g><g><title>schedule_hrtimeout_range_clock{kernel} (11,938,274 cycles, 0.73%)</title><rect x="16.3846%" y="517" width="0.7312%" height="15" fill="rgb(210,229,1)" fg:x="267513179" fg:w="11938274"/><text x="16.6346%" y="527.50"></text></g><g><title>schedule{kernel} (9,616,082 cycles, 0.59%)</title><rect x="16.5268%" y="501" width="0.5890%" height="15" fill="rgb(222,148,37)" fg:x="269835371" fg:w="9616082"/><text x="16.7768%" y="511.50"></text></g><g><title>__schedule{kernel} (8,827,311 cycles, 0.54%)</title><rect x="16.5751%" y="485" width="0.5407%" height="15" fill="rgb(234,67,33)" fg:x="270624142" fg:w="8827311"/><text x="16.8251%" y="495.50"></text></g><g><title>do_poll.constprop.0{kernel} (13,165,926 cycles, 0.81%)</title><rect x="16.3563%" y="565" width="0.8064%" height="15" fill="rgb(247,98,35)" fg:x="267051117" fg:w="13165926"/><text x="16.6063%" y="575.50"></text></g><g><title>do_syscall_64{kernel} (15,977,587 cycles, 0.98%)</title><rect x="16.2413%" y="629" width="0.9786%" height="15" fill="rgb(247,138,52)" fg:x="265173309" fg:w="15977587"/><text x="16.4913%" y="639.50"></text></g><g><title>x64_sys_call{kernel} (15,421,826 cycles, 0.94%)</title><rect x="16.2753%" y="613" width="0.9446%" height="15" fill="rgb(213,79,30)" fg:x="265729070" fg:w="15421826"/><text x="16.5253%" y="623.50"></text></g><g><title>__x64_sys_poll{kernel} (15,421,826 cycles, 0.94%)</title><rect x="16.2753%" y="597" width="0.9446%" height="15" fill="rgb(246,177,23)" fg:x="265729070" fg:w="15421826"/><text x="16.5253%" y="607.50"></text></g><g><title>do_sys_poll{kernel} (15,421,826 cycles, 0.94%)</title><rect x="16.2753%" y="581" width="0.9446%" height="15" fill="rgb(230,62,27)" fg:x="265729070" fg:w="15421826"/><text x="16.5253%" y="591.50"></text></g><g><title>ma_pvio_read{libmariadb.so.3} (73,907,979 cycles, 4.53%)</title><rect x="12.7307%" y="757" width="4.5267%" height="15" fill="rgb(216,154,8)" fg:x="207855670" fg:w="73907979"/><text x="12.9807%" y="767.50">ma_pv..</text></g><g><title>pvio_socket_read{libmariadb.so.3} (73,522,600 cycles, 4.50%)</title><rect x="12.7543%" y="741" width="4.5031%" height="15" fill="rgb(244,35,45)" fg:x="208241049" fg:w="73522600"/><text x="13.0043%" y="751.50">pvio_..</text></g><g><title>pvio_socket_wait_io_or_timeout{libmariadb.so.3} (16,590,340 cycles, 1.02%)</title><rect x="16.2413%" y="725" width="1.0161%" height="15" fill="rgb(251,115,12)" fg:x="265173309" fg:w="16590340"/><text x="16.4913%" y="735.50"></text></g><g><title>poll{inlined} (16,590,340 cycles, 1.02%)</title><rect x="16.2413%" y="709" width="1.0161%" height="15" fill="rgb(240,54,50)" fg:x="265173309" fg:w="16590340"/><text x="16.4913%" y="719.50"></text></g><g><title>__poll{libc.so.6} (16,590,340 cycles, 1.02%)</title><rect x="16.2413%" y="693" width="1.0161%" height="15" fill="rgb(233,84,52)" fg:x="265173309" fg:w="16590340"/><text x="16.4913%" y="703.50"></text></g><g><title>__syscall_cancel{libc.so.6} (16,590,340 cycles, 1.02%)</title><rect x="16.2413%" y="677" width="1.0161%" height="15" fill="rgb(207,117,47)" fg:x="265173309" fg:w="16590340"/><text x="16.4913%" y="687.50"></text></g><g><title>__internal_syscall_cancel{inlined} (16,590,340 cycles, 1.02%)</title><rect x="16.2413%" y="661" width="1.0161%" height="15" fill="rgb(249,43,39)" fg:x="265173309" fg:w="16590340"/><text x="16.4913%" y="671.50"></text></g><g><title>entry_SYSCALL_64_after_hwframe{kernel} (16,590,340 cycles, 1.02%)</title><rect x="16.2413%" y="645" width="1.0161%" height="15" fill="rgb(209,38,44)" fg:x="265173309" fg:w="16590340"/><text x="16.4913%" y="655.50"></text></g><g><title>ma_pvio_cache_read{libmariadb.so.3} (74,957,594 cycles, 4.59%)</title><rect x="12.7021%" y="773" width="4.5910%" height="15" fill="rgb(236,212,23)" fg:x="207388842" fg:w="74957594"/><text x="12.9521%" y="783.50">ma_pv..</text></g><g><title>ma_net_read{libmariadb.so.3} (82,840,075 cycles, 5.07%)</title><rect x="12.3404%" y="805" width="5.0738%" height="15" fill="rgb(242,79,21)" fg:x="201483696" fg:w="82840075"/><text x="12.5904%" y="815.50">ma_net..</text></g><g><title>ma_real_read{libmariadb.so.3} (81,371,887 cycles, 4.98%)</title><rect x="12.4303%" y="789" width="4.9838%" height="15" fill="rgb(211,96,35)" fg:x="202951884" fg:w="81371887"/><text x="12.6803%" y="799.50">ma_rea..</text></g><g><title>ma_net_safe_read{libmariadb.so.3} (85,210,593 cycles, 5.22%)</title><rect x="12.2183%" y="821" width="5.2190%" height="15" fill="rgb(253,215,40)" fg:x="199490381" fg:w="85210593"/><text x="12.4683%" y="831.50">ma_net..</text></g><g><title>mthd_my_read_rows{libmariadb.so.3} (149,046,692 cycles, 9.13%)</title><rect x="8.4845%" y="837" width="9.1288%" height="15" fill="rgb(211,81,21)" fg:x="138528280" fg:w="149046692"/><text x="8.7345%" y="847.50">mthd_my_read_..</text></g><g><title>sql::mariadb::capi::QueryProtocol::executeQuery(bool, sql::mariadb::Results*, sql::SQLString const&amp;){libmariadbcpp.so} (183,882,466 cycles, 11.26%)</title><rect x="6.6991%" y="917" width="11.2624%" height="15" fill="rgb(208,190,38)" fg:x="109377382" fg:w="183882466"/><text x="6.9491%" y="927.50">sql::mariadb::cap..</text></g><g><title>sql::mariadb::capi::QueryProtocol::readResultSet(sql::mariadb::Results*, sql::mariadb::ServerPrepareResult*){libmariadbcpp.so} (183,882,466 cycles, 11.26%)</title><rect x="6.6991%" y="901" width="11.2624%" height="15" fill="rgb(235,213,38)" fg:x="109377382" fg:w="183882466"/><text x="6.9491%" y="911.50">sql::mariadb::cap..</text></g><g><title>sql::mariadb::SelectResultSet::create(sql::mariadb::Results*, sql::mariadb::Protocol*, sql::mariadb::capi::st_mysql*, bool){libmariadbcpp.so} (183,882,466 cycles, 11.26%)</title><rect x="6.6991%" y="885" width="11.2624%" height="15" fill="rgb(237,122,38)" fg:x="109377382" fg:w="183882466"/><text x="6.9491%" y="895.50">sql::mariadb::Sel..</text></g><g><title>sql::mariadb::capi::SelectResultSetCapi::SelectResultSetCapi(sql::mariadb::Results*, sql::mariadb::Protocol*, sql::mariadb::capi::st_mysql*, bool){libmariadbcpp.so} (183,882,466 cycles, 11.26%)</title><rect x="6.6991%" y="869" width="11.2624%" height="15" fill="rgb(244,218,35)" fg:x="109377382" fg:w="183882466"/><text x="6.9491%" y="879.50">sql::mariadb::cap..</text></g><g><title>mysql_store_result@libmariadbclient_18{libmariadb.so.3} (183,882,466 cycles, 11.26%)</title><rect x="6.6991%" y="853" width="11.2624%" height="15" fill="rgb(240,68,47)" fg:x="109377382" fg:w="183882466"/><text x="6.9491%" y="863.50">mysql_store_resul..</text></g><g><title>net_field_length{libmariadb.so.3} (5,684,876 cycles, 0.35%)</title><rect x="17.6133%" y="837" width="0.3482%" height="15" fill="rgb(210,16,53)" fg:x="287574972" fg:w="5684876"/><text x="17.8633%" y="847.50"></text></g><g><title>run_query(sql::Connection*, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const&amp;, bool, bool, std::unique_ptr&lt;sql::Statement, std::default_delete&lt;sql::Statement&gt; &gt;&amp;, std::unique_ptr&lt;sql::PreparedStatement, std::default_delete&lt;sql::PreparedStatement&gt; &gt;&amp;){run-mariadb} (183,908,582 cycles, 11.26%)</title><rect x="6.6991%" y="965" width="11.2640%" height="15" fill="rgb(235,124,12)" fg:x="109377382" fg:w="183908582"/><text x="6.9491%" y="975.50">run_query(sql::Co..</text></g><g><title>sql::mariadb::MariaDbStatement::executeQuery(sql::SQLString const&amp;){libmariadbcpp.so} (183,908,582 cycles, 11.26%)</title><rect x="6.6991%" y="949" width="11.2640%" height="15" fill="rgb(224,169,11)" fg:x="109377382" fg:w="183908582"/><text x="6.9491%" y="959.50">sql::mariadb::Mar..</text></g><g><title>sql::mariadb::MariaDbStatement::executeInternal(sql::SQLString const&amp;, int, int){libmariadbcpp.so} (183,908,582 cycles, 11.26%)</title><rect x="6.6991%" y="933" width="11.2640%" height="15" fill="rgb(250,166,2)" fg:x="109377382" fg:w="183908582"/><text x="6.9491%" y="943.50">sql::mariadb::Mar..</text></g><g><title>sql::CArray&lt;char&gt;::wrap(char*, unsigned long){libmariadbcpp.so} (8,526,836 cycles, 0.52%)</title><rect x="18.1214%" y="965" width="0.5222%" height="15" fill="rgb(242,216,29)" fg:x="295870479" fg:w="8526836"/><text x="18.3714%" y="975.50"></text></g><g><title>sql::SQLString::SQLString(sql::SQLString&amp;&amp;){libmariadbcpp.so} (6,459,746 cycles, 0.40%)</title><rect x="18.6437%" y="965" width="0.3956%" height="15" fill="rgb(230,116,27)" fg:x="304397315" fg:w="6459746"/><text x="18.8937%" y="975.50"></text></g><g><title>cfree@GLIBC_2.2.5{libc.so.6} (5,163,005 cycles, 0.32%)</title><rect x="20.5352%" y="949" width="0.3162%" height="15" fill="rgb(228,99,48)" fg:x="335281423" fg:w="5163005"/><text x="20.7852%" y="959.50"></text></g><g><title>sql::SQLString::~SQLString(){libmariadbcpp.so} (33,464,627 cycles, 2.05%)</title><rect x="19.0393%" y="965" width="2.0496%" height="15" fill="rgb(253,11,6)" fg:x="310857061" fg:w="33464627"/><text x="19.2893%" y="975.50">s..</text></g><g><title>sql::mariadb::ColumnType::getType() const{libmariadbcpp.so} (8,090,197 cycles, 0.50%)</title><rect x="21.2474%" y="965" width="0.4955%" height="15" fill="rgb(247,143,39)" fg:x="346909080" fg:w="8090197"/><text x="21.4974%" y="975.50"></text></g><g><title>sql::mariadb::RowProtocol::lastValueWasNull(){libmariadbcpp.so} (7,617,808 cycles, 0.47%)</title><rect x="21.8206%" y="965" width="0.4666%" height="15" fill="rgb(236,97,10)" fg:x="356268021" fg:w="7617808"/><text x="22.0706%" y="975.50"></text></g><g><title>sql::mariadb::capi::ColumnDefinitionCapi::getColumnType() const{libmariadbcpp.so} (11,607,407 cycles, 0.71%)</title><rect x="22.3663%" y="965" width="0.7109%" height="15" fill="rgb(233,208,19)" fg:x="365177376" fg:w="11607407"/><text x="22.6163%" y="975.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetCapi::checkObjectRange(int) const{libmariadbcpp.so} (7,741,884 cycles, 0.47%)</title><rect x="23.1564%" y="965" width="0.4742%" height="15" fill="rgb(216,164,2)" fg:x="378076911" fg:w="7741884"/><text x="23.4064%" y="975.50"></text></g><g><title>sql::CArray&lt;char&gt;::wrap(char*, unsigned long){libmariadbcpp.so} (3,876,683 cycles, 0.24%)</title><rect x="23.6305%" y="901" width="0.2374%" height="15" fill="rgb(220,129,5)" fg:x="385818795" fg:w="3876683"/><text x="23.8805%" y="911.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetCapi::getDouble(int) const{libmariadbcpp.so} (6,443,310 cycles, 0.39%)</title><rect x="23.6305%" y="965" width="0.3946%" height="15" fill="rgb(242,17,10)" fg:x="385818795" fg:w="6443310"/><text x="23.8805%" y="975.50"></text></g><g><title>std::unique_ptr&lt;sql::mariadb::RowProtocol, std::default_delete&lt;sql::mariadb::RowProtocol&gt; &gt;::operator-&gt;() const{inlined} (6,443,310 cycles, 0.39%)</title><rect x="23.6305%" y="949" width="0.3946%" height="15" fill="rgb(242,107,0)" fg:x="385818795" fg:w="6443310"/><text x="23.8805%" y="959.50"></text></g><g><title>std::unique_ptr&lt;sql::mariadb::RowProtocol, std::default_delete&lt;sql::mariadb::RowProtocol&gt; &gt;::get() const{inlined} (6,443,310 cycles, 0.39%)</title><rect x="23.6305%" y="933" width="0.3946%" height="15" fill="rgb(251,28,31)" fg:x="385818795" fg:w="6443310"/><text x="23.8805%" y="943.50"></text></g><g><title>std::__uniq_ptr_impl&lt;sql::mariadb::RowProtocol, std::default_delete&lt;sql::mariadb::RowProtocol&gt; &gt;::_M_ptr() const{inlined} (6,443,310 cycles, 0.39%)</title><rect x="23.6305%" y="917" width="0.3946%" height="15" fill="rgb(233,223,10)" fg:x="385818795" fg:w="6443310"/><text x="23.8805%" y="927.50"></text></g><g><title>sql::CArray&lt;char&gt;::wrap(char*, unsigned long){libmariadbcpp.so} (3,876,238 cycles, 0.24%)</title><rect x="24.4135%" y="901" width="0.2374%" height="15" fill="rgb(215,21,27)" fg:x="398601961" fg:w="3876238"/><text x="24.6635%" y="911.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetCapi::checkObjectRange(int) const{libmariadbcpp.so} (6,400,842 cycles, 0.39%)</title><rect x="24.6509%" y="901" width="0.3920%" height="15" fill="rgb(232,23,21)" fg:x="402478199" fg:w="6400842"/><text x="24.9009%" y="911.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetCapi::getLong(int) const{libmariadbcpp.so} (17,909,531 cycles, 1.10%)</title><rect x="24.0252%" y="965" width="1.0969%" height="15" fill="rgb(244,5,23)" fg:x="392262105" fg:w="17909531"/><text x="24.2752%" y="975.50"></text></g><g><title>std::unique_ptr&lt;sql::mariadb::RowProtocol, std::default_delete&lt;sql::mariadb::RowProtocol&gt; &gt;::operator-&gt;() const{inlined} (14,042,304 cycles, 0.86%)</title><rect x="24.2620%" y="949" width="0.8601%" height="15" fill="rgb(226,81,46)" fg:x="396129332" fg:w="14042304"/><text x="24.5120%" y="959.50"></text></g><g><title>std::unique_ptr&lt;sql::mariadb::RowProtocol, std::default_delete&lt;sql::mariadb::RowProtocol&gt; &gt;::get() const{inlined} (14,042,304 cycles, 0.86%)</title><rect x="24.2620%" y="933" width="0.8601%" height="15" fill="rgb(247,70,30)" fg:x="396129332" fg:w="14042304"/><text x="24.5120%" y="943.50"></text></g><g><title>std::__uniq_ptr_impl&lt;sql::mariadb::RowProtocol, std::default_delete&lt;sql::mariadb::RowProtocol&gt; &gt;::_M_ptr() const{inlined} (14,042,304 cycles, 0.86%)</title><rect x="24.2620%" y="917" width="0.8601%" height="15" fill="rgb(212,68,19)" fg:x="396129332" fg:w="14042304"/><text x="24.5120%" y="927.50"></text></g><g><title>sql::SQLString::empty() const{libmariadbcpp.so} (6,416,234 cycles, 0.39%)</title><rect x="26.3799%" y="949" width="0.3930%" height="15" fill="rgb(240,187,13)" fg:x="430707250" fg:w="6416234"/><text x="26.6299%" y="959.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::empty() const{inlined} (6,416,234 cycles, 0.39%)</title><rect x="26.3799%" y="933" width="0.3930%" height="15" fill="rgb(223,113,26)" fg:x="430707250" fg:w="6416234"/><text x="26.6299%" y="943.50"></text></g><g><title>sql::SQLString::~SQLString(){libmariadbcpp.so} (5,438,189 cycles, 0.33%)</title><rect x="26.8520%" y="949" width="0.3331%" height="15" fill="rgb(206,192,2)" fg:x="438415983" fg:w="5438189"/><text x="27.1020%" y="959.50"></text></g><g><title>sql::mariadb::RowProtocol::getLengthMaxFieldSize(){libmariadbcpp.so} (3,878,556 cycles, 0.24%)</title><rect x="27.2642%" y="949" width="0.2376%" height="15" fill="rgb(241,108,4)" fg:x="445146082" fg:w="3878556"/><text x="27.5142%" y="959.50"></text></g><g><title>sql::mariadb::capi::ColumnDefinitionCapi::getColumnType() const{libmariadbcpp.so} (7,662,669 cycles, 0.47%)</title><rect x="27.6567%" y="949" width="0.4693%" height="15" fill="rgb(247,173,49)" fg:x="451553954" fg:w="7662669"/><text x="27.9067%" y="959.50"></text></g><g><title>__memcmp_evex_movbe{libc.so.6} (15,404,215 cycles, 0.94%)</title><rect x="30.4081%" y="933" width="0.9435%" height="15" fill="rgb(224,114,35)" fg:x="496476548" fg:w="15404215"/><text x="30.6581%" y="943.50"></text></g><g><title>cfree@GLIBC_2.2.5{libc.so.6} (5,892,589 cycles, 0.36%)</title><rect x="31.3515%" y="933" width="0.3609%" height="15" fill="rgb(245,159,27)" fg:x="511880763" fg:w="5892589"/><text x="31.6015%" y="943.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (11,934,179 cycles, 0.73%)</title><rect x="32.2651%" y="901" width="0.7309%" height="15" fill="rgb(245,172,44)" fg:x="526796890" fg:w="11934179"/><text x="32.5151%" y="911.50"></text></g><g><title>malloc{libc.so.6} (7,607,456 cycles, 0.47%)</title><rect x="33.0752%" y="901" width="0.4659%" height="15" fill="rgb(236,23,11)" fg:x="540023773" fg:w="7607456"/><text x="33.3252%" y="911.50"></text></g><g><title>malloc{libc.so.6} (3,869,559 cycles, 0.24%)</title><rect x="34.0109%" y="853" width="0.2370%" height="15" fill="rgb(205,117,38)" fg:x="555299641" fg:w="3869559"/><text x="34.2609%" y="863.50"></text></g><g><title>sql::SQLString::SQLString(char const*, unsigned long){libmariadbcpp.so} (42,688,017 cycles, 2.61%)</title><rect x="31.7125%" y="933" width="2.6145%" height="15" fill="rgb(237,72,25)" fg:x="517773352" fg:w="42688017"/><text x="31.9625%" y="943.50">sq..</text></g><g><title>sql::StringImp::createString(char const*, unsigned long){libmariadbcpp.so} (37,517,856 cycles, 2.30%)</title><rect x="32.0291%" y="917" width="2.2979%" height="15" fill="rgb(244,70,9)" fg:x="522943513" fg:w="37517856"/><text x="32.2791%" y="927.50">s..</text></g><g><title>sql::StringImp::StringImp(char const*, unsigned long){libmariadbcpp.so} (11,537,723 cycles, 0.71%)</title><rect x="33.6203%" y="901" width="0.7067%" height="15" fill="rgb(217,125,39)" fg:x="548923646" fg:w="11537723"/><text x="33.8703%" y="911.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::basic_string(char const*, unsigned long, std::allocator&lt;char&gt; const&amp;){inlined} (10,332,281 cycles, 0.63%)</title><rect x="33.6942%" y="885" width="0.6328%" height="15" fill="rgb(235,36,10)" fg:x="550129088" fg:w="10332281"/><text x="33.9442%" y="895.50"></text></g><g><title>void std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_construct&lt;char const*&gt;(char const*, char const*, std::forward_iterator_tag){inlined} (10,332,281 cycles, 0.63%)</title><rect x="33.6942%" y="869" width="0.6328%" height="15" fill="rgb(251,123,47)" fg:x="550129088" fg:w="10332281"/><text x="33.9442%" y="879.50"></text></g><g><title>sql::SQLString::~SQLString(){libmariadbcpp.so} (6,458,533 cycles, 0.40%)</title><rect x="34.5646%" y="933" width="0.3956%" height="15" fill="rgb(221,13,13)" fg:x="564340144" fg:w="6458533"/><text x="34.8146%" y="943.50"></text></g><g><title>sql::mariadb::RowProtocol::zeroFillingIfNeeded(sql::SQLString const&amp;, sql::mariadb::ColumnDefinition*){libmariadbcpp.so} (11,449,856 cycles, 0.70%)</title><rect x="35.1096%" y="933" width="0.7013%" height="15" fill="rgb(238,131,9)" fg:x="573239173" fg:w="11449856"/><text x="35.3596%" y="943.50"></text></g><g><title>sql::SQLString::SQLString(sql::SQLString const&amp;){libmariadbcpp.so} (4,994,451 cycles, 0.31%)</title><rect x="35.5050%" y="917" width="0.3059%" height="15" fill="rgb(211,50,8)" fg:x="579694578" fg:w="4994451"/><text x="35.7550%" y="927.50"></text></g><g><title>sql::StringImp::createString(sql::SQLString const&amp;){libmariadbcpp.so} (4,994,451 cycles, 0.31%)</title><rect x="35.5050%" y="901" width="0.3059%" height="15" fill="rgb(245,182,24)" fg:x="579694578" fg:w="4994451"/><text x="35.7550%" y="911.50"></text></g><g><title>sql::SQLString::SQLString(char const*, unsigned long){libmariadbcpp.so} (7,623,175 cycles, 0.47%)</title><rect x="36.4430%" y="917" width="0.4669%" height="15" fill="rgb(242,14,37)" fg:x="595010143" fg:w="7623175"/><text x="36.6930%" y="927.50"></text></g><g><title>sql::StringImp::createString(char const*, unsigned long){libmariadbcpp.so} (3,877,900 cycles, 0.24%)</title><rect x="36.6724%" y="901" width="0.2375%" height="15" fill="rgb(246,228,12)" fg:x="598755418" fg:w="3877900"/><text x="36.9224%" y="911.50"></text></g><g><title>sql::mariadb::capi::TextRowProtocolCapi::getInternalBigDecimal(sql::mariadb::ColumnDefinition*){libmariadbcpp.so} (15,362,176 cycles, 0.94%)</title><rect x="36.1273%" y="933" width="0.9409%" height="15" fill="rgb(213,55,15)" fg:x="589854807" fg:w="15362176"/><text x="36.3773%" y="943.50"></text></g><g><title>sql::mariadb::capi::TextRowProtocolCapi::getInternalDate(sql::mariadb::ColumnDefinition*, sql::mariadb::Calendar*, sql::mariadb::TimeZone*){libmariadbcpp.so} (41,752,902 cycles, 2.56%)</title><rect x="37.0682%" y="933" width="2.5573%" height="15" fill="rgb(209,9,3)" fg:x="605216983" fg:w="41752902"/><text x="37.3182%" y="943.50">sq..</text></g><g><title>sql::SQLString::SQLString(char const*, unsigned long){libmariadbcpp.so} (16,774,026 cycles, 1.03%)</title><rect x="38.5981%" y="917" width="1.0274%" height="15" fill="rgb(230,59,30)" fg:x="630195859" fg:w="16774026"/><text x="38.8481%" y="927.50"></text></g><g><title>sql::StringImp::createString(char const*, unsigned long){libmariadbcpp.so} (7,739,559 cycles, 0.47%)</title><rect x="39.1514%" y="901" width="0.4740%" height="15" fill="rgb(209,121,21)" fg:x="639230326" fg:w="7739559"/><text x="39.4014%" y="911.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (16,678,990 cycles, 1.02%)</title><rect x="45.8096%" y="885" width="1.0216%" height="15" fill="rgb(220,109,13)" fg:x="747938889" fg:w="16678990"/><text x="46.0596%" y="895.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_mutate(unsigned long, unsigned long, char const*, unsigned long){libstdc++.so.6.0.35} (3,782,467 cycles, 0.23%)</title><rect x="47.0686%" y="885" width="0.2317%" height="15" fill="rgb(232,18,1)" fg:x="768495594" fg:w="3782467"/><text x="47.3186%" y="895.50"></text></g><g><title>malloc{libc.so.6} (3,782,467 cycles, 0.23%)</title><rect x="47.0686%" y="869" width="0.2317%" height="15" fill="rgb(215,41,42)" fg:x="768495594" fg:w="3782467"/><text x="47.3186%" y="879.50"></text></g><g><title>sql::SQLString::SQLString(std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const&amp;){inlined} (28,193,336 cycles, 1.73%)</title><rect x="45.7319%" y="917" width="1.7268%" height="15" fill="rgb(224,123,36)" fg:x="746670438" fg:w="28193336"/><text x="45.9819%" y="927.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_replace(unsigned long, unsigned long, char const*, unsigned long){libstdc++.so.6.0.35} (28,193,336 cycles, 1.73%)</title><rect x="45.7319%" y="901" width="1.7268%" height="15" fill="rgb(240,125,3)" fg:x="746670438" fg:w="28193336"/><text x="45.9819%" y="911.50"></text></g><g><title>std::__cxx11::basic_stringbuf&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::basic_stringbuf(std::_Ios_Openmode){inlined} (3,820,975 cycles, 0.23%)</title><rect x="47.6115%" y="901" width="0.2340%" height="15" fill="rgb(205,98,50)" fg:x="777359613" fg:w="3820975"/><text x="47.8615%" y="911.50"></text></g><g><title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::basic_ios(){inlined} (3,862,691 cycles, 0.24%)</title><rect x="47.8456%" y="901" width="0.2366%" height="15" fill="rgb(205,185,37)" fg:x="781180588" fg:w="3862691"/><text x="48.0956%" y="911.50"></text></g><g><title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::_M_cache_locale(std::locale const&amp;){libstdc++.so.6.0.35} (14,205,163 cycles, 0.87%)</title><rect x="48.2404%" y="885" width="0.8700%" height="15" fill="rgb(238,207,15)" fg:x="787627613" fg:w="14205163"/><text x="48.4904%" y="895.50"></text></g><g><title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::init(std::basic_streambuf&lt;char, std::char_traits&lt;char&gt; &gt;*){libstdc++.so.6.0.35} (24,543,261 cycles, 1.50%)</title><rect x="48.0821%" y="901" width="1.5032%" height="15" fill="rgb(213,199,42)" fg:x="785043279" fg:w="24543261"/><text x="48.3321%" y="911.50"></text></g><g><title>std::__cxx11::basic_ostringstream&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::basic_ostringstream(){inlined} (37,304,752 cycles, 2.28%)</title><rect x="47.4587%" y="917" width="2.2848%" height="15" fill="rgb(235,201,11)" fg:x="774863774" fg:w="37304752"/><text x="47.7087%" y="927.50">s..</text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (6,456,179 cycles, 0.40%)</title><rect x="50.2385%" y="805" width="0.3954%" height="15" fill="rgb(207,46,11)" fg:x="820250075" fg:w="6456179"/><text x="50.4885%" y="815.50"></text></g><g><title>std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp; std::__ostream_insert&lt;char, std::char_traits&lt;char&gt; &gt;(std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp;, char const*, long){libstdc++.so.6.0.35} (10,315,292 cycles, 0.63%)</title><rect x="50.0811%" y="853" width="0.6318%" height="15" fill="rgb(241,35,35)" fg:x="817680881" fg:w="10315292"/><text x="50.3311%" y="863.50"></text></g><g><title>void std::__ostream_write&lt;char, std::char_traits&lt;char&gt; &gt;(std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp;, char const*, long){inlined} (7,746,098 cycles, 0.47%)</title><rect x="50.2385%" y="837" width="0.4744%" height="15" fill="rgb(243,32,47)" fg:x="820250075" fg:w="7746098"/><text x="50.4885%" y="847.50"></text></g><g><title>void std::__ostream_write&lt;char, std::char_traits&lt;char&gt; &gt;(std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp;, char const*, long){inlined} (7,746,098 cycles, 0.47%)</title><rect x="50.2385%" y="821" width="0.4744%" height="15" fill="rgb(247,202,23)" fg:x="820250075" fg:w="7746098"/><text x="50.4885%" y="831.50"></text></g><g><title>std::__cxx11::basic_ostringstream&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::str() const{inlined} (17,119,482 cycles, 1.05%)</title><rect x="49.7435%" y="917" width="1.0485%" height="15" fill="rgb(219,102,11)" fg:x="812168526" fg:w="17119482"/><text x="49.9935%" y="927.50"></text></g><g><title>std::__cxx11::basic_stringbuf&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::str() const{inlined} (17,119,482 cycles, 1.05%)</title><rect x="49.7435%" y="901" width="1.0485%" height="15" fill="rgb(243,110,44)" fg:x="812168526" fg:w="17119482"/><text x="49.9935%" y="911.50"></text></g><g><title>std::__cxx11::basic_stringbuf&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_high_mark() const{inlined} (14,553,588 cycles, 0.89%)</title><rect x="49.9007%" y="885" width="0.8914%" height="15" fill="rgb(222,74,54)" fg:x="814734420" fg:w="14553588"/><text x="50.1507%" y="895.50"></text></g><g><title>std::basic_streambuf&lt;char, std::char_traits&lt;char&gt; &gt;::pptr() const{inlined} (11,607,127 cycles, 0.71%)</title><rect x="50.0811%" y="869" width="0.7109%" height="15" fill="rgb(216,99,12)" fg:x="817680881" fg:w="11607127"/><text x="50.3311%" y="879.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::append(unsigned long, char){inlined} (17,956,811 cycles, 1.10%)</title><rect x="50.8712%" y="917" width="1.0998%" height="15" fill="rgb(226,22,26)" fg:x="830580327" fg:w="17956811"/><text x="51.1212%" y="927.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_replace_aux(unsigned long, unsigned long, unsigned long, char){libstdc++.so.6.0.35} (17,956,811 cycles, 1.10%)</title><rect x="50.8712%" y="901" width="1.0998%" height="15" fill="rgb(217,163,10)" fg:x="830580327" fg:w="17956811"/><text x="51.1212%" y="911.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::capacity() const{inlined} (7,624,529 cycles, 0.47%)</title><rect x="51.5040%" y="885" width="0.4670%" height="15" fill="rgb(213,25,53)" fg:x="840912609" fg:w="7624529"/><text x="51.7540%" y="895.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_is_local() const{inlined} (6,333,869 cycles, 0.39%)</title><rect x="51.5831%" y="869" width="0.3879%" height="15" fill="rgb(252,105,26)" fg:x="842203269" fg:w="6333869"/><text x="51.8331%" y="879.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_data() const{inlined} (6,333,869 cycles, 0.39%)</title><rect x="51.5831%" y="853" width="0.3879%" height="15" fill="rgb(220,39,43)" fg:x="842203269" fg:w="6333869"/><text x="51.8331%" y="863.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (10,344,042 cycles, 0.63%)</title><rect x="52.1292%" y="821" width="0.6335%" height="15" fill="rgb(229,68,48)" fg:x="851119307" fg:w="10344042"/><text x="52.3792%" y="831.50"></text></g><g><title>sql::SQLString::SQLString(char const*, unsigned long){libmariadbcpp.so} (16,764,863 cycles, 1.03%)</title><rect x="52.1292%" y="853" width="1.0268%" height="15" fill="rgb(252,8,32)" fg:x="851119307" fg:w="16764863"/><text x="52.3792%" y="863.50"></text></g><g><title>sql::StringImp::createString(char const*, unsigned long){libmariadbcpp.so} (16,764,863 cycles, 1.03%)</title><rect x="52.1292%" y="837" width="1.0268%" height="15" fill="rgb(223,20,43)" fg:x="851119307" fg:w="16764863"/><text x="52.3792%" y="847.50"></text></g><g><title>sql::StringImp::StringImp(char const*, unsigned long){libmariadbcpp.so} (3,858,997 cycles, 0.24%)</title><rect x="52.9196%" y="821" width="0.2364%" height="15" fill="rgb(229,81,49)" fg:x="864025173" fg:w="3858997"/><text x="53.1696%" y="831.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::basic_string(char const*, unsigned long, std::allocator&lt;char&gt; const&amp;){inlined} (3,858,997 cycles, 0.24%)</title><rect x="52.9196%" y="805" width="0.2364%" height="15" fill="rgb(236,28,36)" fg:x="864025173" fg:w="3858997"/><text x="53.1696%" y="815.50"></text></g><g><title>void std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_construct&lt;char const*&gt;(char const*, char const*, std::forward_iterator_tag){inlined} (3,858,997 cycles, 0.24%)</title><rect x="52.9196%" y="789" width="0.2364%" height="15" fill="rgb(249,185,26)" fg:x="864025173" fg:w="3858997"/><text x="53.1696%" y="799.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::~basic_string(){inlined} (24,473,090 cycles, 1.50%)</title><rect x="52.0500%" y="917" width="1.4989%" height="15" fill="rgb(249,174,33)" fg:x="849826873" fg:w="24473090"/><text x="52.3000%" y="927.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_dispose(){inlined} (24,473,090 cycles, 1.50%)</title><rect x="52.0500%" y="901" width="1.4989%" height="15" fill="rgb(233,201,37)" fg:x="849826873" fg:w="24473090"/><text x="52.3000%" y="911.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_is_local() const{inlined} (24,473,090 cycles, 1.50%)</title><rect x="52.0500%" y="885" width="1.4989%" height="15" fill="rgb(221,78,26)" fg:x="849826873" fg:w="24473090"/><text x="52.3000%" y="895.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_data() const{inlined} (23,180,656 cycles, 1.42%)</title><rect x="52.1292%" y="869" width="1.4198%" height="15" fill="rgb(250,127,30)" fg:x="851119307" fg:w="23180656"/><text x="52.3792%" y="879.50"></text></g><g><title>std::ios_base::~ios_base(){libstdc++.so.6.0.35} (3,834,756 cycles, 0.23%)</title><rect x="53.3140%" y="853" width="0.2349%" height="15" fill="rgb(230,49,44)" fg:x="870465207" fg:w="3834756"/><text x="53.5640%" y="863.50"></text></g><g><title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::_M_cache_locale(std::locale const&amp;){libstdc++.so.6.0.35} (7,344,008 cycles, 0.45%)</title><rect x="53.7863%" y="885" width="0.4498%" height="15" fill="rgb(229,67,23)" fg:x="878176600" fg:w="7344008"/><text x="54.0363%" y="895.50"></text></g><g><title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::rdbuf() const{inlined} (8,636,498 cycles, 0.53%)</title><rect x="53.7863%" y="901" width="0.5290%" height="15" fill="rgb(249,83,47)" fg:x="878176600" fg:w="8636498"/><text x="54.0363%" y="911.50"></text></g><g><title>std::ios_base::imbue(std::locale const&amp;){libstdc++.so.6.0.35} (7,742,858 cycles, 0.47%)</title><rect x="54.4736%" y="901" width="0.4742%" height="15" fill="rgb(215,43,3)" fg:x="889397455" fg:w="7742858"/><text x="54.7236%" y="911.50"></text></g><g><title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::imbue(std::locale const&amp;){libstdc++.so.6.0.35} (25,423,435 cycles, 1.56%)</title><rect x="53.6281%" y="917" width="1.5571%" height="15" fill="rgb(238,154,13)" fg:x="875592875" fg:w="25423435"/><text x="53.8781%" y="927.50"></text></g><g><title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::_M_cache_locale(std::locale const&amp;){libstdc++.so.6.0.35} (9,018,254 cycles, 0.55%)</title><rect x="55.5808%" y="901" width="0.5523%" height="15" fill="rgb(219,56,2)" fg:x="907475334" fg:w="9018254"/><text x="55.8308%" y="911.50"></text></g><g><title>std::num_put&lt;char, std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt; &gt; const* std::__try_use_facet&lt;std::num_put&lt;char, std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt; &gt; &gt;(std::locale const&amp;){inlined} (3,854,829 cycles, 0.24%)</title><rect x="55.8971%" y="885" width="0.2361%" height="15" fill="rgb(233,0,4)" fg:x="912638759" fg:w="3854829"/><text x="56.1471%" y="895.50"></text></g><g><title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::init(std::basic_streambuf&lt;char, std::char_traits&lt;char&gt; &gt;*){libstdc++.so.6.0.35} (16,769,937 cycles, 1.03%)</title><rect x="55.1852%" y="917" width="1.0271%" height="15" fill="rgb(235,30,7)" fg:x="901016310" fg:w="16769937"/><text x="55.4352%" y="927.50"></text></g><g><title>std::ostream::sentry::~sentry(){inlined} (25,941,987 cycles, 1.59%)</title><rect x="57.1622%" y="901" width="1.5889%" height="15" fill="rgb(250,79,13)" fg:x="933295153" fg:w="25941987"/><text x="57.4122%" y="911.50"></text></g><g><title>std::basic_streambuf&lt;char, std::char_traits&lt;char&gt; &gt;::sputn(char const*, long){inlined} (7,682,152 cycles, 0.47%)</title><rect x="59.0675%" y="885" width="0.4705%" height="15" fill="rgb(211,146,34)" fg:x="964402661" fg:w="7682152"/><text x="59.3175%" y="895.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (10,313,010 cycles, 0.63%)</title><rect x="59.5380%" y="869" width="0.6316%" height="15" fill="rgb(228,22,38)" fg:x="972084813" fg:w="10313010"/><text x="59.7880%" y="879.50"></text></g><g><title>std::basic_streambuf&lt;char, std::char_traits&lt;char&gt; &gt;::pptr() const{inlined} (5,169,245 cycles, 0.32%)</title><rect x="60.7655%" y="853" width="0.3166%" height="15" fill="rgb(235,168,5)" fg:x="992126752" fg:w="5169245"/><text x="61.0155%" y="863.50"></text></g><g><title>std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp; std::__ostream_insert&lt;char, std::char_traits&lt;char&gt; &gt;(std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp;, char const*, long){libstdc++.so.6.0.35} (80,802,667 cycles, 4.95%)</title><rect x="56.2124%" y="917" width="4.9490%" height="15" fill="rgb(221,155,16)" fg:x="917786247" fg:w="80802667"/><text x="56.4624%" y="927.50">std::b..</text></g><g><title>void std::__ostream_write&lt;char, std::char_traits&lt;char&gt; &gt;(std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp;, char const*, long){inlined} (39,351,774 cycles, 2.41%)</title><rect x="58.7511%" y="901" width="2.4102%" height="15" fill="rgb(215,215,53)" fg:x="959237140" fg:w="39351774"/><text x="59.0011%" y="911.50">vo..</text></g><g><title>void std::__ostream_write&lt;char, std::char_traits&lt;char&gt; &gt;(std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp;, char const*, long){inlined} (26,504,101 cycles, 1.62%)</title><rect x="59.5380%" y="885" width="1.6233%" height="15" fill="rgb(223,4,10)" fg:x="972084813" fg:w="26504101"/><text x="59.7880%" y="895.50"></text></g><g><title>std::basic_streambuf&lt;char, std::char_traits&lt;char&gt; &gt;::xsputn(char const*, long){libstdc++.so.6.0.35} (16,191,091 cycles, 0.99%)</title><rect x="60.1697%" y="869" width="0.9917%" height="15" fill="rgb(234,103,6)" fg:x="982397823" fg:w="16191091"/><text x="60.4197%" y="879.50"></text></g><g><title>std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp; std::operator&lt;&lt; &lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;(std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const&amp;){inlined} (8,349,791 cycles, 0.51%)</title><rect x="61.1613%" y="917" width="0.5114%" height="15" fill="rgb(227,97,0)" fg:x="998588914" fg:w="8349791"/><text x="61.4113%" y="927.50"></text></g><g><title>std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp; std::__ostream_insert&lt;char, std::char_traits&lt;char&gt; &gt;(std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp;, char const*, long){libstdc++.so.6.0.35} (8,349,791 cycles, 0.51%)</title><rect x="61.1613%" y="901" width="0.5114%" height="15" fill="rgb(234,150,53)" fg:x="998588914" fg:w="8349791"/><text x="61.4113%" y="911.50"></text></g><g><title>void std::__ostream_write&lt;char, std::char_traits&lt;char&gt; &gt;(std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp;, char const*, long){inlined} (3,877,043 cycles, 0.24%)</title><rect x="61.4353%" y="885" width="0.2375%" height="15" fill="rgb(228,201,54)" fg:x="1003061662" fg:w="3877043"/><text x="61.6853%" y="895.50"></text></g><g><title>std::num_put&lt;char, std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt; &gt;::do_put(std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt;, std::ios_base&amp;, char, long) const{libstdc++.so.6.0.35} (24,335,098 cycles, 1.49%)</title><rect x="61.7517%" y="901" width="1.4905%" height="15" fill="rgb(222,22,37)" fg:x="1008228577" fg:w="24335098"/><text x="62.0017%" y="911.50"></text></g><g><title>int std::__int_to_char&lt;char, unsigned long&gt;(char*, unsigned long, char const*, std::_Ios_Fmtflags, bool){libstdc++.so.6.0.35} (18,091,648 cycles, 1.11%)</title><rect x="64.1129%" y="885" width="1.1081%" height="15" fill="rgb(237,53,32)" fg:x="1046779230" fg:w="18091648"/><text x="64.3629%" y="895.50"></text></g><g><title>std::basic_streambuf&lt;char, std::char_traits&lt;char&gt; &gt;::xsputn(char const*, long){libstdc++.so.6.0.35} (5,152,223 cycles, 0.32%)</title><rect x="65.3001%" y="885" width="0.3156%" height="15" fill="rgb(233,25,53)" fg:x="1066163535" fg:w="5152223"/><text x="65.5501%" y="895.50"></text></g><g><title>std::ostream::sentry::~sentry(){inlined} (21,894,325 cycles, 1.34%)</title><rect x="65.7740%" y="885" width="1.3410%" height="15" fill="rgb(210,40,34)" fg:x="1073899700" fg:w="21894325"/><text x="66.0240%" y="895.50"></text></g><g><title>std::__use_cache&lt;std::__numpunct_cache&lt;char&gt; &gt;::operator()(std::locale const&amp;) const [clone .isra.0]{libstdc++.so.6.0.35} (5,168,195 cycles, 0.32%)</title><rect x="67.8992%" y="853" width="0.3165%" height="15" fill="rgb(241,220,44)" fg:x="1108598357" fg:w="5168195"/><text x="68.1492%" y="863.50"></text></g><g><title>std::ios_base::flags() const{inlined} (12,919,022 cycles, 0.79%)</title><rect x="67.8992%" y="869" width="0.7913%" height="15" fill="rgb(235,28,35)" fg:x="1108598357" fg:w="12919022"/><text x="68.1492%" y="879.50"></text></g><g><title>std::locale::id::_M_id() const{libstdc++.so.6.0.35} (7,750,827 cycles, 0.47%)</title><rect x="68.2157%" y="853" width="0.4747%" height="15" fill="rgb(210,56,17)" fg:x="1113766552" fg:w="7750827"/><text x="68.4657%" y="863.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (37,452,382 cycles, 2.29%)</title><rect x="68.9278%" y="837" width="2.2939%" height="15" fill="rgb(224,130,29)" fg:x="1125392737" fg:w="37452382"/><text x="69.1778%" y="847.50">_..</text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (5,127,601 cycles, 0.31%)</title><rect x="72.4810%" y="773" width="0.3141%" height="15" fill="rgb(235,212,8)" fg:x="1183406844" fg:w="5127601"/><text x="72.7310%" y="783.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::push_back(char){inlined} (15,400,718 cycles, 0.94%)</title><rect x="72.3234%" y="805" width="0.9433%" height="15" fill="rgb(223,33,50)" fg:x="1180833548" fg:w="15400718"/><text x="72.5734%" y="815.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::size() const{inlined} (12,827,422 cycles, 0.79%)</title><rect x="72.4810%" y="789" width="0.7857%" height="15" fill="rgb(219,149,13)" fg:x="1183406844" fg:w="12827422"/><text x="72.7310%" y="799.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_replace(unsigned long, unsigned long, char const*, unsigned long){libstdc++.so.6.0.35} (7,699,821 cycles, 0.47%)</title><rect x="72.7951%" y="773" width="0.4716%" height="15" fill="rgb(250,156,29)" fg:x="1188534445" fg:w="7699821"/><text x="73.0451%" y="783.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_S_copy(char*, char const*, unsigned long){inlined} (5,168,381 cycles, 0.32%)</title><rect x="72.9501%" y="757" width="0.3166%" height="15" fill="rgb(216,193,19)" fg:x="1191065885" fg:w="5168381"/><text x="73.2001%" y="767.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_S_copy(char*, char const*, unsigned long){inlined} (5,168,381 cycles, 0.32%)</title><rect x="72.9501%" y="741" width="0.3166%" height="15" fill="rgb(216,135,14)" fg:x="1191065885" fg:w="5168381"/><text x="73.2001%" y="751.50"></text></g><g><title>std::char_traits&lt;char&gt;::copy(char*, char const*, unsigned long){inlined} (5,168,381 cycles, 0.32%)</title><rect x="72.9501%" y="725" width="0.3166%" height="15" fill="rgb(241,47,5)" fg:x="1191065885" fg:w="5168381"/><text x="73.2001%" y="735.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::swap(std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;&amp;){libstdc++.so.6.0.35} (6,461,380 cycles, 0.40%)</title><rect x="73.2667%" y="805" width="0.3957%" height="15" fill="rgb(233,42,35)" fg:x="1196234266" fg:w="6461380"/><text x="73.5167%" y="815.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::~basic_string(){inlined} (7,527,993 cycles, 0.46%)</title><rect x="73.6624%" y="805" width="0.4611%" height="15" fill="rgb(231,13,6)" fg:x="1202695646" fg:w="7527993"/><text x="73.9124%" y="815.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_dispose(){inlined} (7,527,993 cycles, 0.46%)</title><rect x="73.6624%" y="789" width="0.4611%" height="15" fill="rgb(207,181,40)" fg:x="1202695646" fg:w="7527993"/><text x="73.9124%" y="799.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_is_local() const{inlined} (7,527,993 cycles, 0.46%)</title><rect x="73.6624%" y="773" width="0.4611%" height="15" fill="rgb(254,173,49)" fg:x="1202695646" fg:w="7527993"/><text x="73.9124%" y="783.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_data() const{inlined} (6,272,236 cycles, 0.38%)</title><rect x="73.7393%" y="757" width="0.3842%" height="15" fill="rgb(221,1,38)" fg:x="1203951403" fg:w="6272236"/><text x="73.9893%" y="767.50"></text></g><g><title>std::__cxx11::basic_stringbuf&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_sync(char*, unsigned long, unsigned long){libstdc++.so.6.0.35} (4,979,841 cycles, 0.31%)</title><rect x="73.8185%" y="741" width="0.3050%" height="15" fill="rgb(206,124,46)" fg:x="1205243798" fg:w="4979841"/><text x="74.0685%" y="751.50"></text></g><g><title>std::basic_streambuf&lt;char, std::char_traits&lt;char&gt; &gt;::pbase() const{inlined} (16,552,557 cycles, 1.01%)</title><rect x="74.1235%" y="805" width="1.0138%" height="15" fill="rgb(249,21,11)" fg:x="1210223639" fg:w="16552557"/><text x="74.3735%" y="815.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::reserve(unsigned long){libstdc++.so.6.0.35} (8,822,825 cycles, 0.54%)</title><rect x="74.5969%" y="789" width="0.5404%" height="15" fill="rgb(222,201,40)" fg:x="1217953371" fg:w="8822825"/><text x="74.8469%" y="799.50"></text></g><g><title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_data() const{inlined} (5,169,852 cycles, 0.32%)</title><rect x="74.8207%" y="773" width="0.3166%" height="15" fill="rgb(235,61,29)" fg:x="1221606344" fg:w="5169852"/><text x="75.0707%" y="783.50"></text></g><g><title>std::__cxx11::basic_stringbuf&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::overflow(int){libstdc++.so.6.0.35} (52,386,476 cycles, 3.21%)</title><rect x="72.1653%" y="821" width="3.2086%" height="15" fill="rgb(219,207,3)" fg:x="1178251350" fg:w="52386476"/><text x="72.4153%" y="831.50">std..</text></g><g><title>std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt; std::num_put&lt;char, std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt; &gt;::_M_insert_int&lt;long&gt;(std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt;, std::ios_base&amp;, char, long) const{libstdc++.so.6.0.35} (143,888,697 cycles, 8.81%)</title><rect x="67.1149%" y="885" width="8.8129%" height="15" fill="rgb(222,56,46)" fg:x="1095794025" fg:w="143888697"/><text x="67.3649%" y="895.50">std::ostream..</text></g><g><title>std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt; std::__write&lt;char&gt;(std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt;, char const*, int){inlined} (116,872,795 cycles, 7.16%)</title><rect x="68.7696%" y="869" width="7.1582%" height="15" fill="rgb(239,76,54)" fg:x="1122809927" fg:w="116872795"/><text x="69.0196%" y="879.50">std::ostre..</text></g><g><title>std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt;::_M_put(char const*, long){inlined} (116,872,795 cycles, 7.16%)</title><rect x="68.7696%" y="853" width="7.1582%" height="15" fill="rgb(231,124,27)" fg:x="1122809927" fg:w="116872795"/><text x="69.0196%" y="863.50">std::ostre..</text></g><g><title>std::basic_streambuf&lt;char, std::char_traits&lt;char&gt; &gt;::xsputn(char const*, long){libstdc++.so.6.0.35} (74,261,119 cycles, 4.55%)</title><rect x="71.3795%" y="837" width="4.5483%" height="15" fill="rgb(249,195,6)" fg:x="1165421603" fg:w="74261119"/><text x="71.6295%" y="847.50">std::..</text></g><g><title>std::char_traits&lt;char&gt;::to_int_type(char const&amp;){inlined} (7,752,528 cycles, 0.47%)</title><rect x="75.4530%" y="821" width="0.4748%" height="15" fill="rgb(237,174,47)" fg:x="1231930194" fg:w="7752528"/><text x="75.7030%" y="831.50"></text></g><g><title>std::ostream&amp; std::ostream::_M_insert&lt;long&gt;(long){libstdc++.so.6.0.35} (208,411,668 cycles, 12.76%)</title><rect x="63.2422%" y="901" width="12.7647%" height="15" fill="rgb(206,201,31)" fg:x="1032563675" fg:w="208411668"/><text x="63.4922%" y="911.50">std::ostream&amp; std::..</text></g><g><title>std::ostream::sentry::sentry(std::ostream&amp;)@plt{libstdc++.so.6.0.35} (5,102,505 cycles, 0.31%)</title><rect x="76.0070%" y="901" width="0.3125%" height="15" fill="rgb(231,57,52)" fg:x="1240975343" fg:w="5102505"/><text x="76.2570%" y="911.50"></text></g><g><title>std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp; std::operator&lt;&lt; &lt;std::char_traits&lt;char&gt; &gt;(std::basic_ostream&lt;char, std::char_traits&lt;char&gt; &gt;&amp;, char const*){inlined} (241,725,382 cycles, 14.81%)</title><rect x="61.6727%" y="917" width="14.8051%" height="15" fill="rgb(248,177,22)" fg:x="1006938705" fg:w="241725382"/><text x="61.9227%" y="927.50">std::basic_ostream&lt;char..</text></g><g><title>std::basic_streambuf&lt;char, std::char_traits&lt;char&gt; &gt;::imbue(std::locale const&amp;){libstdc++.so.6.0.35} (5,154,178 cycles, 0.32%)</title><rect x="76.4779%" y="917" width="0.3157%" height="15" fill="rgb(215,211,37)" fg:x="1248664087" fg:w="5154178"/><text x="76.7279%" y="927.50"></text></g><g><title>std::basic_streambuf&lt;char, std::char_traits&lt;char&gt; &gt;::xsputn(char const*, long){libstdc++.so.6.0.35} (26,849,438 cycles, 1.64%)</title><rect x="76.7936%" y="917" width="1.6445%" height="15" fill="rgb(241,128,51)" fg:x="1253818265" fg:w="26849438"/><text x="77.0436%" y="927.50"></text></g><g><title>std::locale::~locale(){libstdc++.so.6.0.35} (3,880,113 cycles, 0.24%)</title><rect x="78.9122%" y="917" width="0.2376%" height="15" fill="rgb(227,165,31)" fg:x="1288409758" fg:w="3880113"/><text x="79.1622%" y="927.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (8,940,195 cycles, 0.55%)</title><rect x="80.0174%" y="853" width="0.5476%" height="15" fill="rgb(228,167,24)" fg:x="1306454831" fg:w="8940195"/><text x="80.2674%" y="863.50"></text></g><g><title>std::ostream&amp; std::ostream::_M_insert&lt;long&gt;(long){libstdc++.so.6.0.35} (23,104,726 cycles, 1.42%)</title><rect x="79.3078%" y="917" width="1.4151%" height="15" fill="rgb(228,143,12)" fg:x="1294867877" fg:w="23104726"/><text x="79.5578%" y="927.50"></text></g><g><title>std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt; std::num_put&lt;char, std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt; &gt;::_M_insert_int&lt;long&gt;(std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt;, std::ios_base&amp;, char, long) const{libstdc++.so.6.0.35} (15,394,954 cycles, 0.94%)</title><rect x="79.7800%" y="901" width="0.9429%" height="15" fill="rgb(249,149,8)" fg:x="1302577649" fg:w="15394954"/><text x="80.0300%" y="911.50"></text></g><g><title>std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt; std::__write&lt;char&gt;(std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt;, char const*, int){inlined} (11,517,772 cycles, 0.71%)</title><rect x="80.0174%" y="885" width="0.7054%" height="15" fill="rgb(243,35,44)" fg:x="1306454831" fg:w="11517772"/><text x="80.2674%" y="895.50"></text></g><g><title>std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt;::_M_put(char const*, long){inlined} (11,517,772 cycles, 0.71%)</title><rect x="80.0174%" y="869" width="0.7054%" height="15" fill="rgb(246,89,9)" fg:x="1306454831" fg:w="11517772"/><text x="80.2674%" y="879.50"></text></g><g><title>std::ostream::sentry::sentry(std::ostream&amp;){libstdc++.so.6.0.35} (9,024,296 cycles, 0.55%)</title><rect x="80.8811%" y="917" width="0.5527%" height="15" fill="rgb(233,213,13)" fg:x="1320556687" fg:w="9024296"/><text x="81.1311%" y="927.50"></text></g><g><title>sql::mariadb::capi::TextRowProtocolCapi::getInternalTimestamp(sql::mariadb::ColumnDefinition*, sql::mariadb::Calendar*, sql::mariadb::TimeZone*){libmariadbcpp.so} (687,669,791 cycles, 42.12%)</title><rect x="39.6255%" y="933" width="42.1182%" height="15" fill="rgb(233,141,41)" fg:x="646969885" fg:w="687669791"/><text x="39.8755%" y="943.50">sql::mariadb::capi::TextRowProtocolCapi::getInternalTimestamp(sql::ma..</text></g><g><title>void std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_construct&lt;char const*&gt;(char const*, char const*, std::forward_iterator_tag) [clone .isra.0]{libmariadbcpp.so} (5,058,693 cycles, 0.31%)</title><rect x="81.4339%" y="917" width="0.3098%" height="15" fill="rgb(239,167,4)" fg:x="1329580983" fg:w="5058693"/><text x="81.6839%" y="927.50"></text></g><g><title>std::ios_base::ios_base(){libstdc++.so.6.0.35} (3,876,482 cycles, 0.24%)</title><rect x="82.3765%" y="933" width="0.2374%" height="15" fill="rgb(209,217,16)" fg:x="1344970969" fg:w="3876482"/><text x="82.6265%" y="943.50"></text></g><g><title>std::locale::~locale(){libstdc++.so.6.0.35} (4,383,815 cycles, 0.27%)</title><rect x="82.9275%" y="933" width="0.2685%" height="15" fill="rgb(219,88,35)" fg:x="1353968475" fg:w="4383815"/><text x="83.1775%" y="943.50"></text></g><g><title>std::ostream&amp; std::ostream::_M_insert&lt;long&gt;(long){libstdc++.so.6.0.35} (5,147,906 cycles, 0.32%)</title><rect x="83.1960%" y="933" width="0.3153%" height="15" fill="rgb(220,193,23)" fg:x="1358352290" fg:w="5147906"/><text x="83.4460%" y="943.50"></text></g><g><title>sql::mariadb::capi::TextRowProtocolCapi::getInternalString(sql::mariadb::ColumnDefinition*, sql::mariadb::Calendar*, sql::mariadb::TimeZone*){libmariadbcpp.so} (907,632,646 cycles, 55.59%)</title><rect x="28.3634%" y="949" width="55.5905%" height="15" fill="rgb(230,90,52)" fg:x="463092414" fg:w="907632646"/><text x="28.6134%" y="959.50">sql::mariadb::capi::TextRowProtocolCapi::getInternalString(sql::mariadb::ColumnDefinition*, ..</text></g><g><title>std::ostream::operator&lt;&lt;(int){libstdc++.so.6.0.35} (5,525,009 cycles, 0.34%)</title><rect x="83.6154%" y="933" width="0.3384%" height="15" fill="rgb(252,106,19)" fg:x="1365200051" fg:w="5525009"/><text x="83.8654%" y="943.50"></text></g><g><title>std::operator&amp;(std::_Ios_Fmtflags, std::_Ios_Fmtflags){inlined} (5,525,009 cycles, 0.34%)</title><rect x="83.6154%" y="917" width="0.3384%" height="15" fill="rgb(206,74,20)" fg:x="1365200051" fg:w="5525009"/><text x="83.8654%" y="927.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetCapi::checkObjectRange(int) const{libmariadbcpp.so} (10,316,044 cycles, 0.63%)</title><rect x="84.2703%" y="933" width="0.6318%" height="15" fill="rgb(230,138,44)" fg:x="1375892443" fg:w="10316044"/><text x="84.5203%" y="943.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetCapi::getString(int) const{libmariadbcpp.so} (985,083,924 cycles, 60.33%)</title><rect x="25.1221%" y="965" width="60.3342%" height="15" fill="rgb(235,182,43)" fg:x="410171636" fg:w="985083924"/><text x="25.3721%" y="975.50">sql::mariadb::capi::SelectResultSetCapi::getString(int) const{libmariadbcpp.so}</text></g><g><title>std::__shared_ptr&lt;sql::mariadb::ColumnDefinition,{__gnu_cxx::_Lock_policy)2&gt;::get() const+0x3a (inlined} (23,239,521 cycles, 1.42%)</title><rect x="84.0329%" y="949" width="1.4234%" height="15" fill="rgb(242,16,51)" fg:x="1372016039" fg:w="23239521"/><text x="84.2829%" y="959.50"></text></g><g><title>sql::mariadb::capi::TextRowProtocolCapi::setPosition(int){libmariadbcpp.so} (9,047,073 cycles, 0.55%)</title><rect x="84.9022%" y="933" width="0.5541%" height="15" fill="rgb(248,9,4)" fg:x="1386208487" fg:w="9047073"/><text x="85.1522%" y="943.50"></text></g><g><title>sql::CArray&lt;char&gt;::wrap(char*, unsigned long){libmariadbcpp.so} (5,084,291 cycles, 0.31%)</title><rect x="85.5357%" y="949" width="0.3114%" height="15" fill="rgb(210,31,22)" fg:x="1396551558" fg:w="5084291"/><text x="85.7857%" y="959.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetCapi::checkObjectRange(int) const{libmariadbcpp.so} (45,923,500 cycles, 2.81%)</title><rect x="85.8471%" y="949" width="2.8127%" height="15" fill="rgb(239,54,39)" fg:x="1401635849" fg:w="45923500"/><text x="86.0971%" y="959.50">sq..</text></g><g><title>sql::mariadb::capi::SelectResultSetCapi::resetRow() const{libmariadbcpp.so} (5,165,684 cycles, 0.32%)</title><rect x="88.3434%" y="933" width="0.3164%" height="15" fill="rgb(230,99,41)" fg:x="1442393665" fg:w="5165684"/><text x="88.5934%" y="943.50"></text></g><g><title>mysql_fetch_lengths@libmariadbclient_18{libmariadb.so.3} (5,165,684 cycles, 0.32%)</title><rect x="88.3434%" y="917" width="0.3164%" height="15" fill="rgb(253,106,12)" fg:x="1442393665" fg:w="5165684"/><text x="88.5934%" y="927.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetCapi::isNull(int) const{libmariadbcpp.so} (80,655,865 cycles, 4.94%)</title><rect x="85.4563%" y="965" width="4.9400%" height="15" fill="rgb(213,46,41)" fg:x="1395255560" fg:w="80655865"/><text x="85.7063%" y="975.50">sql::m..</text></g><g><title>sql::mariadb::capi::TextRowProtocolCapi::setPosition(int){libmariadbcpp.so} (28,352,076 cycles, 1.74%)</title><rect x="88.6598%" y="949" width="1.7365%" height="15" fill="rgb(215,133,35)" fg:x="1447559349" fg:w="28352076"/><text x="88.9098%" y="959.50"></text></g><g><title>round_and_return{libc.so.6} (10,326,549 cycles, 0.63%)</title><rect x="94.0144%" y="917" width="0.6325%" height="15" fill="rgb(213,28,5)" fg:x="1534985601" fg:w="10326549"/><text x="94.2644%" y="927.50"></text></g><g><title>str_to_mpn.isra.0{libc.so.6} (25,586,076 cycles, 1.57%)</title><rect x="94.6469%" y="917" width="1.5671%" height="15" fill="rgb(215,77,49)" fg:x="1545312150" fg:w="25586076"/><text x="94.8969%" y="927.50"></text></g><g><title>str_to_mpn{inlined} (21,823,285 cycles, 1.34%)</title><rect x="94.8774%" y="901" width="1.3366%" height="15" fill="rgb(248,100,22)" fg:x="1549074941" fg:w="21823285"/><text x="95.1274%" y="911.50"></text></g><g><title>__GI_____strtod_l_internal{libc.so.6} (81,674,956 cycles, 5.00%)</title><rect x="91.6056%" y="933" width="5.0024%" height="15" fill="rgb(208,67,9)" fg:x="1495655671" fg:w="81674956"/><text x="91.8556%" y="943.50">__GI__..</text></g><g><title>udiv_qrnnd_x86{inlined} (6,432,401 cycles, 0.39%)</title><rect x="96.2140%" y="917" width="0.3940%" height="15" fill="rgb(219,133,21)" fg:x="1570898226" fg:w="6432401"/><text x="96.4640%" y="927.50"></text></g><g><title>__mpn_construct_double{libc.so.6} (5,170,978 cycles, 0.32%)</title><rect x="96.6080%" y="933" width="0.3167%" height="15" fill="rgb(246,46,29)" fg:x="1577330627" fg:w="5170978"/><text x="96.8580%" y="943.50"></text></g><g><title>__mpn_lshift{libc.so.6} (6,394,509 cycles, 0.39%)</title><rect x="96.9247%" y="933" width="0.3916%" height="15" fill="rgb(246,185,52)" fg:x="1582501605" fg:w="6394509"/><text x="97.1747%" y="943.50"></text></g><g><title>sql::mariadb::RowProtocol::stringToDouble(char const*, unsigned int){libmariadbcpp.so} (112,557,204 cycles, 6.89%)</title><rect x="90.6599%" y="949" width="6.8939%" height="15" fill="rgb(252,136,11)" fg:x="1480215687" fg:w="112557204"/><text x="90.9099%" y="959.50">sql::mari..</text></g><g><title>__strlen_evex{libc.so.6} (3,876,777 cycles, 0.24%)</title><rect x="97.3163%" y="933" width="0.2374%" height="15" fill="rgb(219,138,53)" fg:x="1588896114" fg:w="3876777"/><text x="97.5663%" y="943.50"></text></g><g><title>sql::mariadb::capi::TextRowProtocolCapi::getInternalDouble(sql::mariadb::ColumnDefinition*){libmariadbcpp.so} (117,101,822 cycles, 7.17%)</title><rect x="90.4754%" y="965" width="7.1722%" height="15" fill="rgb(211,51,23)" fg:x="1477203675" fg:w="117101822"/><text x="90.7254%" y="975.50">sql::maria..</text></g><g><title>sql::mariadb::core_strtoll(char const*, unsigned int){libmariadbcpp.so} (7,463,767 cycles, 0.46%)</title><rect x="98.5933%" y="949" width="0.4571%" height="15" fill="rgb(247,221,28)" fg:x="1609745853" fg:w="7463767"/><text x="98.8433%" y="959.50"></text></g><g><title>sql::mariadb::capi::TextRowProtocolCapi::getInternalLong(sql::mariadb::ColumnDefinition*){libmariadbcpp.so} (30,655,936 cycles, 1.88%)</title><rect x="97.6476%" y="965" width="1.8776%" height="15" fill="rgb(251,222,45)" fg:x="1594305497" fg:w="30655936"/><text x="97.8976%" y="975.50">s..</text></g><g><title>sql::mariadb::safer_strtoll(char const*, unsigned int){libmariadbcpp.so} (7,751,813 cycles, 0.47%)</title><rect x="99.0505%" y="949" width="0.4748%" height="15" fill="rgb(217,162,53)" fg:x="1617209620" fg:w="7751813"/><text x="99.3005%" y="959.50"></text></g><g><title>sql::mariadb::capi::TextRowProtocolCapi::setPosition(int){libmariadbcpp.so} (3,874,057 cycles, 0.24%)</title><rect x="99.6044%" y="965" width="0.2373%" height="15" fill="rgb(229,93,14)" fg:x="1626253397" fg:w="3874057"/><text x="99.8544%" y="975.50"></text></g><g><title>all (1,632,712,794 cycles, 100%)</title><rect x="0.0000%" y="1093" width="100.0000%" height="15" fill="rgb(209,67,49)" fg:x="0" fg:w="1632712794"/><text x="0.2500%" y="1103.50"></text></g><g><title>run-mariadb (1,632,712,794 cycles, 100.00%)</title><rect x="0.0000%" y="1077" width="100.0000%" height="15" fill="rgb(213,87,29)" fg:x="0" fg:w="1632712794"/><text x="0.2500%" y="1087.50">run-mariadb</text></g><g><title>_start{run-mariadb} (1,632,387,937 cycles, 99.98%)</title><rect x="0.0199%" y="1061" width="99.9801%" height="15" fill="rgb(205,151,52)" fg:x="324857" fg:w="1632387937"/><text x="0.2699%" y="1071.50">_start{run-mariadb}</text></g><g><title>__libc_start_main@@GLIBC_2.34{libc.so.6} (1,632,387,937 cycles, 99.98%)</title><rect x="0.0199%" y="1045" width="99.9801%" height="15" fill="rgb(253,215,39)" fg:x="324857" fg:w="1632387937"/><text x="0.2699%" y="1055.50">__libc_start_main@@GLIBC_2.34{libc.so.6}</text></g><g><title>call_init{inlined} (1,632,387,937 cycles, 99.98%)</title><rect x="0.0199%" y="1029" width="99.9801%" height="15" fill="rgb(221,220,41)" fg:x="324857" fg:w="1632387937"/><text x="0.2699%" y="1039.50">call_init{inlined}</text></g><g><title>__libc_start_call_main{libc.so.6} (1,632,387,937 cycles, 99.98%)</title><rect x="0.0199%" y="1013" width="99.9801%" height="15" fill="rgb(218,133,21)" fg:x="324857" fg:w="1632387937"/><text x="0.2699%" y="1023.50">__libc_start_call_main{libc.so.6}</text></g><g><title>main{run-mariadb} (1,632,387,937 cycles, 99.98%)</title><rect x="0.0199%" y="997" width="99.9801%" height="15" fill="rgb(221,193,43)" fg:x="324857" fg:w="1632387937"/><text x="0.2699%" y="1007.50">main{run-mariadb}</text></g><g><title>t4(sql::Connection*){run-mariadb} (1,568,520,704 cycles, 96.07%)</title><rect x="3.9316%" y="981" width="96.0684%" height="15" fill="rgb(240,128,52)" fg:x="64192090" fg:w="1568520704"/><text x="4.1816%" y="991.50">t4(sql::Connection*){run-mariadb}</text></g></svg></svg>

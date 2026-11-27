@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="534" onload="init(evt)" viewBox="0 0 1200 534" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="534" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">php-doctrine-orm/T3-text-streamed-default-0.folded (Percona, default; sampled CPU cycles)</text><text id="details" fill="rgb(0,0,0)" x="10" y="517.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="517.00"> </text><svg id="frames" x="10" width="1180" total_samples="75875946046"><g><title>i_zval_ptr_dtor{inlined} (1,898,875,747 cycles, 2.50%)</title><rect x="0.7494%" y="197" width="2.5026%" height="15" fill="rgb(227,0,7)" fg:x="568605704" fg:w="1898875747"/><text x="0.9994%" y="207.50">i_..</text></g><g><title>zend_array_destroy{php8.5} (2,015,611,472 cycles, 2.66%)</title><rect x="0.6138%" y="213" width="2.6565%" height="15" fill="rgb(217,0,24)" fg:x="465735105" fg:w="2015611472"/><text x="0.8638%" y="223.50">ze..</text></g><g><title>i_zval_ptr_dtor{inlined} (2,441,714,423 cycles, 3.22%)</title><rect x="0.0602%" y="229" width="3.2180%" height="15" fill="rgb(221,193,54)" fg:x="45653680" fg:w="2441714423"/><text x="0.3102%" y="239.50">i_z..</text></g><g><title>ZEND_ASSIGN_OBJ_SPEC_UNUSED_CONST_OP_DATA_TMP_HANDLER{php8.5} (2,570,654,009 cycles, 3.39%)</title><rect x="0.0241%" y="261" width="3.3880%" height="15" fill="rgb(248,212,6)" fg:x="18322502" fg:w="2570654009"/><text x="0.2741%" y="271.50">ZEN..</text></g><g><title>zend_array_destroy{php8.5} (2,557,988,835 cycles, 3.37%)</title><rect x="0.0408%" y="245" width="3.3713%" height="15" fill="rgb(208,68,35)" fg:x="30987676" fg:w="2557988835"/><text x="0.2908%" y="255.50">zen..</text></g><g><title>mysqlnd_mysqlnd_vio_network_read_pub{mysqlnd.so} (172,896,177 cycles, 0.23%)</title><rect x="4.2262%" y="133" width="0.2279%" height="15" fill="rgb(232,128,0)" fg:x="3206641644" fg:w="172896177"/><text x="4.4762%" y="143.50"></text></g><g><title>php_mysqlnd_rowp_read{mysqlnd.so} (379,091,083 cycles, 0.50%)</title><rect x="4.0627%" y="165" width="0.4996%" height="15" fill="rgb(207,160,47)" fg:x="3082576687" fg:w="379091083"/><text x="4.3127%" y="175.50"></text></g><g><title>php_mysqlnd_read_row_ex{inlined} (319,457,169 cycles, 0.42%)</title><rect x="4.1412%" y="149" width="0.4210%" height="15" fill="rgb(228,23,34)" fg:x="3142210601" fg:w="319457169"/><text x="4.3912%" y="159.50"></text></g><g><title>mysqlnd_mysqlnd_res_store_result_fetch_data_pub{mysqlnd.so} (864,861,831 cycles, 1.14%)</title><rect x="3.4234%" y="181" width="1.1398%" height="15" fill="rgb(218,30,26)" fg:x="2597533568" fg:w="864861831"/><text x="3.6734%" y="191.50"></text></g><g><title>ZEND_DO_FCALL_SPEC_RETVAL_USED_HANDLER{inlined} (865,475,399 cycles, 1.14%)</title><rect x="3.4234%" y="261" width="1.1406%" height="15" fill="rgb(220,122,19)" fg:x="2597533568" fg:w="865475399"/><text x="3.6734%" y="271.50"></text></g><g><title>zim_PDO_query{pdo.so} (865,475,399 cycles, 1.14%)</title><rect x="3.4234%" y="245" width="1.1406%" height="15" fill="rgb(250,228,42)" fg:x="2597533568" fg:w="865475399"/><text x="3.6734%" y="255.50"></text></g><g><title>pdo_mysql_fill_stmt_from_result{pdo_mysql.so} (865,475,399 cycles, 1.14%)</title><rect x="3.4234%" y="229" width="1.1406%" height="15" fill="rgb(240,193,28)" fg:x="2597533568" fg:w="865475399"/><text x="3.6734%" y="239.50"></text></g><g><title>mysqlnd_mysqlnd_conn_data_store_result_pub{mysqlnd.so} (865,475,399 cycles, 1.14%)</title><rect x="3.4234%" y="213" width="1.1406%" height="15" fill="rgb(216,20,37)" fg:x="2597533568" fg:w="865475399"/><text x="3.6734%" y="223.50"></text></g><g><title>mysqlnd_mysqlnd_res_store_result_pub{mysqlnd.so} (865,475,399 cycles, 1.14%)</title><rect x="3.4234%" y="197" width="1.1406%" height="15" fill="rgb(206,188,39)" fg:x="2597533568" fg:w="865475399"/><text x="3.6734%" y="207.50"></text></g><g><title>ZEND_ASSIGN_SPEC_CV_CONST_RETVAL_UNUSED_HANDLER{php8.5} (360,401,622 cycles, 0.47%)</title><rect x="5.3267%" y="229" width="0.4750%" height="15" fill="rgb(217,207,13)" fg:x="4041649101" fg:w="360401622"/><text x="5.5767%" y="239.50"></text></g><g><title>zend_assign_to_variable{inlined} (323,936,879 cycles, 0.43%)</title><rect x="5.3747%" y="213" width="0.4269%" height="15" fill="rgb(231,73,38)" fg:x="4078113844" fg:w="323936879"/><text x="5.6247%" y="223.50"></text></g><g><title>zend_copy_to_variable{inlined} (296,707,134 cycles, 0.39%)</title><rect x="5.4106%" y="197" width="0.3910%" height="15" fill="rgb(225,20,46)" fg:x="4105343589" fg:w="296707134"/><text x="5.6606%" y="207.50"></text></g><g><title>ZEND_ASSIGN_SPEC_CV_TMP_RETVAL_UNUSED_HANDLER{php8.5} (657,710,245 cycles, 0.87%)</title><rect x="5.8016%" y="229" width="0.8668%" height="15" fill="rgb(210,31,41)" fg:x="4402050723" fg:w="657710245"/><text x="6.0516%" y="239.50"></text></g><g><title>zend_assign_to_variable{inlined} (367,062,445 cycles, 0.48%)</title><rect x="6.1847%" y="213" width="0.4838%" height="15" fill="rgb(221,200,47)" fg:x="4692698523" fg:w="367062445"/><text x="6.4347%" y="223.50"></text></g><g><title>zend_copy_to_variable{inlined} (296,715,655 cycles, 0.39%)</title><rect x="6.2774%" y="197" width="0.3911%" height="15" fill="rgb(226,26,5)" fg:x="4763045313" fg:w="296715655"/><text x="6.5274%" y="207.50"></text></g><g><title>ZEND_BOOL_NOT_SPEC_TMPVAR_HANDLER{php8.5} (159,202,618 cycles, 0.21%)</title><rect x="6.7157%" y="229" width="0.2098%" height="15" fill="rgb(249,33,26)" fg:x="5095625784" fg:w="159202618"/><text x="6.9657%" y="239.50"></text></g><g><title>ZEND_BOOL_SPEC_TMPVAR_HANDLER{php8.5} (170,983,136 cycles, 0.23%)</title><rect x="6.9256%" y="229" width="0.2253%" height="15" fill="rgb(235,183,28)" fg:x="5254828402" fg:w="170983136"/><text x="7.1756%" y="239.50"></text></g><g><title>ZEND_FE_RESET_R_SPEC_TMP_HANDLER{php8.5} (256,863,619 cycles, 0.34%)</title><rect x="8.0098%" y="229" width="0.3385%" height="15" fill="rgb(221,5,38)" fg:x="6077496132" fg:w="256863619"/><text x="8.2598%" y="239.50"></text></g><g><title>ZEND_JMPZ_EX_SPEC_TMPVAR_HANDLER{php8.5} (208,461,322 cycles, 0.27%)</title><rect x="8.7602%" y="229" width="0.2747%" height="15" fill="rgb(247,18,42)" fg:x="6646864484" fg:w="208461322"/><text x="9.0102%" y="239.50"></text></g><g><title>ZEND_VERIFY_RETURN_TYPE_SPEC_TMP_UNUSED_HANDLER{php8.5} (163,868,464 cycles, 0.22%)</title><rect x="9.1259%" y="229" width="0.2160%" height="15" fill="rgb(241,131,45)" fg:x="6924343694" fg:w="163868464"/><text x="9.3759%" y="239.50"></text></g><g><title>_efree{php8.5} (189,570,160 cycles, 0.25%)</title><rect x="9.4637%" y="229" width="0.2498%" height="15" fill="rgb(249,31,29)" fg:x="7180663014" fg:w="189570160"/><text x="9.7137%" y="239.50"></text></g><g><title>zend_gc_try_delref{inlined} (275,482,916 cycles, 0.36%)</title><rect x="17.5572%" y="197" width="0.3631%" height="15" fill="rgb(225,111,53)" fg:x="13321654366" fg:w="275482916"/><text x="17.8072%" y="207.50"></text></g><g><title>zend_array_dup{php8.5} (156,487,829 cycles, 0.21%)</title><rect x="17.7140%" y="181" width="0.2062%" height="15" fill="rgb(238,160,17)" fg:x="13440649453" fg:w="156487829"/><text x="17.9640%" y="191.50"></text></g><g><title>ZEND_ASSIGN_DIM_OP_SPEC_CV_CV_HANDLER{php8.5} (520,823,711 cycles, 0.69%)</title><rect x="17.2617%" y="213" width="0.6864%" height="15" fill="rgb(214,148,48)" fg:x="13097459785" fg:w="520823711"/><text x="17.5117%" y="223.50"></text></g><g><title>zend_hash_lookup{php8.5} (173,428,396 cycles, 0.23%)</title><rect x="18.1568%" y="165" width="0.2286%" height="15" fill="rgb(232,36,49)" fg:x="13776619644" fg:w="173428396"/><text x="18.4068%" y="175.50"></text></g><g><title>_zend_hash_add_or_update_i{inlined} (172,275,558 cycles, 0.23%)</title><rect x="18.1583%" y="149" width="0.2270%" height="15" fill="rgb(209,103,24)" fg:x="13777772482" fg:w="172275558"/><text x="18.4083%" y="159.50"></text></g><g><title>zend_fetch_dimension_address_inner_W{php8.5} (201,846,733 cycles, 0.27%)</title><rect x="18.1274%" y="197" width="0.2660%" height="15" fill="rgb(229,88,8)" fg:x="13754370520" fg:w="201846733"/><text x="18.3774%" y="207.50"></text></g><g><title>zend_fetch_dimension_address_inner{inlined} (191,971,805 cycles, 0.25%)</title><rect x="18.1405%" y="181" width="0.2530%" height="15" fill="rgb(213,181,19)" fg:x="13764245448" fg:w="191971805"/><text x="18.3905%" y="191.50"></text></g><g><title>ZEND_ASSIGN_DIM_SPEC_CV_CV_OP_DATA_CONST_HANDLER{php8.5} (364,419,931 cycles, 0.48%)</title><rect x="17.9481%" y="213" width="0.4803%" height="15" fill="rgb(254,191,54)" fg:x="13618283496" fg:w="364419931"/><text x="18.1981%" y="223.50"></text></g><g><title>_emalloc_320{php8.5} (313,323,453 cycles, 0.41%)</title><rect x="18.9778%" y="133" width="0.4129%" height="15" fill="rgb(241,83,37)" fg:x="14399609580" fg:w="313323453"/><text x="19.2278%" y="143.50"></text></g><g><title>zend_mm_alloc_small{inlined} (303,336,752 cycles, 0.40%)</title><rect x="18.9910%" y="117" width="0.3998%" height="15" fill="rgb(233,36,39)" fg:x="14409596281" fg:w="303336752"/><text x="19.2410%" y="127.50"></text></g><g><title>zend_mm_get_next_free_slot{inlined} (282,331,718 cycles, 0.37%)</title><rect x="19.0187%" y="101" width="0.3721%" height="15" fill="rgb(226,3,54)" fg:x="14430601315" fg:w="282331718"/><text x="19.2687%" y="111.50"></text></g><g><title>zend_hash_lookup{php8.5} (462,669,278 cycles, 0.61%)</title><rect x="18.8246%" y="165" width="0.6098%" height="15" fill="rgb(245,192,40)" fg:x="14283314345" fg:w="462669278"/><text x="19.0746%" y="175.50"></text></g><g><title>_zend_hash_add_or_update_i{inlined} (462,669,278 cycles, 0.61%)</title><rect x="18.8246%" y="149" width="0.6098%" height="15" fill="rgb(238,167,29)" fg:x="14283314345" fg:w="462669278"/><text x="19.0746%" y="159.50"></text></g><g><title>zend_fetch_dimension_address_inner_W{php8.5} (516,579,595 cycles, 0.68%)</title><rect x="18.7883%" y="197" width="0.6808%" height="15" fill="rgb(232,182,51)" fg:x="14255774439" fg:w="516579595"/><text x="19.0383%" y="207.50"></text></g><g><title>zend_fetch_dimension_address_inner{inlined} (502,817,416 cycles, 0.66%)</title><rect x="18.8064%" y="181" width="0.6627%" height="15" fill="rgb(231,60,39)" fg:x="14269536618" fg:w="502817416"/><text x="19.0564%" y="191.50"></text></g><g><title>ZEND_ASSIGN_DIM_SPEC_CV_CV_OP_DATA_CV_HANDLER{php8.5} (821,861,823 cycles, 1.08%)</title><rect x="18.4284%" y="213" width="1.0832%" height="15" fill="rgb(208,69,12)" fg:x="13982703427" fg:w="821861823"/><text x="18.6784%" y="223.50"></text></g><g><title>zend_assign_to_variable_ex{inlined} (181,719,007 cycles, 0.24%)</title><rect x="19.7387%" y="197" width="0.2395%" height="15" fill="rgb(235,93,37)" fg:x="14976913239" fg:w="181719007"/><text x="19.9887%" y="207.50"></text></g><g><title>zend_hash_lookup{php8.5} (156,230,199 cycles, 0.21%)</title><rect x="19.9898%" y="165" width="0.2059%" height="15" fill="rgb(213,116,39)" fg:x="15167449260" fg:w="156230199"/><text x="20.2398%" y="175.50"></text></g><g><title>_zend_hash_add_or_update_i{inlined} (155,045,764 cycles, 0.20%)</title><rect x="19.9914%" y="149" width="0.2043%" height="15" fill="rgb(222,207,29)" fg:x="15168633695" fg:w="155045764"/><text x="20.2414%" y="159.50"></text></g><g><title>zend_fetch_dimension_address_inner_W{php8.5} (184,702,138 cycles, 0.24%)</title><rect x="19.9782%" y="197" width="0.2434%" height="15" fill="rgb(206,96,30)" fg:x="15158632246" fg:w="184702138"/><text x="20.2282%" y="207.50"></text></g><g><title>zend_fetch_dimension_address_inner{inlined} (179,735,717 cycles, 0.24%)</title><rect x="19.9847%" y="181" width="0.2369%" height="15" fill="rgb(218,138,4)" fg:x="15163598667" fg:w="179735717"/><text x="20.2347%" y="191.50"></text></g><g><title>ZEND_ASSIGN_DIM_SPEC_CV_CV_OP_DATA_TMP_HANDLER{php8.5} (555,203,631 cycles, 0.73%)</title><rect x="19.5115%" y="213" width="0.7317%" height="15" fill="rgb(250,191,14)" fg:x="14804565250" fg:w="555203631"/><text x="19.7615%" y="223.50"></text></g><g><title>ZEND_ASSIGN_DIM_SPEC_VAR_CONST_OP_DATA_TMP_HANDLER{php8.5} (172,922,265 cycles, 0.23%)</title><rect x="20.3665%" y="213" width="0.2279%" height="15" fill="rgb(239,60,40)" fg:x="15453289775" fg:w="172922265"/><text x="20.6165%" y="223.50"></text></g><g><title>zend_hash_index_lookup{php8.5} (425,651,594 cycles, 0.56%)</title><rect x="20.8217%" y="165" width="0.5610%" height="15" fill="rgb(206,27,48)" fg:x="15798653141" fg:w="425651594"/><text x="21.0717%" y="175.50"></text></g><g><title>_zend_hash_index_add_or_update_i{inlined} (420,655,580 cycles, 0.55%)</title><rect x="20.8283%" y="149" width="0.5544%" height="15" fill="rgb(225,35,8)" fg:x="15803649155" fg:w="420655580"/><text x="21.0783%" y="159.50"></text></g><g><title>zend_fetch_dimension_address_inner_W{php8.5} (542,159,595 cycles, 0.71%)</title><rect x="20.8067%" y="197" width="0.7145%" height="15" fill="rgb(250,213,24)" fg:x="15787310823" fg:w="542159595"/><text x="21.0567%" y="207.50"></text></g><g><title>zend_fetch_dimension_address_inner{inlined} (539,607,811 cycles, 0.71%)</title><rect x="20.8101%" y="181" width="0.7112%" height="15" fill="rgb(247,123,22)" fg:x="15789862607" fg:w="539607811"/><text x="21.0601%" y="191.50"></text></g><g><title>ZEND_ASSIGN_DIM_SPEC_VAR_CV_OP_DATA_CONST_HANDLER{php8.5} (712,159,224 cycles, 0.94%)</title><rect x="20.5944%" y="213" width="0.9386%" height="15" fill="rgb(231,138,38)" fg:x="15626212040" fg:w="712159224"/><text x="20.8444%" y="223.50"></text></g><g><title>do_user_addr_fault{kernel} (159,492,072 cycles, 0.21%)</title><rect x="22.4427%" y="85" width="0.2102%" height="15" fill="rgb(231,145,46)" fg:x="17028590137" fg:w="159492072"/><text x="22.6927%" y="95.50"></text></g><g><title>asm_exc_page_fault{kernel} (173,207,234 cycles, 0.23%)</title><rect x="22.4296%" y="117" width="0.2283%" height="15" fill="rgb(251,118,11)" fg:x="17018694445" fg:w="173207234"/><text x="22.6796%" y="127.50"></text></g><g><title>exc_page_fault{kernel} (166,912,446 cycles, 0.22%)</title><rect x="22.4379%" y="101" width="0.2200%" height="15" fill="rgb(217,147,25)" fg:x="17024989233" fg:w="166912446"/><text x="22.6879%" y="111.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (202,756,882 cycles, 0.27%)</title><rect x="22.3924%" y="133" width="0.2672%" height="15" fill="rgb(247,81,37)" fg:x="16990425666" fg:w="202756882"/><text x="22.6424%" y="143.50"></text></g><g><title>do_anonymous_page{kernel} (176,843,567 cycles, 0.23%)</title><rect x="22.7060%" y="37" width="0.2331%" height="15" fill="rgb(209,12,38)" fg:x="17228404907" fg:w="176843567"/><text x="22.9560%" y="47.50"></text></g><g><title>handle_mm_fault{kernel} (188,069,746 cycles, 0.25%)</title><rect x="22.6979%" y="85" width="0.2479%" height="15" fill="rgb(227,1,9)" fg:x="17222263808" fg:w="188069746"/><text x="22.9479%" y="95.50"></text></g><g><title>__handle_mm_fault{kernel} (186,844,019 cycles, 0.25%)</title><rect x="22.6995%" y="69" width="0.2462%" height="15" fill="rgb(248,47,43)" fg:x="17223489535" fg:w="186844019"/><text x="22.9495%" y="79.50"></text></g><g><title>handle_pte_fault{kernel} (183,189,515 cycles, 0.24%)</title><rect x="22.7044%" y="53" width="0.2414%" height="15" fill="rgb(221,10,30)" fg:x="17227144039" fg:w="183189515"/><text x="22.9544%" y="63.50"></text></g><g><title>do_user_addr_fault{kernel} (255,787,293 cycles, 0.34%)</title><rect x="22.6811%" y="101" width="0.3371%" height="15" fill="rgb(210,229,1)" fg:x="17209468652" fg:w="255787293"/><text x="22.9311%" y="111.50"></text></g><g><title>asm_exc_page_fault{kernel} (273,340,368 cycles, 0.36%)</title><rect x="22.6596%" y="133" width="0.3602%" height="15" fill="rgb(222,148,37)" fg:x="17193182548" fg:w="273340368"/><text x="22.9096%" y="143.50"></text></g><g><title>exc_page_fault{kernel} (258,267,987 cycles, 0.34%)</title><rect x="22.6795%" y="117" width="0.3404%" height="15" fill="rgb(234,67,33)" fg:x="17208254929" fg:w="258267987"/><text x="22.9295%" y="127.50"></text></g><g><title>zend_hash_do_fresize{php8.5} (182,034,652 cycles, 0.24%)</title><rect x="23.0246%" y="133" width="0.2399%" height="15" fill="rgb(247,98,35)" fg:x="17470101903" fg:w="182034652"/><text x="23.2746%" y="143.50"></text></g><g><title>zend_hash_index_find_bucket{inlined} (211,654,236 cycles, 0.28%)</title><rect x="23.2645%" y="133" width="0.2789%" height="15" fill="rgb(247,138,52)" fg:x="17652136555" fg:w="211654236"/><text x="23.5145%" y="143.50"></text></g><g><title>zend_hash_index_lookup{php8.5} (1,090,288,797 cycles, 1.44%)</title><rect x="22.1981%" y="165" width="1.4369%" height="15" fill="rgb(213,79,30)" fg:x="16842985498" fg:w="1090288797"/><text x="22.4481%" y="175.50"></text></g><g><title>_zend_hash_index_add_or_update_i{inlined} (1,020,611,688 cycles, 1.35%)</title><rect x="22.2899%" y="149" width="1.3451%" height="15" fill="rgb(246,177,23)" fg:x="16912662607" fg:w="1020611688"/><text x="22.5399%" y="159.50"></text></g><g><title>zend_fetch_dimension_address_inner_W{php8.5} (1,169,308,342 cycles, 1.54%)</title><rect x="22.1085%" y="197" width="1.5411%" height="15" fill="rgb(230,62,27)" fg:x="16775056323" fg:w="1169308342"/><text x="22.3585%" y="207.50"></text></g><g><title>zend_fetch_dimension_address_inner{inlined} (1,165,719,933 cycles, 1.54%)</title><rect x="22.1133%" y="181" width="1.5363%" height="15" fill="rgb(216,154,8)" fg:x="16778644732" fg:w="1165719933"/><text x="22.3633%" y="191.50"></text></g><g><title>ZEND_ASSIGN_DIM_SPEC_VAR_CV_OP_DATA_CV_HANDLER{php8.5} (1,616,738,264 cycles, 2.13%)</title><rect x="21.5330%" y="213" width="2.1308%" height="15" fill="rgb(244,35,45)" fg:x="16338371264" fg:w="1616738264"/><text x="21.7830%" y="223.50">Z..</text></g><g><title>zend_fetch_dimension_address_inner_W{php8.5} (154,536,533 cycles, 0.20%)</title><rect x="23.9691%" y="197" width="0.2037%" height="15" fill="rgb(251,115,12)" fg:x="18186756779" fg:w="154536533"/><text x="24.2191%" y="207.50"></text></g><g><title>ZEND_ASSIGN_DIM_SPEC_VAR_CV_OP_DATA_TMP_HANDLER{php8.5} (396,250,527 cycles, 0.52%)</title><rect x="23.6638%" y="213" width="0.5222%" height="15" fill="rgb(240,54,50)" fg:x="17955109528" fg:w="396250527"/><text x="23.9138%" y="223.50"></text></g><g><title>_emalloc_320{php8.5} (159,647,761 cycles, 0.21%)</title><rect x="24.2899%" y="133" width="0.2104%" height="15" fill="rgb(233,84,52)" fg:x="18430189539" fg:w="159647761"/><text x="24.5399%" y="143.50"></text></g><g><title>zend_mm_alloc_small{inlined} (155,868,190 cycles, 0.21%)</title><rect x="24.2949%" y="117" width="0.2054%" height="15" fill="rgb(207,117,47)" fg:x="18433969110" fg:w="155868190"/><text x="24.5449%" y="127.50"></text></g><g><title>zend_mm_get_next_free_slot{inlined} (153,363,106 cycles, 0.20%)</title><rect x="24.2982%" y="101" width="0.2021%" height="15" fill="rgb(249,43,39)" fg:x="18436474194" fg:w="153363106"/><text x="24.5482%" y="111.50"></text></g><g><title>zend_hash_lookup{php8.5} (212,425,038 cycles, 0.28%)</title><rect x="24.2388%" y="165" width="0.2800%" height="15" fill="rgb(209,38,44)" fg:x="18391427867" fg:w="212425038"/><text x="24.4888%" y="175.50"></text></g><g><title>_zend_hash_add_or_update_i{inlined} (212,425,038 cycles, 0.28%)</title><rect x="24.2388%" y="149" width="0.2800%" height="15" fill="rgb(236,212,23)" fg:x="18391427867" fg:w="212425038"/><text x="24.4888%" y="159.50"></text></g><g><title>zend_fetch_dimension_address_inner_W{php8.5} (217,425,732 cycles, 0.29%)</title><rect x="24.2356%" y="197" width="0.2866%" height="15" fill="rgb(242,79,21)" fg:x="18388956031" fg:w="217425732"/><text x="24.4856%" y="207.50"></text></g><g><title>zend_fetch_dimension_address_inner{inlined} (217,425,732 cycles, 0.29%)</title><rect x="24.2356%" y="181" width="0.2866%" height="15" fill="rgb(211,96,35)" fg:x="18388956031" fg:w="217425732"/><text x="24.4856%" y="191.50"></text></g><g><title>_emalloc_56{php8.5} (307,050,396 cycles, 0.40%)</title><rect x="24.5286%" y="181" width="0.4047%" height="15" fill="rgb(253,215,40)" fg:x="18611322625" fg:w="307050396"/><text x="24.7786%" y="191.50"></text></g><g><title>zend_mm_alloc_small{inlined} (303,376,407 cycles, 0.40%)</title><rect x="24.5335%" y="165" width="0.3998%" height="15" fill="rgb(211,81,21)" fg:x="18614996614" fg:w="303376407"/><text x="24.7835%" y="175.50"></text></g><g><title>zend_mm_get_next_free_slot{inlined} (286,449,344 cycles, 0.38%)</title><rect x="24.5558%" y="149" width="0.3775%" height="15" fill="rgb(208,190,38)" fg:x="18631923677" fg:w="286449344"/><text x="24.8058%" y="159.50"></text></g><g><title>zval_get_type{inlined} (312,082,067 cycles, 0.41%)</title><rect x="24.5269%" y="197" width="0.4113%" height="15" fill="rgb(235,213,38)" fg:x="18610037328" fg:w="312082067"/><text x="24.7769%" y="207.50"></text></g><g><title>ZEND_ASSIGN_DIM_SPEC_VAR_TMPVAR_OP_DATA_CV_HANDLER{php8.5} (572,050,900 cycles, 0.75%)</title><rect x="24.1860%" y="213" width="0.7539%" height="15" fill="rgb(237,122,38)" fg:x="18351360055" fg:w="572050900"/><text x="24.4360%" y="223.50"></text></g><g><title>ZEND_ASSIGN_DIM_SPEC_VAR_UNUSED_OP_DATA_CV_HANDLER{php8.5} (274,778,580 cycles, 0.36%)</title><rect x="24.9399%" y="213" width="0.3621%" height="15" fill="rgb(244,218,35)" fg:x="18923410955" fg:w="274778580"/><text x="25.1899%" y="223.50"></text></g><g><title>ZEND_ASSIGN_OBJ_SPEC_UNUSED_CONST_OP_DATA_CONST_HANDLER{php8.5} (320,200,813 cycles, 0.42%)</title><rect x="25.3021%" y="213" width="0.4220%" height="15" fill="rgb(240,68,47)" fg:x="19198189535" fg:w="320200813"/><text x="25.5521%" y="223.50"></text></g><g><title>_efree{php8.5} (170,126,307 cycles, 0.22%)</title><rect x="25.8840%" y="197" width="0.2242%" height="15" fill="rgb(210,16,53)" fg:x="19639765935" fg:w="170126307"/><text x="26.1340%" y="207.50"></text></g><g><title>zend_array_destroy{php8.5} (200,230,012 cycles, 0.26%)</title><rect x="26.1577%" y="197" width="0.2639%" height="15" fill="rgb(235,124,12)" fg:x="19847400137" fg:w="200230012"/><text x="26.4077%" y="207.50"></text></g><g><title>ZEND_ASSIGN_OBJ_SPEC_UNUSED_CONST_OP_DATA_CV_HANDLER{php8.5} (636,758,830 cycles, 0.84%)</title><rect x="25.7241%" y="213" width="0.8392%" height="15" fill="rgb(224,169,11)" fg:x="19518390348" fg:w="636758830"/><text x="25.9741%" y="223.50"></text></g><g><title>zend_array_destroy{php8.5} (177,493,217 cycles, 0.23%)</title><rect x="26.9390%" y="197" width="0.2339%" height="15" fill="rgb(250,166,2)" fg:x="20440204099" fg:w="177493217"/><text x="27.1890%" y="207.50"></text></g><g><title>ZEND_ASSIGN_OBJ_SPEC_UNUSED_CONST_OP_DATA_TMP_HANDLER{php8.5} (609,666,205 cycles, 0.80%)</title><rect x="26.5633%" y="213" width="0.8035%" height="15" fill="rgb(242,216,29)" fg:x="20155149178" fg:w="609666205"/><text x="26.8133%" y="223.50"></text></g><g><title>_efree{php8.5} (193,683,587 cycles, 0.26%)</title><rect x="28.0941%" y="181" width="0.2553%" height="15" fill="rgb(230,116,27)" fg:x="21316631632" fg:w="193683587"/><text x="28.3441%" y="191.50"></text></g><g><title>zend_mm_free_heap{inlined} (171,545,164 cycles, 0.23%)</title><rect x="28.1232%" y="165" width="0.2261%" height="15" fill="rgb(228,99,48)" fg:x="21338770055" fg:w="171545164"/><text x="28.3732%" y="175.50"></text></g><g><title>zend_array_destroy{php8.5} (176,589,485 cycles, 0.23%)</title><rect x="28.4202%" y="181" width="0.2327%" height="15" fill="rgb(253,11,6)" fg:x="21564127266" fg:w="176589485"/><text x="28.6702%" y="191.50"></text></g><g><title>ZEND_ASSIGN_SPEC_CV_VAR_RETVAL_UNUSED_HANDLER{php8.5} (1,003,055,506 cycles, 1.32%)</title><rect x="27.4664%" y="213" width="1.3220%" height="15" fill="rgb(247,143,39)" fg:x="20840402345" fg:w="1003055506"/><text x="27.7164%" y="223.50"></text></g><g><title>zend_assign_to_variable{inlined} (882,333,706 cycles, 1.16%)</title><rect x="27.6255%" y="197" width="1.1629%" height="15" fill="rgb(236,97,10)" fg:x="20961124145" fg:w="882333706"/><text x="27.8755%" y="207.50"></text></g><g><title>zend_mm_alloc_small{inlined} (172,678,443 cycles, 0.23%)</title><rect x="29.0308%" y="149" width="0.2276%" height="15" fill="rgb(233,208,19)" fg:x="22027418197" fg:w="172678443"/><text x="29.2808%" y="159.50"></text></g><g><title>_emalloc{php8.5} (198,922,240 cycles, 0.26%)</title><rect x="29.0177%" y="181" width="0.2622%" height="15" fill="rgb(216,164,2)" fg:x="22017484242" fg:w="198922240"/><text x="29.2677%" y="191.50"></text></g><g><title>zend_mm_alloc_heap{inlined} (192,662,435 cycles, 0.25%)</title><rect x="29.0260%" y="165" width="0.2539%" height="15" fill="rgb(220,129,5)" fg:x="22023744047" fg:w="192662435"/><text x="29.2760%" y="175.50"></text></g><g><title>zend_objects_clone_obj{php8.5} (308,180,382 cycles, 0.41%)</title><rect x="28.9981%" y="197" width="0.4062%" height="15" fill="rgb(242,17,10)" fg:x="22002586829" fg:w="308180382"/><text x="29.2481%" y="207.50"></text></g><g><title>ZEND_CLONE_SPEC_CV_HANDLER{php8.5} (394,714,464 cycles, 0.52%)</title><rect x="28.8873%" y="213" width="0.5202%" height="15" fill="rgb(242,107,0)" fg:x="21918513422" fg:w="394714464"/><text x="29.1373%" y="223.50"></text></g><g><title>zend_print_long_to_buf{inlined} (153,122,924 cycles, 0.20%)</title><rect x="30.0826%" y="165" width="0.2018%" height="15" fill="rgb(251,28,31)" fg:x="22825449330" fg:w="153122924"/><text x="30.3326%" y="175.50"></text></g><g><title>zend_long_to_str{php8.5} (179,487,881 cycles, 0.24%)</title><rect x="30.0661%" y="181" width="0.2366%" height="15" fill="rgb(233,223,10)" fg:x="22812921444" fg:w="179487881"/><text x="30.3161%" y="191.50"></text></g><g><title>concat_function{php8.5} (519,171,095 cycles, 0.68%)</title><rect x="29.6958%" y="197" width="0.6842%" height="15" fill="rgb(215,21,27)" fg:x="22531947556" fg:w="519171095"/><text x="29.9458%" y="207.50"></text></g><g><title>ZEND_CONCAT_SPEC_CONST_CV_HANDLER{php8.5} (746,366,044 cycles, 0.98%)</title><rect x="29.4075%" y="213" width="0.9837%" height="15" fill="rgb(232,23,21)" fg:x="22313227886" fg:w="746366044"/><text x="29.6575%" y="223.50"></text></g><g><title>i_init_func_execute_data{inlined} (341,454,148 cycles, 0.45%)</title><rect x="30.8458%" y="197" width="0.4500%" height="15" fill="rgb(244,5,23)" fg:x="23404577827" fg:w="341454148"/><text x="31.0958%" y="207.50"></text></g><g><title>zend_init_cvs{inlined} (196,028,408 cycles, 0.26%)</title><rect x="31.0375%" y="181" width="0.2584%" height="15" fill="rgb(226,81,46)" fg:x="23550003567" fg:w="196028408"/><text x="31.2875%" y="191.50"></text></g><g><title>ZEND_DO_FCALL_SPEC_RETVAL_UNUSED_HANDLER{inlined} (1,099,993,295 cycles, 1.45%)</title><rect x="30.5477%" y="213" width="1.4497%" height="15" fill="rgb(247,70,30)" fg:x="23178353809" fg:w="1099993295"/><text x="30.7977%" y="223.50"></text></g><g><title>zim_ReflectionProperty_setRawValueWithoutLazyInitialization{php8.5} (384,153,151 cycles, 0.51%)</title><rect x="31.4911%" y="197" width="0.5063%" height="15" fill="rgb(212,68,19)" fg:x="23894193953" fg:w="384153151"/><text x="31.7411%" y="207.50"></text></g><g><title>i_init_func_execute_data{inlined} (510,853,513 cycles, 0.67%)</title><rect x="32.3164%" y="197" width="0.6733%" height="15" fill="rgb(240,187,13)" fg:x="24520337846" fg:w="510853513"/><text x="32.5664%" y="207.50"></text></g><g><title>zend_init_cvs{inlined} (261,527,624 cycles, 0.34%)</title><rect x="32.6449%" y="181" width="0.3447%" height="15" fill="rgb(223,113,26)" fg:x="24769663735" fg:w="261527624"/><text x="32.8949%" y="191.50"></text></g><g><title>mysqlnd_mysqlnd_res_fetch_row_pub{mysqlnd.so} (188,250,812 cycles, 0.25%)</title><rect x="33.4598%" y="149" width="0.2481%" height="15" fill="rgb(206,192,2)" fg:x="25387928452" fg:w="188250812"/><text x="33.7098%" y="159.50"></text></g><g><title>mysqlnd_mysqlnd_result_buffered_fetch_row_pub{mysqlnd.so} (1,196,751,089 cycles, 1.58%)</title><rect x="33.8342%" y="133" width="1.5772%" height="15" fill="rgb(241,108,4)" fg:x="25672028883" fg:w="1196751089"/><text x="34.0842%" y="143.50"></text></g><g><title>php_mysqlnd_rowp_read_text_protocol{mysqlnd.so} (702,340,409 cycles, 0.93%)</title><rect x="34.4858%" y="117" width="0.9256%" height="15" fill="rgb(247,173,49)" fg:x="26166439563" fg:w="702340409"/><text x="34.7358%" y="127.50"></text></g><g><title>atoll{inlined} (287,301,749 cycles, 0.38%)</title><rect x="35.0328%" y="101" width="0.3786%" height="15" fill="rgb(224,114,35)" fg:x="26581478223" fg:w="287301749"/><text x="35.2828%" y="111.50"></text></g><g><title>__GI_____strtoll_l_internal{libc.so.6} (287,301,749 cycles, 0.38%)</title><rect x="35.0328%" y="85" width="0.3786%" height="15" fill="rgb(245,159,27)" fg:x="26581478223" fg:w="287301749"/><text x="35.2828%" y="95.50"></text></g><g><title>do_fetch_common{pdo.so} (1,592,763,919 cycles, 2.10%)</title><rect x="33.4227%" y="165" width="2.0992%" height="15" fill="rgb(245,172,44)" fg:x="25359800131" fg:w="1592763919"/><text x="33.6727%" y="175.50">d..</text></g><g><title>pdo_mysql_stmt_fetch{pdo_mysql.so} (1,352,480,425 cycles, 1.78%)</title><rect x="33.7394%" y="149" width="1.7825%" height="15" fill="rgb(236,23,11)" fg:x="25600083625" fg:w="1352480425"/><text x="33.9894%" y="159.50">p..</text></g><g><title>zend_hash_update{php8.5} (187,879,449 cycles, 0.25%)</title><rect x="35.8191%" y="165" width="0.2476%" height="15" fill="rgb(205,117,38)" fg:x="27178107924" fg:w="187879449"/><text x="36.0691%" y="175.50"></text></g><g><title>_zend_hash_add_or_update_i{inlined} (176,979,327 cycles, 0.23%)</title><rect x="35.8335%" y="149" width="0.2332%" height="15" fill="rgb(237,72,25)" fg:x="27189008046" fg:w="176979327"/><text x="36.0835%" y="159.50"></text></g><g><title>do_fetch{pdo.so} (2,288,305,294 cycles, 3.02%)</title><rect x="33.0576%" y="181" width="3.0159%" height="15" fill="rgb(244,70,9)" fg:x="25082784818" fg:w="2288305294"/><text x="33.3076%" y="191.50">do_..</text></g><g><title>ZEND_DO_FCALL_SPEC_RETVAL_USED_HANDLER{inlined} (3,137,746,929 cycles, 4.14%)</title><rect x="31.9974%" y="213" width="4.1354%" height="15" fill="rgb(217,125,39)" fg:x="24278347104" fg:w="3137746929"/><text x="32.2474%" y="223.50">ZEND_..</text></g><g><title>zim_PDOStatement_fetch{pdo.so} (2,377,573,131 cycles, 3.13%)</title><rect x="32.9993%" y="197" width="3.1335%" height="15" fill="rgb(235,36,10)" fg:x="25038520902" fg:w="2377573131"/><text x="33.2493%" y="207.50">zim..</text></g><g><title>zend_atomic_bool_load_ex{inlined} (289,729,545 cycles, 0.38%)</title><rect x="36.4557%" y="197" width="0.3818%" height="15" fill="rgb(251,123,47)" fg:x="27661074546" fg:w="289729545"/><text x="36.7057%" y="207.50"></text></g><g><title>ZEND_DO_ICALL_SPEC_RETVAL_USED_HANDLER{inlined} (612,991,379 cycles, 0.81%)</title><rect x="36.1328%" y="213" width="0.8079%" height="15" fill="rgb(221,13,13)" fg:x="27416094033" fg:w="612991379"/><text x="36.3828%" y="223.50"></text></g><g><title>i_init_func_execute_data{inlined} (208,491,815 cycles, 0.27%)</title><rect x="37.1457%" y="197" width="0.2748%" height="15" fill="rgb(238,131,9)" fg:x="28184669168" fg:w="208491815"/><text x="37.3957%" y="207.50"></text></g><g><title>ZEND_DO_UCALL_SPEC_RETVAL_USED_HANDLER{inlined} (370,419,788 cycles, 0.49%)</title><rect x="36.9407%" y="213" width="0.4882%" height="15" fill="rgb(211,50,8)" fg:x="28029085412" fg:w="370419788"/><text x="37.1907%" y="223.50"></text></g><g><title>zend_hash_find_bucket{inlined} (162,088,592 cycles, 0.21%)</title><rect x="37.7175%" y="133" width="0.2136%" height="15" fill="rgb(245,182,24)" fg:x="28618539898" fg:w="162088592"/><text x="37.9675%" y="143.50"></text></g><g><title>zend_fetch_dimension_address_inner{inlined} (239,733,057 cycles, 0.32%)</title><rect x="37.6416%" y="165" width="0.3160%" height="15" fill="rgb(242,14,37)" fg:x="28560945915" fg:w="239733057"/><text x="37.8916%" y="175.50"></text></g><g><title>zend_hash_find{php8.5} (182,139,074 cycles, 0.24%)</title><rect x="37.7175%" y="149" width="0.2400%" height="15" fill="rgb(246,228,12)" fg:x="28618539898" fg:w="182139074"/><text x="37.9675%" y="159.50"></text></g><g><title>zend_fetch_dimension_address_read_IS{php8.5} (278,412,808 cycles, 0.37%)</title><rect x="37.5924%" y="197" width="0.3669%" height="15" fill="rgb(213,55,15)" fg:x="28523552333" fg:w="278412808"/><text x="37.8424%" y="207.50"></text></g><g><title>zend_fetch_dimension_address_read{inlined} (263,297,126 cycles, 0.35%)</title><rect x="37.6123%" y="181" width="0.3470%" height="15" fill="rgb(209,9,3)" fg:x="28538668015" fg:w="263297126"/><text x="37.8623%" y="191.50"></text></g><g><title>ZEND_FETCH_DIM_IS_SPEC_TMPVAR_CONST_HANDLER{php8.5} (323,259,971 cycles, 0.43%)</title><rect x="37.5876%" y="213" width="0.4260%" height="15" fill="rgb(230,59,30)" fg:x="28519955791" fg:w="323259971"/><text x="37.8376%" y="223.50"></text></g><g><title>zend_fetch_dimension_address_inner{inlined} (194,326,235 cycles, 0.26%)</title><rect x="38.1814%" y="165" width="0.2561%" height="15" fill="rgb(209,121,21)" fg:x="28970463658" fg:w="194326235"/><text x="38.4314%" y="175.50"></text></g><g><title>zend_hash_find{php8.5} (153,365,069 cycles, 0.20%)</title><rect x="38.2353%" y="149" width="0.2021%" height="15" fill="rgb(220,109,13)" fg:x="29011424824" fg:w="153365069"/><text x="38.4853%" y="159.50"></text></g><g><title>zend_fetch_dimension_address_read_IS{php8.5} (316,899,250 cycles, 0.42%)</title><rect x="38.0315%" y="197" width="0.4177%" height="15" fill="rgb(232,18,1)" fg:x="28856725759" fg:w="316899250"/><text x="38.2815%" y="207.50"></text></g><g><title>zend_fetch_dimension_address_read{inlined} (263,584,718 cycles, 0.35%)</title><rect x="38.1017%" y="181" width="0.3474%" height="15" fill="rgb(215,41,42)" fg:x="28910040291" fg:w="263584718"/><text x="38.3517%" y="191.50"></text></g><g><title>ZEND_FETCH_DIM_IS_SPEC_TMPVAR_CV_HANDLER{php8.5} (357,395,587 cycles, 0.47%)</title><rect x="38.0136%" y="213" width="0.4710%" height="15" fill="rgb(224,123,36)" fg:x="28843215762" fg:w="357395587"/><text x="38.2636%" y="223.50"></text></g><g><title>zend_hash_find_bucket{inlined} (183,328,132 cycles, 0.24%)</title><rect x="38.6129%" y="133" width="0.2416%" height="15" fill="rgb(240,125,3)" fg:x="29297925563" fg:w="183328132"/><text x="38.8629%" y="143.50"></text></g><g><title>zend_fetch_dimension_address_inner{inlined} (215,727,251 cycles, 0.28%)</title><rect x="38.6033%" y="165" width="0.2843%" height="15" fill="rgb(205,98,50)" fg:x="29290595954" fg:w="215727251"/><text x="38.8533%" y="175.50"></text></g><g><title>zend_hash_find{php8.5} (208,397,642 cycles, 0.27%)</title><rect x="38.6129%" y="149" width="0.2747%" height="15" fill="rgb(205,185,37)" fg:x="29297925563" fg:w="208397642"/><text x="38.8629%" y="159.50"></text></g><g><title>zend_fetch_dimension_address_read_IS{php8.5} (306,950,177 cycles, 0.40%)</title><rect x="38.4847%" y="197" width="0.4045%" height="15" fill="rgb(238,207,15)" fg:x="29200611349" fg:w="306950177"/><text x="38.7347%" y="207.50"></text></g><g><title>zend_fetch_dimension_address_read{inlined} (296,817,274 cycles, 0.39%)</title><rect x="38.4980%" y="181" width="0.3912%" height="15" fill="rgb(213,199,42)" fg:x="29210744252" fg:w="296817274"/><text x="38.7480%" y="191.50"></text></g><g><title>ZEND_FETCH_DIM_IS_SPEC_TMPVAR_TMPVAR_HANDLER{php8.5} (316,871,041 cycles, 0.42%)</title><rect x="38.4847%" y="213" width="0.4176%" height="15" fill="rgb(235,201,11)" fg:x="29200611349" fg:w="316871041"/><text x="38.7347%" y="223.50"></text></g><g><title>zend_fetch_dimension_address_inner{inlined} (347,188,825 cycles, 0.46%)</title><rect x="39.3147%" y="197" width="0.4576%" height="15" fill="rgb(207,46,11)" fg:x="29830421943" fg:w="347188825"/><text x="39.5647%" y="207.50"></text></g><g><title>zend_string_equal_val{php8.5} (282,422,665 cycles, 0.37%)</title><rect x="39.4001%" y="181" width="0.3722%" height="15" fill="rgb(241,35,35)" fg:x="29895188103" fg:w="282422665"/><text x="39.6501%" y="191.50"></text></g><g><title>ZEND_FETCH_DIM_R_SPEC_CV_CONST_HANDLER{php8.5} (714,506,554 cycles, 0.94%)</title><rect x="38.9023%" y="213" width="0.9417%" height="15" fill="rgb(243,32,47)" fg:x="29517482390" fg:w="714506554"/><text x="39.1523%" y="223.50"></text></g><g><title>zend_hash_find_bucket{inlined} (396,091,398 cycles, 0.52%)</title><rect x="40.3291%" y="149" width="0.5220%" height="15" fill="rgb(247,202,23)" fg:x="30600052880" fg:w="396091398"/><text x="40.5791%" y="159.50"></text></g><g><title>zend_fetch_dimension_address_inner{inlined} (521,977,274 cycles, 0.69%)</title><rect x="40.1940%" y="197" width="0.6879%" height="15" fill="rgb(219,102,11)" fg:x="30497543056" fg:w="521977274"/><text x="40.4440%" y="207.50"></text></g><g><title>zend_hash_find_ex{inlined} (471,861,317 cycles, 0.62%)</title><rect x="40.2600%" y="181" width="0.6219%" height="15" fill="rgb(243,110,44)" fg:x="30547659013" fg:w="471861317"/><text x="40.5100%" y="191.50"></text></g><g><title>zend_hash_find{php8.5} (453,021,769 cycles, 0.60%)</title><rect x="40.2848%" y="165" width="0.5971%" height="15" fill="rgb(222,74,54)" fg:x="30566498561" fg:w="453021769"/><text x="40.5348%" y="175.50"></text></g><g><title>ZEND_FETCH_DIM_R_SPEC_CV_CV_HANDLER{php8.5} (790,078,166 cycles, 1.04%)</title><rect x="39.8440%" y="213" width="1.0413%" height="15" fill="rgb(216,99,12)" fg:x="30231988944" fg:w="790078166"/><text x="40.0940%" y="223.50"></text></g><g><title>ZEND_FETCH_DIM_R_SPEC_TMPVAR_CONST_HANDLER{php8.5} (292,330,132 cycles, 0.39%)</title><rect x="40.8852%" y="213" width="0.3853%" height="15" fill="rgb(226,22,26)" fg:x="31022067110" fg:w="292330132"/><text x="41.1352%" y="223.50"></text></g><g><title>zend_hash_find_bucket{inlined} (549,357,362 cycles, 0.72%)</title><rect x="41.8293%" y="149" width="0.7240%" height="15" fill="rgb(217,163,10)" fg:x="31738351609" fg:w="549357362"/><text x="42.0793%" y="159.50"></text></g><g><title>zend_hash_find{php8.5} (563,961,181 cycles, 0.74%)</title><rect x="41.8293%" y="165" width="0.7433%" height="15" fill="rgb(213,25,53)" fg:x="31738351609" fg:w="563961181"/><text x="42.0793%" y="175.50"></text></g><g><title>zend_fetch_dimension_address_inner{inlined} (708,533,197 cycles, 0.93%)</title><rect x="41.7454%" y="197" width="0.9338%" height="15" fill="rgb(252,105,26)" fg:x="31674749200" fg:w="708533197"/><text x="41.9954%" y="207.50"></text></g><g><title>zend_hash_find_ex{inlined} (648,598,030 cycles, 0.85%)</title><rect x="41.8244%" y="181" width="0.8548%" height="15" fill="rgb(220,39,43)" fg:x="31734684367" fg:w="648598030"/><text x="42.0744%" y="191.50"></text></g><g><title>ZEND_FETCH_DIM_R_SPEC_TMPVAR_CV_HANDLER{php8.5} (1,119,668,716 cycles, 1.48%)</title><rect x="41.2705%" y="213" width="1.4757%" height="15" fill="rgb(229,68,48)" fg:x="31314397242" fg:w="1119668716"/><text x="41.5205%" y="223.50"></text></g><g><title>zend_fetch_dimension_address_inner{inlined} (265,685,467 cycles, 0.35%)</title><rect x="43.3092%" y="165" width="0.3502%" height="15" fill="rgb(252,8,32)" fg:x="32861273613" fg:w="265685467"/><text x="43.5592%" y="175.50"></text></g><g><title>zend_fetch_dimension_address_W{php8.5} (538,837,343 cycles, 0.71%)</title><rect x="42.9540%" y="197" width="0.7102%" height="15" fill="rgb(223,20,43)" fg:x="32591784794" fg:w="538837343"/><text x="43.2040%" y="207.50"></text></g><g><title>zend_fetch_dimension_address{inlined} (531,655,276 cycles, 0.70%)</title><rect x="42.9635%" y="181" width="0.7007%" height="15" fill="rgb(229,81,49)" fg:x="32598966861" fg:w="531655276"/><text x="43.2135%" y="191.50"></text></g><g><title>ZEND_FETCH_DIM_W_SPEC_CV_CONST_HANDLER{php8.5} (548,962,278 cycles, 0.72%)</title><rect x="42.9490%" y="213" width="0.7235%" height="15" fill="rgb(236,28,36)" fg:x="32587943800" fg:w="548962278"/><text x="43.1990%" y="223.50"></text></g><g><title>zend_fetch_dimension_address_inner{inlined} (172,976,528 cycles, 0.23%)</title><rect x="43.8794%" y="165" width="0.2280%" height="15" fill="rgb(249,185,26)" fg:x="33293891002" fg:w="172976528"/><text x="44.1294%" y="175.50"></text></g><g><title>zend_fetch_dimension_address_W{php8.5} (317,650,605 cycles, 0.42%)</title><rect x="43.7003%" y="197" width="0.4186%" height="15" fill="rgb(249,174,33)" fg:x="33158021935" fg:w="317650605"/><text x="43.9503%" y="207.50"></text></g><g><title>zend_fetch_dimension_address{inlined} (271,637,171 cycles, 0.36%)</title><rect x="43.7610%" y="181" width="0.3580%" height="15" fill="rgb(233,201,37)" fg:x="33204035369" fg:w="271637171"/><text x="44.0110%" y="191.50"></text></g><g><title>ZEND_FETCH_DIM_W_SPEC_VAR_CV_HANDLER{php8.5} (348,511,910 cycles, 0.46%)</title><rect x="43.6725%" y="213" width="0.4593%" height="15" fill="rgb(221,78,26)" fg:x="33136906078" fg:w="348511910"/><text x="43.9225%" y="223.50"></text></g><g><title>ZEND_FETCH_OBJ_IS_SPEC_CV_CONST_HANDLER{php8.5} (226,000,130 cycles, 0.30%)</title><rect x="44.1516%" y="213" width="0.2979%" height="15" fill="rgb(250,127,30)" fg:x="33500442960" fg:w="226000130"/><text x="44.4016%" y="223.50"></text></g><g><title>ZEND_FETCH_OBJ_IS_SPEC_UNUSED_CONST_HANDLER{php8.5} (901,849,637 cycles, 1.19%)</title><rect x="44.4495%" y="213" width="1.1886%" height="15" fill="rgb(230,49,44)" fg:x="33726443090" fg:w="901849637"/><text x="44.6995%" y="223.50"></text></g><g><title>ZEND_FETCH_OBJ_R_SPEC_CV_CONST_INLINE_HANDLER{inlined} (1,087,203,569 cycles, 1.43%)</title><rect x="45.6380%" y="213" width="1.4329%" height="15" fill="rgb(229,67,23)" fg:x="34628292727" fg:w="1087203569"/><text x="45.8880%" y="223.50"></text></g><g><title>ZEND_FETCH_OBJ_R_SPEC_UNUSED_CONST_INLINE_HANDLER{inlined} (3,795,139,806 cycles, 5.00%)</title><rect x="47.3189%" y="213" width="5.0018%" height="15" fill="rgb(249,83,47)" fg:x="35903648063" fg:w="3795139806"/><text x="47.5689%" y="223.50">ZEND_F..</text></g><g><title>zend_fetch_property_address{inlined} (462,566,412 cycles, 0.61%)</title><rect x="52.6427%" y="197" width="0.6096%" height="15" fill="rgb(215,43,3)" fg:x="39943133490" fg:w="462566412"/><text x="52.8927%" y="207.50"></text></g><g><title>ZEND_FETCH_OBJ_W_SPEC_UNUSED_CONST_HANDLER{php8.5} (683,530,084 cycles, 0.90%)</title><rect x="52.4136%" y="213" width="0.9009%" height="15" fill="rgb(238,154,13)" fg:x="39769312929" fg:w="683530084"/><text x="52.6636%" y="223.50"></text></g><g><title>ZEND_FE_FETCH_R_SPEC_VAR_HANDLER{inlined} (1,907,658,165 cycles, 2.51%)</title><rect x="53.4943%" y="213" width="2.5142%" height="15" fill="rgb(219,56,2)" fg:x="40589307664" fg:w="1907658165"/><text x="53.7443%" y="223.50">ZE..</text></g><g><title>ZEND_FE_FREE_SPEC_TMPVAR_HANDLER{inlined} (542,628,284 cycles, 0.72%)</title><rect x="56.0085%" y="213" width="0.7152%" height="15" fill="rgb(233,0,4)" fg:x="42496965829" fg:w="542628284"/><text x="56.2585%" y="223.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (164,870,889 cycles, 0.22%)</title><rect x="57.1306%" y="149" width="0.2173%" height="15" fill="rgb(235,30,7)" fg:x="43348405888" fg:w="164870889"/><text x="57.3806%" y="159.50"></text></g><g><title>zend_print_long_to_buf{inlined} (206,201,446 cycles, 0.27%)</title><rect x="57.5518%" y="133" width="0.2718%" height="15" fill="rgb(250,79,13)" fg:x="43667994418" fg:w="206201446"/><text x="57.8018%" y="143.50"></text></g><g><title>zend_print_ulong_to_buf{inlined} (206,201,446 cycles, 0.27%)</title><rect x="57.5518%" y="117" width="0.2718%" height="15" fill="rgb(211,146,34)" fg:x="43667994418" fg:w="206201446"/><text x="57.8018%" y="127.50"></text></g><g><title>zend_long_to_str{php8.5} (240,855,200 cycles, 0.32%)</title><rect x="57.5325%" y="149" width="0.3174%" height="15" fill="rgb(228,22,38)" fg:x="43653314137" fg:w="240855200"/><text x="57.7825%" y="159.50"></text></g><g><title>zval_get_string{inlined} (655,140,480 cycles, 0.86%)</title><rect x="57.1290%" y="165" width="0.8634%" height="15" fill="rgb(235,168,5)" fg:x="43347163788" fg:w="655140480"/><text x="57.3790%" y="175.50"></text></g><g><title>php_implode{php8.5} (713,039,483 cycles, 0.94%)</title><rect x="57.0609%" y="181" width="0.9397%" height="15" fill="rgb(221,155,16)" fg:x="43295490092" fg:w="713039483"/><text x="57.3109%" y="191.50"></text></g><g><title>ZEND_FRAMELESS_ICALL_2_SPEC_HANDLER{php8.5} (837,360,777 cycles, 1.10%)</title><rect x="56.9375%" y="213" width="1.1036%" height="15" fill="rgb(215,215,53)" fg:x="43201856998" fg:w="837360777"/><text x="57.1875%" y="223.50"></text></g><g><title>zflf_implode_2{php8.5} (780,033,856 cycles, 1.03%)</title><rect x="57.0130%" y="197" width="1.0280%" height="15" fill="rgb(223,4,10)" fg:x="43259183919" fg:w="780033856"/><text x="57.2630%" y="207.50"></text></g><g><title>ZEND_INIT_FCALL_SPEC_CONST_HANDLER{inlined} (313,253,757 cycles, 0.41%)</title><rect x="58.2055%" y="213" width="0.4128%" height="15" fill="rgb(234,103,6)" fg:x="44163944710" fg:w="313253757"/><text x="58.4555%" y="223.50"></text></g><g><title>ZEND_INIT_METHOD_CALL_SPEC_CV_CONST_HANDLER{inlined} (314,546,261 cycles, 0.41%)</title><rect x="58.6183%" y="213" width="0.4146%" height="15" fill="rgb(227,97,0)" fg:x="44477198467" fg:w="314546261"/><text x="58.8683%" y="223.50"></text></g><g><title>zend_vm_calc_used_stack{inlined} (183,678,349 cycles, 0.24%)</title><rect x="59.8517%" y="181" width="0.2421%" height="15" fill="rgb(234,150,53)" fg:x="45413006499" fg:w="183678349"/><text x="60.1017%" y="191.50"></text></g><g><title>zend_vm_stack_push_call_frame{inlined} (387,990,061 cycles, 0.51%)</title><rect x="59.8517%" y="197" width="0.5113%" height="15" fill="rgb(228,201,54)" fg:x="45413006499" fg:w="387990061"/><text x="60.1017%" y="207.50"></text></g><g><title>zend_vm_stack_push_call_frame_ex{inlined} (204,311,712 cycles, 0.27%)</title><rect x="60.0937%" y="181" width="0.2693%" height="15" fill="rgb(222,22,37)" fg:x="45596684848" fg:w="204311712"/><text x="60.3437%" y="191.50"></text></g><g><title>ZEND_INIT_METHOD_CALL_SPEC_TMPVAR_CONST_HANDLER{php8.5} (1,011,819,302 cycles, 1.33%)</title><rect x="59.0329%" y="213" width="1.3335%" height="15" fill="rgb(237,53,32)" fg:x="44791744728" fg:w="1011819302"/><text x="59.2829%" y="223.50"></text></g><g><title>zend_vm_calc_used_stack{inlined} (227,994,484 cycles, 0.30%)</title><rect x="62.1746%" y="181" width="0.3005%" height="15" fill="rgb(233,25,53)" fg:x="47175564484" fg:w="227994484"/><text x="62.4246%" y="191.50"></text></g><g><title>ZEND_INIT_METHOD_CALL_SPEC_UNUSED_CONST_HANDLER{inlined} (1,806,883,879 cycles, 2.38%)</title><rect x="60.3664%" y="213" width="2.3814%" height="15" fill="rgb(210,40,34)" fg:x="45803564030" fg:w="1806883879"/><text x="60.6164%" y="223.50">ZE..</text></g><g><title>zend_vm_stack_push_call_frame{inlined} (434,883,425 cycles, 0.57%)</title><rect x="62.1746%" y="197" width="0.5732%" height="15" fill="rgb(241,220,44)" fg:x="47175564484" fg:w="434883425"/><text x="62.4246%" y="207.50"></text></g><g><title>zend_vm_stack_push_call_frame_ex{inlined} (206,888,941 cycles, 0.27%)</title><rect x="62.4751%" y="181" width="0.2727%" height="15" fill="rgb(235,28,35)" fg:x="47403558968" fg:w="206888941"/><text x="62.7251%" y="191.50"></text></g><g><title>ZEND_INIT_STATIC_METHOD_CALL_SPEC_UNUSED_CONST_HANDLER{php8.5} (313,520,592 cycles, 0.41%)</title><rect x="62.7477%" y="213" width="0.4132%" height="15" fill="rgb(210,56,17)" fg:x="47610447909" fg:w="313520592"/><text x="62.9977%" y="223.50"></text></g><g><title>zend_hash_find_bucket{inlined} (339,339,934 cycles, 0.45%)</title><rect x="63.6449%" y="165" width="0.4472%" height="15" fill="rgb(224,130,29)" fg:x="48291147319" fg:w="339339934"/><text x="63.8949%" y="175.50"></text></g><g><title>zend_lookup_class_ex{php8.5} (539,524,984 cycles, 0.71%)</title><rect x="63.4053%" y="197" width="0.7111%" height="15" fill="rgb(235,212,8)" fg:x="48109367785" fg:w="539524984"/><text x="63.6553%" y="207.50"></text></g><g><title>zend_hash_find{php8.5} (357,745,450 cycles, 0.47%)</title><rect x="63.6449%" y="181" width="0.4715%" height="15" fill="rgb(223,33,50)" fg:x="48291147319" fg:w="357745450"/><text x="63.8949%" y="191.50"></text></g><g><title>ZEND_INSTANCEOF_SPEC_CV_CONST_HANDLER{php8.5} (732,208,136 cycles, 0.97%)</title><rect x="63.1610%" y="213" width="0.9650%" height="15" fill="rgb(219,149,13)" fg:x="47923968501" fg:w="732208136"/><text x="63.4110%" y="223.50"></text></g><g><title>zend_string_equal_val{php8.5} (185,054,434 cycles, 0.24%)</title><rect x="64.8533%" y="197" width="0.2439%" height="15" fill="rgb(250,156,29)" fg:x="49208047406" fg:w="185054434"/><text x="65.1033%" y="207.50"></text></g><g><title>ZEND_ISSET_ISEMPTY_DIM_OBJ_SPEC_CV_CONST_HANDLER{php8.5} (534,781,399 cycles, 0.70%)</title><rect x="64.4056%" y="213" width="0.7048%" height="15" fill="rgb(216,193,19)" fg:x="48868376157" fg:w="534781399"/><text x="64.6556%" y="223.50"></text></g><g><title>ZEND_ISSET_ISEMPTY_DIM_OBJ_SPEC_CV_CV_HANDLER{php8.5} (250,665,641 cycles, 0.33%)</title><rect x="65.1104%" y="213" width="0.3304%" height="15" fill="rgb(216,135,14)" fg:x="49403157556" fg:w="250665641"/><text x="65.3604%" y="223.50"></text></g><g><title>ZEND_ISSET_ISEMPTY_DIM_OBJ_SPEC_CV_TMPVAR_HANDLER{php8.5} (231,987,522 cycles, 0.31%)</title><rect x="65.4408%" y="213" width="0.3057%" height="15" fill="rgb(241,47,5)" fg:x="49653823197" fg:w="231987522"/><text x="65.6908%" y="223.50"></text></g><g><title>zend_hash_find_bucket{inlined} (871,122,562 cycles, 1.15%)</title><rect x="66.4506%" y="165" width="1.1481%" height="15" fill="rgb(233,42,35)" fg:x="50420056299" fg:w="871122562"/><text x="66.7006%" y="175.50"></text></g><g><title>zend_hash_find{php8.5} (960,391,458 cycles, 1.27%)</title><rect x="66.4161%" y="181" width="1.2657%" height="15" fill="rgb(231,13,6)" fg:x="50393808659" fg:w="960391458"/><text x="66.6661%" y="191.50"></text></g><g><title>zend_hash_find_ex{inlined} (1,066,567,684 cycles, 1.41%)</title><rect x="66.3967%" y="197" width="1.4057%" height="15" fill="rgb(207,181,40)" fg:x="50379114140" fg:w="1066567684"/><text x="66.6467%" y="207.50"></text></g><g><title>ZEND_ISSET_ISEMPTY_DIM_OBJ_SPEC_TMPVAR_CV_HANDLER{php8.5} (1,597,371,984 cycles, 2.11%)</title><rect x="65.8048%" y="213" width="2.1052%" height="15" fill="rgb(254,173,49)" fg:x="49930021817" fg:w="1597371984"/><text x="66.0548%" y="223.50">Z..</text></g><g><title>ZEND_JMPZ_SPEC_TMPVAR_HANDLER{inlined} (461,704,207 cycles, 0.61%)</title><rect x="68.4401%" y="213" width="0.6085%" height="15" fill="rgb(221,1,38)" fg:x="51929580391" fg:w="461704207"/><text x="68.6901%" y="223.50"></text></g><g><title>ZEND_PRE_INC_OBJ_SPEC_UNUSED_CONST_HANDLER{php8.5} (214,359,900 cycles, 0.28%)</title><rect x="69.2736%" y="213" width="0.2825%" height="15" fill="rgb(206,124,46)" fg:x="52562028466" fg:w="214359900"/><text x="69.5236%" y="223.50"></text></g><g><title>ZEND_RECV_INIT_SPEC_CONST_HANDLER{inlined} (183,038,969 cycles, 0.24%)</title><rect x="69.8891%" y="213" width="0.2412%" height="15" fill="rgb(249,21,11)" fg:x="53029013354" fg:w="183038969"/><text x="70.1391%" y="223.50"></text></g><g><title>ZEND_RECV_SPEC_UNUSED_HANDLER{inlined} (1,022,235,340 cycles, 1.35%)</title><rect x="70.1303%" y="213" width="1.3472%" height="15" fill="rgb(222,201,40)" fg:x="53212052323" fg:w="1022235340"/><text x="70.3803%" y="223.50"></text></g><g><title>ZEND_SEND_VAR_EX_SPEC_CV_UNUSED_QUICK_HANDLER{inlined} (381,389,660 cycles, 0.50%)</title><rect x="71.7729%" y="213" width="0.5026%" height="15" fill="rgb(235,61,29)" fg:x="54458403918" fg:w="381389660"/><text x="72.0229%" y="223.50"></text></g><g><title>ZEND_SEND_VAR_SPEC_CV_UNUSED_HANDLER{inlined} (224,779,926 cycles, 0.30%)</title><rect x="72.2756%" y="213" width="0.2962%" height="15" fill="rgb(219,207,3)" fg:x="54839793578" fg:w="224779926"/><text x="72.5256%" y="223.50"></text></g><g><title>ZEND_VERIFY_RETURN_TYPE_SPEC_CV_UNUSED_HANDLER{php8.5} (251,172,451 cycles, 0.33%)</title><rect x="72.8983%" y="213" width="0.3310%" height="15" fill="rgb(222,56,46)" fg:x="55312310427" fg:w="251172451"/><text x="73.1483%" y="223.50"></text></g><g><title>ZEND_VERIFY_RETURN_TYPE_SPEC_TMP_UNUSED_HANDLER{php8.5} (173,431,573 cycles, 0.23%)</title><rect x="73.2294%" y="213" width="0.2286%" height="15" fill="rgb(239,76,54)" fg:x="55563482878" fg:w="173431573"/><text x="73.4794%" y="223.50"></text></g><g><title>zend_check_type_slow{inlined} (167,796,934 cycles, 0.22%)</title><rect x="74.3048%" y="197" width="0.2211%" height="15" fill="rgb(231,124,27)" fg:x="56379454396" fg:w="167796934"/><text x="74.5548%" y="207.50"></text></g><g><title>ZEND_VERIFY_RETURN_TYPE_SPEC_VAR_UNUSED_HANDLER{php8.5} (825,604,084 cycles, 1.09%)</title><rect x="73.4579%" y="213" width="1.0881%" height="15" fill="rgb(249,195,6)" fg:x="55736914451" fg:w="825604084"/><text x="73.7079%" y="223.50"></text></g><g><title>_zend_handle_numeric_str_ex{php8.5} (163,091,022 cycles, 0.21%)</title><rect x="74.7684%" y="213" width="0.2149%" height="15" fill="rgb(237,174,47)" fg:x="56731204850" fg:w="163091022"/><text x="75.0184%" y="223.50"></text></g><g><title>zend_gc_addref{inlined} (763,762,526 cycles, 1.01%)</title><rect x="77.9202%" y="117" width="1.0066%" height="15" fill="rgb(206,201,31)" fg:x="59122686880" fg:w="763762526"/><text x="78.1702%" y="127.50"></text></g><g><title>gc_scan_black{inlined} (2,849,572,427 cycles, 3.76%)</title><rect x="75.3829%" y="133" width="3.7556%" height="15" fill="rgb(231,57,52)" fg:x="57197492787" fg:w="2849572427"/><text x="75.6329%" y="143.50">gc_s..</text></g><g><title>zval_gc_type{inlined} (160,615,808 cycles, 0.21%)</title><rect x="78.9268%" y="117" width="0.2117%" height="15" fill="rgb(248,177,22)" fg:x="59886449406" fg:w="160615808"/><text x="79.1768%" y="127.50"></text></g><g><title>gc_scan{php8.5} (2,866,655,762 cycles, 3.78%)</title><rect x="75.3653%" y="149" width="3.7781%" height="15" fill="rgb(215,211,37)" fg:x="57184158708" fg:w="2866655762"/><text x="75.6153%" y="159.50">gc_s..</text></g><g><title>gc_collect_roots{inlined} (3,103,673,319 cycles, 4.09%)</title><rect x="75.0891%" y="165" width="4.0905%" height="15" fill="rgb(241,128,51)" fg:x="56974547275" fg:w="3103673319"/><text x="75.3391%" y="175.50">gc_c..</text></g><g><title>zend_gc_delref{inlined} (897,572,915 cycles, 1.18%)</title><rect x="81.9205%" y="133" width="1.1829%" height="15" fill="rgb(227,165,31)" fg:x="62157929951" fg:w="897572915"/><text x="82.1705%" y="143.50"></text></g><g><title>gc_mark_roots{inlined} (3,105,456,187 cycles, 4.09%)</title><rect x="79.1795%" y="165" width="4.0928%" height="15" fill="rgb(228,167,24)" fg:x="60078220594" fg:w="3105456187"/><text x="79.4295%" y="175.50">gc_m..</text></g><g><title>gc_mark_grey{inlined} (2,990,175,411 cycles, 3.94%)</title><rect x="79.3315%" y="149" width="3.9409%" height="15" fill="rgb(228,143,12)" fg:x="60193501370" fg:w="2990175411"/><text x="79.5815%" y="159.50">gc_m..</text></g><g><title>zend_gc_collect_cycles{php8.5} (6,349,577,234 cycles, 8.37%)</title><rect x="75.0891%" y="181" width="8.3684%" height="15" fill="rgb(249,149,8)" fg:x="56974547275" fg:w="6349577234"/><text x="75.3391%" y="191.50">zend_gc_coll..</text></g><g><title>gc_possible_root_when_full{php8.5} (6,383,493,378 cycles, 8.41%)</title><rect x="75.0891%" y="213" width="8.4131%" height="15" fill="rgb(243,35,44)" fg:x="56974547275" fg:w="6383493378"/><text x="75.3391%" y="223.50">gc_possible_..</text></g><g><title>gc_adjust_threshold{inlined} (6,383,493,378 cycles, 8.41%)</title><rect x="75.0891%" y="197" width="8.4131%" height="15" fill="rgb(246,89,9)" fg:x="56974547275" fg:w="6383493378"/><text x="75.3391%" y="207.50">gc_adjust_th..</text></g><g><title>_efree{php8.5} (170,284,945 cycles, 0.22%)</title><rect x="84.0688%" y="197" width="0.2244%" height="15" fill="rgb(233,213,13)" fg:x="63788025376" fg:w="170284945"/><text x="84.3188%" y="207.50"></text></g><g><title>gc_remove_from_buffer{php8.5} (666,183,925 cycles, 0.88%)</title><rect x="84.3263%" y="197" width="0.8780%" height="15" fill="rgb(233,141,41)" fg:x="63983395617" fg:w="666183925"/><text x="84.5763%" y="207.50"></text></g><g><title>gc_remove_from_roots{inlined} (318,099,473 cycles, 0.42%)</title><rect x="84.7851%" y="181" width="0.4192%" height="15" fill="rgb(239,167,4)" fg:x="64331480069" fg:w="318099473"/><text x="85.0351%" y="191.50"></text></g><g><title>gc_link_unused{inlined} (318,099,473 cycles, 0.42%)</title><rect x="84.7851%" y="165" width="0.4192%" height="15" fill="rgb(209,217,16)" fg:x="64331480069" fg:w="318099473"/><text x="85.0351%" y="175.50"></text></g><g><title>zend_gc_addref{inlined} (242,985,126 cycles, 0.32%)</title><rect x="87.4675%" y="69" width="0.3202%" height="15" fill="rgb(219,88,35)" fg:x="66366798691" fg:w="242985126"/><text x="87.7175%" y="79.50"></text></g><g><title>gc_scan{php8.5} (1,066,623,095 cycles, 1.41%)</title><rect x="86.4558%" y="101" width="1.4057%" height="15" fill="rgb(220,193,23)" fg:x="65599143155" fg:w="1066623095"/><text x="86.7058%" y="111.50"></text></g><g><title>gc_scan_black{inlined} (1,066,623,095 cycles, 1.41%)</title><rect x="86.4558%" y="85" width="1.4057%" height="15" fill="rgb(230,90,52)" fg:x="65599143155" fg:w="1066623095"/><text x="86.7058%" y="95.50"></text></g><g><title>gc_collect_roots{inlined} (1,164,160,769 cycles, 1.53%)</title><rect x="86.3453%" y="117" width="1.5343%" height="15" fill="rgb(252,106,19)" fg:x="65515334521" fg:w="1164160769"/><text x="86.5953%" y="127.50"></text></g><g><title>zend_gc_delref{inlined} (347,737,156 cycles, 0.46%)</title><rect x="89.0102%" y="85" width="0.4583%" height="15" fill="rgb(206,74,20)" fg:x="67537355065" fg:w="347737156"/><text x="89.2602%" y="95.50"></text></g><g><title>gc_mark_roots{inlined} (1,266,294,424 cycles, 1.67%)</title><rect x="87.8796%" y="117" width="1.6689%" height="15" fill="rgb(230,138,44)" fg:x="66679495290" fg:w="1266294424"/><text x="88.1296%" y="127.50"></text></g><g><title>gc_mark_grey{inlined} (1,218,470,606 cycles, 1.61%)</title><rect x="87.9427%" y="101" width="1.6059%" height="15" fill="rgb(235,182,43)" fg:x="66727319108" fg:w="1218470606"/><text x="88.1927%" y="111.50"></text></g><g><title>zend_gc_collect_cycles{php8.5} (2,483,366,353 cycles, 3.27%)</title><rect x="86.3453%" y="133" width="3.2729%" height="15" fill="rgb(242,16,51)" fg:x="65515334521" fg:w="2483366353"/><text x="86.5953%" y="143.50">zen..</text></g><g><title>gc_check_possible_root{inlined} (2,716,473,210 cycles, 3.58%)</title><rect x="86.0579%" y="181" width="3.5802%" height="15" fill="rgb(248,9,4)" fg:x="65297277143" fg:w="2716473210"/><text x="86.3079%" y="191.50">gc_c..</text></g><g><title>gc_possible_root_when_full{php8.5} (2,498,415,832 cycles, 3.29%)</title><rect x="86.3453%" y="165" width="3.2928%" height="15" fill="rgb(210,31,22)" fg:x="65515334521" fg:w="2498415832"/><text x="86.5953%" y="175.50">gc_..</text></g><g><title>gc_adjust_threshold{inlined} (2,498,415,832 cycles, 3.29%)</title><rect x="86.3453%" y="149" width="3.2928%" height="15" fill="rgb(239,54,39)" fg:x="65515334521" fg:w="2498415832"/><text x="86.5953%" y="159.50">gc_..</text></g><g><title>i_zval_ptr_dtor{inlined} (3,443,029,496 cycles, 4.54%)</title><rect x="85.2043%" y="197" width="4.5377%" height="15" fill="rgb(230,99,41)" fg:x="64649579542" fg:w="3443029496"/><text x="85.4543%" y="207.50">i_zva..</text></g><g><title>i_zval_ptr_dtor{inlined} (679,025,435 cycles, 0.89%)</title><rect x="90.0305%" y="181" width="0.8949%" height="15" fill="rgb(253,106,12)" fg:x="68311468349" fg:w="679025435"/><text x="90.2805%" y="191.50"></text></g><g><title>zend_array_destroy{php8.5} (488,642,996 cycles, 0.64%)</title><rect x="90.2814%" y="165" width="0.6440%" height="15" fill="rgb(213,46,41)" fg:x="68501850788" fg:w="488642996"/><text x="90.5314%" y="175.50"></text></g><g><title>i_zval_ptr_dtor{inlined} (328,589,078 cycles, 0.43%)</title><rect x="90.4923%" y="149" width="0.4331%" height="15" fill="rgb(215,133,35)" fg:x="68661904706" fg:w="328589078"/><text x="90.7423%" y="159.50"></text></g><g><title>zend_array_destroy{php8.5} (904,986,259 cycles, 1.19%)</title><rect x="89.7521%" y="197" width="1.1927%" height="15" fill="rgb(213,28,5)" fg:x="68100278358" fg:w="904986259"/><text x="90.0021%" y="207.50"></text></g><g><title>i_free_compiled_variables{inlined} (5,623,296,175 cycles, 7.41%)</title><rect x="83.5352%" y="213" width="7.4112%" height="15" fill="rgb(215,77,49)" fg:x="63383134049" fg:w="5623296175"/><text x="83.7852%" y="223.50">i_free_com..</text></g><g><title>instanceof_function_slow{php8.5} (304,782,036 cycles, 0.40%)</title><rect x="90.9464%" y="213" width="0.4017%" height="15" fill="rgb(248,100,22)" fg:x="69006430224" fg:w="304782036"/><text x="91.1964%" y="223.50"></text></g><g><title>zend_hash_find_known_hash{php8.5} (3,598,644,674 cycles, 4.74%)</title><rect x="91.8753%" y="213" width="4.7428%" height="15" fill="rgb(208,67,9)" fg:x="69711247933" fg:w="3598644674"/><text x="92.1253%" y="223.50">zend_h..</text></g><g><title>zend_hash_find_bucket{inlined} (3,303,360,991 cycles, 4.35%)</title><rect x="92.2645%" y="197" width="4.3536%" height="15" fill="rgb(219,133,21)" fg:x="70006531616" fg:w="3303360991"/><text x="92.5145%" y="207.50">zend_..</text></g><g><title>zend_string_equal_content{inlined} (606,462,754 cycles, 0.80%)</title><rect x="95.8188%" y="181" width="0.7993%" height="15" fill="rgb(246,46,29)" fg:x="72703429853" fg:w="606462754"/><text x="96.0688%" y="191.50"></text></g><g><title>zend_hash_find{php8.5} (163,771,223 cycles, 0.22%)</title><rect x="96.6181%" y="213" width="0.2158%" height="15" fill="rgb(246,185,52)" fg:x="73309892607" fg:w="163771223"/><text x="96.8681%" y="223.50"></text></g><g><title>zend_object_release{inlined} (164,272,312 cycles, 0.22%)</title><rect x="97.0352%" y="213" width="0.2165%" height="15" fill="rgb(252,136,11)" fg:x="73626410463" fg:w="164272312"/><text x="97.2852%" y="223.50"></text></g><g><title>zend_verify_recv_arg_type_helper_SPEC{php8.5} (353,449,162 cycles, 0.47%)</title><rect x="97.3061%" y="213" width="0.4658%" height="15" fill="rgb(219,138,53)" fg:x="73831889236" fg:w="353449162"/><text x="97.5561%" y="223.50"></text></g><g><title>zend_verify_recv_arg_type{inlined} (305,366,250 cycles, 0.40%)</title><rect x="97.3694%" y="197" width="0.4025%" height="15" fill="rgb(211,51,23)" fg:x="73879972148" fg:w="305366250"/><text x="97.6194%" y="207.50"></text></g><g><title>zend_check_type{inlined} (305,366,250 cycles, 0.40%)</title><rect x="97.3694%" y="181" width="0.4025%" height="15" fill="rgb(247,221,28)" fg:x="73879972148" fg:w="305366250"/><text x="97.6194%" y="191.50"></text></g><g><title>zend_check_type_slow{inlined} (298,938,572 cycles, 0.39%)</title><rect x="97.3779%" y="165" width="0.3940%" height="15" fill="rgb(251,222,45)" fg:x="73886399826" fg:w="298938572"/><text x="97.6279%" y="175.50"></text></g><g><title>zend_fetch_ce_from_type{inlined} (177,665,209 cycles, 0.23%)</title><rect x="97.5377%" y="149" width="0.2342%" height="15" fill="rgb(217,162,53)" fg:x="74007673189" fg:w="177665209"/><text x="97.7877%" y="159.50"></text></g><g><title>execute_ex{php8.5} (66,824,804,365 cycles, 88.07%)</title><rect x="9.8744%" y="229" width="88.0711%" height="15" fill="rgb(229,93,14)" fg:x="7492262364" fg:w="66824804365"/><text x="10.1244%" y="239.50">execute_ex{php8.5}</text></g><g><title>gc_possible_root{php8.5} (305,682,084 cycles, 0.40%)</title><rect x="97.9455%" y="229" width="0.4029%" height="15" fill="rgb(209,67,49)" fg:x="74317066729" fg:w="305682084"/><text x="98.1955%" y="239.50"></text></g><g><title>zend_verify_recv_arg_type_helper_SPEC{php8.5} (356,535,849 cycles, 0.47%)</title><rect x="98.6201%" y="229" width="0.4699%" height="15" fill="rgb(213,87,29)" fg:x="74828923832" fg:w="356535849"/><text x="98.8701%" y="239.50"></text></g><g><title>zend_verify_recv_arg_type{inlined} (326,769,780 cycles, 0.43%)</title><rect x="98.6593%" y="213" width="0.4307%" height="15" fill="rgb(205,151,52)" fg:x="74858689901" fg:w="326769780"/><text x="98.9093%" y="223.50"></text></g><g><title>zif_spl_object_id{php8.5} (158,886,341 cycles, 0.21%)</title><rect x="99.5612%" y="229" width="0.2094%" height="15" fill="rgb(253,215,39)" fg:x="75542995935" fg:w="158886341"/><text x="99.8112%" y="239.50"></text></g><g><title>zend_fe_fetch_object_helper_SPEC{php8.5} (72,122,531,900 cycles, 95.05%)</title><rect x="4.7523%" y="261" width="95.0532%" height="15" fill="rgb(221,220,41)" fg:x="3605861002" fg:w="72122531900"/><text x="5.0023%" y="271.50">zend_fe_fetch_object_helper_SPEC{php8.5}</text></g><g><title>zend_generator_resume{php8.5} (71,984,868,220 cycles, 94.87%)</title><rect x="4.9337%" y="245" width="94.8718%" height="15" fill="rgb(218,133,21)" fg:x="3743524682" fg:w="71984868220"/><text x="5.1837%" y="255.50">zend_generator_resume{php8.5}</text></g><g><title>execute_ex{php8.5} (75,865,136,480 cycles, 99.99%)</title><rect x="0.0126%" y="277" width="99.9858%" height="15" fill="rgb(221,193,43)" fg:x="9573721" fg:w="75865136480"/><text x="0.2626%" y="287.50">execute_ex{php8.5}</text></g><g><title>all (75,875,946,046 cycles, 100%)</title><rect x="0.0000%" y="485" width="100.0000%" height="15" fill="rgb(240,128,52)" fg:x="0" fg:w="75875946046"/><text x="0.2500%" y="495.50"></text></g><g><title>php (75,875,946,046 cycles, 100.00%)</title><rect x="0.0000%" y="469" width="100.0000%" height="15" fill="rgb(253,114,12)" fg:x="0" fg:w="75875946046"/><text x="0.2500%" y="479.50">php</text></g><g><title>_start{php8.5} (75,866,372,325 cycles, 99.99%)</title><rect x="0.0126%" y="453" width="99.9874%" height="15" fill="rgb(215,223,47)" fg:x="9573721" fg:w="75866372325"/><text x="0.2626%" y="463.50">_start{php8.5}</text></g><g><title>__libc_start_main@@GLIBC_2.34{libc.so.6} (75,866,372,325 cycles, 99.99%)</title><rect x="0.0126%" y="437" width="99.9874%" height="15" fill="rgb(248,225,23)" fg:x="9573721" fg:w="75866372325"/><text x="0.2626%" y="447.50">__libc_start_main@@GLIBC_2.34{libc.so.6}</text></g><g><title>call_init{inlined} (75,866,372,325 cycles, 99.99%)</title><rect x="0.0126%" y="421" width="99.9874%" height="15" fill="rgb(250,108,0)" fg:x="9573721" fg:w="75866372325"/><text x="0.2626%" y="431.50">call_init{inlined}</text></g><g><title>__libc_start_call_main{libc.so.6} (75,866,372,325 cycles, 99.99%)</title><rect x="0.0126%" y="405" width="99.9874%" height="15" fill="rgb(228,208,7)" fg:x="9573721" fg:w="75866372325"/><text x="0.2626%" y="415.50">__libc_start_call_main{libc.so.6}</text></g><g><title>main{php8.5} (75,866,372,325 cycles, 99.99%)</title><rect x="0.0126%" y="389" width="99.9874%" height="15" fill="rgb(244,45,10)" fg:x="9573721" fg:w="75866372325"/><text x="0.2626%" y="399.50">main{php8.5}</text></g><g><title>do_cli{php8.5} (75,866,372,325 cycles, 99.99%)</title><rect x="0.0126%" y="373" width="99.9874%" height="15" fill="rgb(207,125,25)" fg:x="9573721" fg:w="75866372325"/><text x="0.2626%" y="383.50">do_cli{php8.5}</text></g><g><title>php_execute_script_ex{php8.5} (75,866,372,325 cycles, 99.99%)</title><rect x="0.0126%" y="357" width="99.9874%" height="15" fill="rgb(210,195,18)" fg:x="9573721" fg:w="75866372325"/><text x="0.2626%" y="367.50">php_execute_script_ex{php8.5}</text></g><g><title>zend_execute_script{php8.5} (75,866,372,325 cycles, 99.99%)</title><rect x="0.0126%" y="341" width="99.9874%" height="15" fill="rgb(249,80,12)" fg:x="9573721" fg:w="75866372325"/><text x="0.2626%" y="351.50">zend_execute_script{php8.5}</text></g><g><title>zend_execute{php8.5} (75,866,372,325 cycles, 99.99%)</title><rect x="0.0126%" y="325" width="99.9874%" height="15" fill="rgb(221,65,9)" fg:x="9573721" fg:w="75866372325"/><text x="0.2626%" y="335.50">zend_execute{php8.5}</text></g><g><title>zend_vm_stack_free_call_frame{inlined} (75,866,372,325 cycles, 99.99%)</title><rect x="0.0126%" y="309" width="99.9874%" height="15" fill="rgb(235,49,36)" fg:x="9573721" fg:w="75866372325"/><text x="0.2626%" y="319.50">zend_vm_stack_free_call_frame{inlined}</text></g><g><title>zend_vm_stack_free_call_frame_ex{inlined} (75,866,372,325 cycles, 99.99%)</title><rect x="0.0126%" y="293" width="99.9874%" height="15" fill="rgb(225,32,20)" fg:x="9573721" fg:w="75866372325"/><text x="0.2626%" y="303.50">zend_vm_stack_free_call_frame_ex{inlined}</text></g></svg></svg>

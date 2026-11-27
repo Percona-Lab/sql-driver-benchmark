@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="1270" onload="init(evt)" viewBox="0 0 1200 1270" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="1270" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">java-jdbctemplate/T4-mix-text-default-0.folded (Percona, default; sampled CPU cycles)</text><text id="details" fill="rgb(0,0,0)" x="10" y="1253.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="1253.00"> </text><svg id="frames" x="10" width="1180" total_samples="2788044416"><g><title>Matcher::find_shared(Node*){libjvm.so} (5,619,671 cycles, 0.20%)</title><rect x="0.1242%" y="1013" width="0.2016%" height="15" fill="rgb(227,0,7)" fg:x="3462072" fg:w="5619671"/><text x="0.3742%" y="1023.50"></text></g><g><title>Matcher::Label_Root(Node const*, State*, Node*, Node*&amp;){libjvm.so} (6,500,247 cycles, 0.23%)</title><rect x="0.6366%" y="981" width="0.2331%" height="15" fill="rgb(217,0,24)" fg:x="17749164" fg:w="6500247"/><text x="0.8866%" y="991.50"></text></g><g><title>Matcher::match(){libjvm.so} (24,489,034 cycles, 0.88%)</title><rect x="0.0842%" y="1029" width="0.8784%" height="15" fill="rgb(221,193,54)" fg:x="2347071" fg:w="24489034"/><text x="0.3342%" y="1039.50"></text></g><g><title>Matcher::xform(Node*, int){libjvm.so} (15,184,600 cycles, 0.54%)</title><rect x="0.4179%" y="1013" width="0.5446%" height="15" fill="rgb(248,212,6)" fg:x="11651505" fg:w="15184600"/><text x="0.6679%" y="1023.50"></text></g><g><title>Matcher::match_tree(Node const*){libjvm.so} (11,440,284 cycles, 0.41%)</title><rect x="0.5522%" y="997" width="0.4103%" height="15" fill="rgb(208,68,35)" fg:x="15395821" fg:w="11440284"/><text x="0.8022%" y="1007.50"></text></g><g><title>PhaseCFG::schedule_late(VectorSet&amp;, Node_Stack&amp;){libjvm.so} (9,156,086 cycles, 0.33%)</title><rect x="1.0850%" y="997" width="0.3284%" height="15" fill="rgb(232,128,0)" fg:x="30250942" fg:w="9156086"/><text x="1.3350%" y="1007.50"></text></g><g><title>PhaseCFG::schedule_local(Block*, GrowableArray&lt;int&gt;&amp;, VectorSet&amp;, long*){libjvm.so} (8,972,822 cycles, 0.32%)</title><rect x="1.4134%" y="997" width="0.3218%" height="15" fill="rgb(207,160,47)" fg:x="39407028" fg:w="8972822"/><text x="1.6634%" y="1007.50"></text></g><g><title>PhaseCFG::do_global_code_motion(){libjvm.so} (27,176,931 cycles, 0.97%)</title><rect x="1.0471%" y="1029" width="0.9748%" height="15" fill="rgb(228,23,34)" fg:x="29194393" fg:w="27176931"/><text x="1.2971%" y="1039.50"></text></g><g><title>PhaseCFG::global_code_motion(){libjvm.so} (27,176,931 cycles, 0.97%)</title><rect x="1.0471%" y="1013" width="0.9748%" height="15" fill="rgb(218,30,26)" fg:x="29194393" fg:w="27176931"/><text x="1.2971%" y="1023.50"></text></g><g><title>PhaseAggressiveCoalesce::insert_copies(Matcher&amp;){libjvm.so} (5,853,619 cycles, 0.21%)</title><rect x="2.1515%" y="1013" width="0.2100%" height="15" fill="rgb(220,122,19)" fg:x="59983607" fg:w="5853619"/><text x="2.4015%" y="1023.50"></text></g><g><title>PhaseChaitin::Select(){libjvm.so} (6,017,681 cycles, 0.22%)</title><rect x="2.3614%" y="1013" width="0.2158%" height="15" fill="rgb(250,228,42)" fg:x="65837226" fg:w="6017681"/><text x="2.6114%" y="1023.50"></text></g><g><title>PhaseChaitin::Split(unsigned int, ResourceArea*){libjvm.so} (15,531,538 cycles, 0.56%)</title><rect x="2.7461%" y="1013" width="0.5571%" height="15" fill="rgb(240,193,28)" fg:x="76561786" fg:w="15531538"/><text x="2.9961%" y="1023.50"></text></g><g><title>PhaseChaitin::interfere_with_live(unsigned int, IndexSet*) [clone .part.0]{libjvm.so} (13,129,890 cycles, 0.47%)</title><rect x="3.9630%" y="997" width="0.4709%" height="15" fill="rgb(216,20,37)" fg:x="110489272" fg:w="13129890"/><text x="4.2130%" y="1007.50"></text></g><g><title>PhaseChaitin::build_ifg_physical(ResourceArea*){libjvm.so} (32,762,335 cycles, 1.18%)</title><rect x="3.3032%" y="1013" width="1.1751%" height="15" fill="rgb(206,188,39)" fg:x="92093324" fg:w="32762335"/><text x="3.5532%" y="1023.50"></text></g><g><title>PhaseChaitin::gather_lrg_masks(bool) [clone .constprop.0]{libjvm.so} (10,474,166 cycles, 0.38%)</title><rect x="4.7677%" y="1013" width="0.3757%" height="15" fill="rgb(217,207,13)" fg:x="132926758" fg:w="10474166"/><text x="5.0177%" y="1023.50"></text></g><g><title>PhaseChaitin::post_allocate_copy_removal(){libjvm.so} (25,551,849 cycles, 0.92%)</title><rect x="5.3073%" y="1013" width="0.9165%" height="15" fill="rgb(231,73,38)" fg:x="147969073" fg:w="25551849"/><text x="5.5573%" y="1023.50"></text></g><g><title>PhaseChaitin::elide_copy(Node*, int, Block*, Node_List*, Node_List*, bool){libjvm.so} (20,998,644 cycles, 0.75%)</title><rect x="5.4706%" y="997" width="0.7532%" height="15" fill="rgb(225,20,46)" fg:x="152522278" fg:w="20998644"/><text x="5.7206%" y="1007.50"></text></g><g><title>PhaseIFG::Compute_Effective_Degree(){libjvm.so} (7,170,450 cycles, 0.26%)</title><rect x="6.3030%" y="1013" width="0.2572%" height="15" fill="rgb(210,31,41)" fg:x="175730407" fg:w="7170450"/><text x="6.5530%" y="1023.50"></text></g><g><title>PhaseLive::compute(unsigned int){libjvm.so} (9,498,179 cycles, 0.34%)</title><rect x="6.6404%" y="1013" width="0.3407%" height="15" fill="rgb(221,200,47)" fg:x="185136563" fg:w="9498179"/><text x="6.8904%" y="1023.50"></text></g><g><title>PhaseChaitin::Register_Allocate(){libjvm.so} (145,294,173 cycles, 5.21%)</title><rect x="2.0219%" y="1029" width="5.2113%" height="15" fill="rgb(226,26,5)" fg:x="56371324" fg:w="145294173"/><text x="2.2719%" y="1039.50">PhaseC..</text></g><g><title>PhaseOutput::BuildOopMaps(){libjvm.so} (5,984,117 cycles, 0.21%)</title><rect x="7.2808%" y="1013" width="0.2146%" height="15" fill="rgb(249,33,26)" fg:x="202991338" fg:w="5984117"/><text x="7.5308%" y="1023.50"></text></g><g><title>PhaseOutput::fill_buffer(C2_MacroAssembler*, unsigned int*){libjvm.so} (6,633,849 cycles, 0.24%)</title><rect x="7.4954%" y="1013" width="0.2379%" height="15" fill="rgb(235,183,28)" fg:x="208975455" fg:w="6633849"/><text x="7.7454%" y="1023.50"></text></g><g><title>PhaseOutput::Output(){libjvm.so} (17,715,124 cycles, 0.64%)</title><rect x="7.2332%" y="1029" width="0.6354%" height="15" fill="rgb(221,5,38)" fg:x="201665497" fg:w="17715124"/><text x="7.4832%" y="1039.50"></text></g><g><title>Compile::Code_Gen(){libjvm.so} (218,285,722 cycles, 7.83%)</title><rect x="0.0842%" y="1045" width="7.8293%" height="15" fill="rgb(247,18,42)" fg:x="2347071" fg:w="218285722"/><text x="0.3342%" y="1055.50">Compile::Co..</text></g><g><title>PhaseIdealLoop::build_loop_late_post_work(Node*, bool){libjvm.so} (8,087,592 cycles, 0.29%)</title><rect x="9.0017%" y="981" width="0.2901%" height="15" fill="rgb(241,131,45)" fg:x="250972425" fg:w="8087592"/><text x="9.2517%" y="991.50"></text></g><g><title>PhaseIdealLoop::build_loop_late(VectorSet&amp;, Node_List&amp;, Node_Stack&amp;){libjvm.so} (17,234,134 cycles, 0.62%)</title><rect x="8.7165%" y="997" width="0.6181%" height="15" fill="rgb(249,31,29)" fg:x="243019689" fg:w="17234134"/><text x="8.9665%" y="1007.50"></text></g><g><title>PhaseIdealLoop::split_if_with_blocks(VectorSet&amp;, Node_Stack&amp;){libjvm.so} (5,848,408 cycles, 0.21%)</title><rect x="9.3710%" y="997" width="0.2098%" height="15" fill="rgb(225,111,53)" fg:x="261266889" fg:w="5848408"/><text x="9.6210%" y="1007.50"></text></g><g><title>PhaseIdealLoop::build_and_optimize(){libjvm.so} (41,694,961 cycles, 1.50%)</title><rect x="8.1311%" y="1013" width="1.4955%" height="15" fill="rgb(238,160,17)" fg:x="226698839" fg:w="41694961"/><text x="8.3811%" y="1023.50"></text></g><g><title>Compile::optimize_loops(PhaseIterGVN&amp;, LoopOptsMode){libjvm.so} (48,759,074 cycles, 1.75%)</title><rect x="8.1311%" y="1029" width="1.7489%" height="15" fill="rgb(214,148,48)" fg:x="226698839" fg:w="48759074"/><text x="8.3811%" y="1039.50"></text></g><g><title>PhaseIterGVN::optimize(){libjvm.so} (7,064,113 cycles, 0.25%)</title><rect x="9.6266%" y="1013" width="0.2534%" height="15" fill="rgb(232,36,49)" fg:x="268393800" fg:w="7064113"/><text x="9.8766%" y="1023.50"></text></g><g><title>PhaseIterGVN::transform_old(Node*){libjvm.so} (5,801,105 cycles, 0.21%)</title><rect x="9.6719%" y="997" width="0.2081%" height="15" fill="rgb(209,103,24)" fg:x="269656808" fg:w="5801105"/><text x="9.9219%" y="1007.50"></text></g><g><title>Compile::process_for_post_loop_opts_igvn(PhaseIterGVN&amp;){libjvm.so} (7,531,690 cycles, 0.27%)</title><rect x="9.9258%" y="1029" width="0.2701%" height="15" fill="rgb(229,88,8)" fg:x="276736402" fg:w="7531690"/><text x="10.1758%" y="1039.50"></text></g><g><title>PhaseIterGVN::optimize(){libjvm.so} (7,531,690 cycles, 0.27%)</title><rect x="9.9258%" y="1013" width="0.2701%" height="15" fill="rgb(213,181,19)" fg:x="276736402" fg:w="7531690"/><text x="10.1758%" y="1023.50"></text></g><g><title>PhaseCCP::push_more_uses(Unique_Node_List&amp;, Node*, Node const*) const{libjvm.so} (8,123,890 cycles, 0.29%)</title><rect x="10.3976%" y="1013" width="0.2914%" height="15" fill="rgb(254,191,54)" fg:x="289889252" fg:w="8123890"/><text x="10.6476%" y="1023.50"></text></g><g><title>PhaseCCP::analyze(){libjvm.so} (12,690,128 cycles, 0.46%)</title><rect x="10.2768%" y="1029" width="0.4552%" height="15" fill="rgb(241,83,37)" fg:x="286521091" fg:w="12690128"/><text x="10.5268%" y="1039.50"></text></g><g><title>PhaseIdealLoop::build_loop_late(VectorSet&amp;, Node_List&amp;, Node_Stack&amp;){libjvm.so} (11,510,932 cycles, 0.41%)</title><rect x="11.3909%" y="997" width="0.4129%" height="15" fill="rgb(233,36,39)" fg:x="317584301" fg:w="11510932"/><text x="11.6409%" y="1007.50"></text></g><g><title>PhaseIdealLoop::build_loop_late_post_work(Node*, bool){libjvm.so} (7,954,540 cycles, 0.29%)</title><rect x="11.5185%" y="981" width="0.2853%" height="15" fill="rgb(226,3,54)" fg:x="321140693" fg:w="7954540"/><text x="11.7685%" y="991.50"></text></g><g><title>PhaseIdealLoop::build_and_optimize(){libjvm.so} (32,678,341 cycles, 1.17%)</title><rect x="10.8108%" y="1013" width="1.1721%" height="15" fill="rgb(245,192,40)" fg:x="301408948" fg:w="32678341"/><text x="11.0608%" y="1023.50"></text></g><g><title>PhaseIterGVN::transform_old(Node*){libjvm.so} (18,503,542 cycles, 0.66%)</title><rect x="11.9829%" y="997" width="0.6637%" height="15" fill="rgb(238,167,29)" fg:x="334087289" fg:w="18503542"/><text x="12.2329%" y="1007.50"></text></g><g><title>PhaseIdealLoop::optimize(PhaseIterGVN&amp;, LoopOptsMode){libjvm.so} (52,377,287 cycles, 1.88%)</title><rect x="10.8108%" y="1029" width="1.8786%" height="15" fill="rgb(232,182,51)" fg:x="301408948" fg:w="52377287"/><text x="11.0608%" y="1039.50">P..</text></g><g><title>PhaseIterGVN::optimize(){libjvm.so} (19,698,946 cycles, 0.71%)</title><rect x="11.9829%" y="1013" width="0.7066%" height="15" fill="rgb(231,60,39)" fg:x="334087289" fg:w="19698946"/><text x="12.2329%" y="1023.50"></text></g><g><title>PhaseIterGVN::transform_old(Node*){libjvm.so} (16,081,673 cycles, 0.58%)</title><rect x="12.6894%" y="1013" width="0.5768%" height="15" fill="rgb(208,69,12)" fg:x="353786235" fg:w="16081673"/><text x="12.9394%" y="1023.50"></text></g><g><title>PhaseIterGVN::optimize(){libjvm.so} (18,318,270 cycles, 0.66%)</title><rect x="12.6894%" y="1029" width="0.6570%" height="15" fill="rgb(235,93,37)" fg:x="353786235" fg:w="18318270"/><text x="12.9394%" y="1039.50"></text></g><g><title>Compile::Optimize(){libjvm.so} (156,276,266 cycles, 5.61%)</title><rect x="7.9135%" y="1045" width="5.6052%" height="15" fill="rgb(213,116,39)" fg:x="220632793" fg:w="156276266"/><text x="8.1635%" y="1055.50">Compile..</text></g><g><title>Parse::do_call(){libjvm.so} (6,317,476 cycles, 0.23%)</title><rect x="13.7589%" y="821" width="0.2266%" height="15" fill="rgb(222,207,29)" fg:x="383605636" fg:w="6317476"/><text x="14.0089%" y="831.50"></text></g><g><title>ParseGenerator::generate(JVMState*){libjvm.so} (9,199,949 cycles, 0.33%)</title><rect x="13.7186%" y="885" width="0.3300%" height="15" fill="rgb(206,96,30)" fg:x="382480378" fg:w="9199949"/><text x="13.9686%" y="895.50"></text></g><g><title>Parse::Parse(JVMState*, ciMethod*, float){libjvm.so} (9,199,949 cycles, 0.33%)</title><rect x="13.7186%" y="869" width="0.3300%" height="15" fill="rgb(218,138,4)" fg:x="382480378" fg:w="9199949"/><text x="13.9686%" y="879.50"></text></g><g><title>Parse::do_all_blocks(){libjvm.so} (9,199,949 cycles, 0.33%)</title><rect x="13.7186%" y="853" width="0.3300%" height="15" fill="rgb(250,191,14)" fg:x="382480378" fg:w="9199949"/><text x="13.9686%" y="863.50"></text></g><g><title>Parse::do_one_block(){libjvm.so} (9,199,949 cycles, 0.33%)</title><rect x="13.7186%" y="837" width="0.3300%" height="15" fill="rgb(239,60,40)" fg:x="382480378" fg:w="9199949"/><text x="13.9686%" y="847.50"></text></g><g><title>Parse::do_call(){libjvm.so} (11,473,067 cycles, 0.41%)</title><rect x="13.7186%" y="901" width="0.4115%" height="15" fill="rgb(206,27,48)" fg:x="382480378" fg:w="11473067"/><text x="13.9686%" y="911.50"></text></g><g><title>ParseGenerator::generate(JVMState*){libjvm.so} (13,763,138 cycles, 0.49%)</title><rect x="13.7186%" y="965" width="0.4936%" height="15" fill="rgb(225,35,8)" fg:x="382480378" fg:w="13763138"/><text x="13.9686%" y="975.50"></text></g><g><title>Parse::Parse(JVMState*, ciMethod*, float){libjvm.so} (13,763,138 cycles, 0.49%)</title><rect x="13.7186%" y="949" width="0.4936%" height="15" fill="rgb(250,213,24)" fg:x="382480378" fg:w="13763138"/><text x="13.9686%" y="959.50"></text></g><g><title>Parse::do_all_blocks(){libjvm.so} (13,763,138 cycles, 0.49%)</title><rect x="13.7186%" y="933" width="0.4936%" height="15" fill="rgb(247,123,22)" fg:x="382480378" fg:w="13763138"/><text x="13.9686%" y="943.50"></text></g><g><title>Parse::do_one_block(){libjvm.so} (13,763,138 cycles, 0.49%)</title><rect x="13.7186%" y="917" width="0.4936%" height="15" fill="rgb(231,138,38)" fg:x="382480378" fg:w="13763138"/><text x="13.9686%" y="927.50"></text></g><g><title>ParseGenerator::generate(JVMState*){libjvm.so} (27,479,012 cycles, 0.99%)</title><rect x="13.5538%" y="1045" width="0.9856%" height="15" fill="rgb(231,145,46)" fg:x="377887175" fg:w="27479012"/><text x="13.8038%" y="1055.50"></text></g><g><title>Parse::Parse(JVMState*, ciMethod*, float){libjvm.so} (27,479,012 cycles, 0.99%)</title><rect x="13.5538%" y="1029" width="0.9856%" height="15" fill="rgb(251,118,11)" fg:x="377887175" fg:w="27479012"/><text x="13.8038%" y="1039.50"></text></g><g><title>Parse::do_all_blocks(){libjvm.so} (27,479,012 cycles, 0.99%)</title><rect x="13.5538%" y="1013" width="0.9856%" height="15" fill="rgb(217,147,25)" fg:x="377887175" fg:w="27479012"/><text x="13.8038%" y="1023.50"></text></g><g><title>Parse::do_one_block(){libjvm.so} (27,479,012 cycles, 0.99%)</title><rect x="13.5538%" y="997" width="0.9856%" height="15" fill="rgb(247,81,37)" fg:x="377887175" fg:w="27479012"/><text x="13.8038%" y="1007.50"></text></g><g><title>Parse::do_call(){libjvm.so} (27,479,012 cycles, 0.99%)</title><rect x="13.5538%" y="981" width="0.9856%" height="15" fill="rgb(209,12,38)" fg:x="377887175" fg:w="27479012"/><text x="13.8038%" y="991.50"></text></g><g><title>PredictedCallGenerator::generate(JVMState*){libjvm.so} (9,122,671 cycles, 0.33%)</title><rect x="14.2122%" y="965" width="0.3272%" height="15" fill="rgb(227,1,9)" fg:x="396243516" fg:w="9122671"/><text x="14.4622%" y="975.50"></text></g><g><title>PredictedCallGenerator::generate(JVMState*){libjvm.so} (9,122,671 cycles, 0.33%)</title><rect x="14.2122%" y="949" width="0.3272%" height="15" fill="rgb(248,47,43)" fg:x="396243516" fg:w="9122671"/><text x="14.4622%" y="959.50"></text></g><g><title>ParseGenerator::generate(JVMState*){libjvm.so} (9,122,671 cycles, 0.33%)</title><rect x="14.2122%" y="933" width="0.3272%" height="15" fill="rgb(221,10,30)" fg:x="396243516" fg:w="9122671"/><text x="14.4622%" y="943.50"></text></g><g><title>Parse::Parse(JVMState*, ciMethod*, float){libjvm.so} (9,122,671 cycles, 0.33%)</title><rect x="14.2122%" y="917" width="0.3272%" height="15" fill="rgb(210,229,1)" fg:x="396243516" fg:w="9122671"/><text x="14.4622%" y="927.50"></text></g><g><title>Parse::do_all_blocks(){libjvm.so} (9,122,671 cycles, 0.33%)</title><rect x="14.2122%" y="901" width="0.3272%" height="15" fill="rgb(222,148,37)" fg:x="396243516" fg:w="9122671"/><text x="14.4622%" y="911.50"></text></g><g><title>Parse::do_one_block(){libjvm.so} (9,122,671 cycles, 0.33%)</title><rect x="14.2122%" y="885" width="0.3272%" height="15" fill="rgb(234,67,33)" fg:x="396243516" fg:w="9122671"/><text x="14.4622%" y="895.50"></text></g><g><title>Parse::do_call(){libjvm.so} (9,122,671 cycles, 0.33%)</title><rect x="14.2122%" y="869" width="0.3272%" height="15" fill="rgb(247,98,35)" fg:x="396243516" fg:w="9122671"/><text x="14.4622%" y="879.50"></text></g><g><title>PredictedCallGenerator::generate(JVMState*){libjvm.so} (5,955,096 cycles, 0.21%)</title><rect x="14.3259%" y="853" width="0.2136%" height="15" fill="rgb(247,138,52)" fg:x="399411091" fg:w="5955096"/><text x="14.5759%" y="863.50"></text></g><g><title>C2Compiler::compile_method(ciEnv*, ciMethod*, int, bool, DirectiveSet*){libjvm.so} (405,056,924 cycles, 14.53%)</title><rect x="0.0842%" y="1077" width="14.5284%" height="15" fill="rgb(213,79,30)" fg:x="2347071" fg:w="405056924"/><text x="0.3342%" y="1087.50">C2Compiler::compile_me..</text></g><g><title>Compile::Compile(ciEnv*, ciMethod*, int, Options, DirectiveSet*){libjvm.so} (405,056,924 cycles, 14.53%)</title><rect x="0.0842%" y="1061" width="14.5284%" height="15" fill="rgb(246,177,23)" fg:x="2347071" fg:w="405056924"/><text x="0.3342%" y="1071.50">Compile::Compile(ciEnv..</text></g><g><title>C2_CompilerThre (407,335,547 cycles, 14.61%)</title><rect x="0.0842%" y="1205" width="14.6101%" height="15" fill="rgb(230,62,27)" fg:x="2347071" fg:w="407335547"/><text x="0.3342%" y="1215.50">C2_CompilerThre</text></g><g><title>__GI___clone3{libc.so.6} (407,335,547 cycles, 14.61%)</title><rect x="0.0842%" y="1189" width="14.6101%" height="15" fill="rgb(216,154,8)" fg:x="2347071" fg:w="407335547"/><text x="0.3342%" y="1199.50">__GI___clone3{libc.so...</text></g><g><title>start_thread{libc.so.6} (407,335,547 cycles, 14.61%)</title><rect x="0.0842%" y="1173" width="14.6101%" height="15" fill="rgb(244,35,45)" fg:x="2347071" fg:w="407335547"/><text x="0.3342%" y="1183.50">start_thread{libc.so.6}</text></g><g><title>thread_native_entry(Thread*){libjvm.so} (407,335,547 cycles, 14.61%)</title><rect x="0.0842%" y="1157" width="14.6101%" height="15" fill="rgb(251,115,12)" fg:x="2347071" fg:w="407335547"/><text x="0.3342%" y="1167.50">thread_native_entry(Th..</text></g><g><title>Thread::call_run(){libjvm.so} (407,335,547 cycles, 14.61%)</title><rect x="0.0842%" y="1141" width="14.6101%" height="15" fill="rgb(240,54,50)" fg:x="2347071" fg:w="407335547"/><text x="0.3342%" y="1151.50">Thread::call_run(){lib..</text></g><g><title>JavaThread::thread_main_inner(){libjvm.so} (407,335,547 cycles, 14.61%)</title><rect x="0.0842%" y="1125" width="14.6101%" height="15" fill="rgb(233,84,52)" fg:x="2347071" fg:w="407335547"/><text x="0.3342%" y="1135.50">JavaThread::thread_mai..</text></g><g><title>CompileBroker::compiler_thread_loop(){libjvm.so} (407,335,547 cycles, 14.61%)</title><rect x="0.0842%" y="1109" width="14.6101%" height="15" fill="rgb(207,117,47)" fg:x="2347071" fg:w="407335547"/><text x="0.3342%" y="1119.50">CompileBroker::compile..</text></g><g><title>CompileBroker::invoke_compiler_on_method(CompileTask*){libjvm.so} (407,335,547 cycles, 14.61%)</title><rect x="0.0842%" y="1093" width="14.6101%" height="15" fill="rgb(249,43,39)" fg:x="2347071" fg:w="407335547"/><text x="0.3342%" y="1103.50">CompileBroker::invoke_..</text></g><g><title>CardTableRS::non_clean_card_iterate(TenuredGeneration*, MemRegion, OldGenScanClosure*){libjvm.so} (6,057,525 cycles, 0.22%)</title><rect x="14.6970%" y="981" width="0.2173%" height="15" fill="rgb(209,38,44)" fg:x="409757605" fg:w="6057525"/><text x="14.9470%" y="991.50"></text></g><g><title>CardTableRS::scan_old_to_young_refs(TenuredGeneration*, HeapWordImpl**){libjvm.so} (7,267,098 cycles, 0.26%)</title><rect x="14.6970%" y="997" width="0.2607%" height="15" fill="rgb(236,212,23)" fg:x="409757605" fg:w="7267098"/><text x="14.9470%" y="1007.50"></text></g><g><title>DefNewGeneration::copy_to_survivor_space(oopDesc*){libjvm.so} (6,043,557 cycles, 0.22%)</title><rect x="16.8571%" y="981" width="0.2168%" height="15" fill="rgb(242,79,21)" fg:x="469982649" fg:w="6043557"/><text x="17.1071%" y="991.50"></text></g><g><title>DefNewGeneration::copy_to_survivor_space(oopDesc*){libjvm.so} (8,964,872 cycles, 0.32%)</title><rect x="17.2749%" y="965" width="0.3215%" height="15" fill="rgb(211,96,35)" fg:x="481631341" fg:w="8964872"/><text x="17.5249%" y="975.50"></text></g><g><title>void OopOopIterateDispatch&lt;OldGenScanClosure&gt;::Table::oop_oop_iterate&lt;InstanceKlass, narrowOop&gt;(OldGenScanClosure*, oopDesc*, Klass*){libjvm.so} (15,801,357 cycles, 0.57%)</title><rect x="17.0738%" y="981" width="0.5668%" height="15" fill="rgb(253,215,40)" fg:x="476026206" fg:w="15801357"/><text x="17.3238%" y="991.50"></text></g><g><title>void OopOopIterateDispatch&lt;OldGenScanClosure&gt;::Table::oop_oop_iterate&lt;ObjArrayKlass, narrowOop&gt;(OldGenScanClosure*, oopDesc*, Klass*){libjvm.so} (28,043,096 cycles, 1.01%)</title><rect x="17.6406%" y="981" width="1.0058%" height="15" fill="rgb(211,81,21)" fg:x="491827563" fg:w="28043096"/><text x="17.8906%" y="991.50"></text></g><g><title>DefNewGeneration::copy_to_survivor_space(oopDesc*){libjvm.so} (22,024,862 cycles, 0.79%)</title><rect x="17.8565%" y="965" width="0.7900%" height="15" fill="rgb(208,190,38)" fg:x="497845797" fg:w="22024862"/><text x="18.1065%" y="975.50"></text></g><g><title>DefNewGeneration::copy_to_survivor_space(oopDesc*){libjvm.so} (46,922,745 cycles, 1.68%)</title><rect x="20.3860%" y="965" width="1.6830%" height="15" fill="rgb(235,213,38)" fg:x="568370078" fg:w="46922745"/><text x="20.6360%" y="975.50"></text></g><g><title>handle_mm_fault{kernel} (14,326,532 cycles, 0.51%)</title><rect x="22.7737%" y="901" width="0.5139%" height="15" fill="rgb(237,122,38)" fg:x="634941643" fg:w="14326532"/><text x="23.0237%" y="911.50"></text></g><g><title>__handle_mm_fault{kernel} (14,326,532 cycles, 0.51%)</title><rect x="22.7737%" y="885" width="0.5139%" height="15" fill="rgb(244,218,35)" fg:x="634941643" fg:w="14326532"/><text x="23.0237%" y="895.50"></text></g><g><title>handle_pte_fault{kernel} (13,059,157 cycles, 0.47%)</title><rect x="22.8192%" y="869" width="0.4684%" height="15" fill="rgb(240,68,47)" fg:x="636209018" fg:w="13059157"/><text x="23.0692%" y="879.50"></text></g><g><title>do_anonymous_page{kernel} (13,059,157 cycles, 0.47%)</title><rect x="22.8192%" y="853" width="0.4684%" height="15" fill="rgb(210,16,53)" fg:x="636209018" fg:w="13059157"/><text x="23.0692%" y="863.50"></text></g><g><title>lock_vma_under_rcu{kernel} (8,552,201 cycles, 0.31%)</title><rect x="23.2876%" y="901" width="0.3067%" height="15" fill="rgb(235,124,12)" fg:x="649268175" fg:w="8552201"/><text x="23.5376%" y="911.50"></text></g><g><title>mas_walk{kernel} (7,295,169 cycles, 0.26%)</title><rect x="23.3327%" y="885" width="0.2617%" height="15" fill="rgb(224,169,11)" fg:x="650525207" fg:w="7295169"/><text x="23.5827%" y="895.50"></text></g><g><title>do_user_addr_fault{kernel} (24,162,977 cycles, 0.87%)</title><rect x="22.7737%" y="917" width="0.8667%" height="15" fill="rgb(250,166,2)" fg:x="634941643" fg:w="24162977"/><text x="23.0237%" y="927.50"></text></g><g><title>void OopOopIterateDispatch&lt;YoungGenScanClosure&gt;::Table::oop_oop_iterate&lt;InstanceKlass, narrowOop&gt;(YoungGenScanClosure*, oopDesc*, Klass*){libjvm.so} (140,451,003 cycles, 5.04%)</title><rect x="18.6464%" y="981" width="5.0376%" height="15" fill="rgb(242,216,29)" fg:x="519870659" fg:w="140451003"/><text x="18.8964%" y="991.50">void O..</text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (45,028,839 cycles, 1.62%)</title><rect x="22.0690%" y="965" width="1.6151%" height="15" fill="rgb(230,116,27)" fg:x="615292823" fg:w="45028839"/><text x="22.3190%" y="975.50"></text></g><g><title>asm_exc_page_fault{kernel} (28,876,332 cycles, 1.04%)</title><rect x="22.6483%" y="949" width="1.0357%" height="15" fill="rgb(228,99,48)" fg:x="631445330" fg:w="28876332"/><text x="22.8983%" y="959.50"></text></g><g><title>exc_page_fault{kernel} (25,380,019 cycles, 0.91%)</title><rect x="22.7737%" y="933" width="0.9103%" height="15" fill="rgb(253,11,6)" fg:x="634941643" fg:w="25380019"/><text x="23.0237%" y="943.50"></text></g><g><title>_raw_spin_lock{kernel} (9,412,669 cycles, 0.34%)</title><rect x="29.5672%" y="837" width="0.3376%" height="15" fill="rgb(247,143,39)" fg:x="824345541" fg:w="9412669"/><text x="29.8172%" y="847.50"></text></g><g><title>alloc_anon_folio{kernel} (8,552,748 cycles, 0.31%)</title><rect x="29.9048%" y="837" width="0.3068%" height="15" fill="rgb(236,97,10)" fg:x="833758210" fg:w="8552748"/><text x="30.1548%" y="847.50"></text></g><g><title>vma_alloc_folio_noprof{kernel} (6,178,359 cycles, 0.22%)</title><rect x="29.9899%" y="821" width="0.2216%" height="15" fill="rgb(233,208,19)" fg:x="836132599" fg:w="6178359"/><text x="30.2399%" y="831.50"></text></g><g><title>alloc_pages_mpol{kernel} (6,178,359 cycles, 0.22%)</title><rect x="29.9899%" y="805" width="0.2216%" height="15" fill="rgb(216,164,2)" fg:x="836132599" fg:w="6178359"/><text x="30.2399%" y="815.50"></text></g><g><title>__alloc_frozen_pages_noprof{kernel} (6,178,359 cycles, 0.22%)</title><rect x="29.9899%" y="789" width="0.2216%" height="15" fill="rgb(220,129,5)" fg:x="836132599" fg:w="6178359"/><text x="30.2399%" y="799.50"></text></g><g><title>folio_add_lru_vma{kernel} (6,091,366 cycles, 0.22%)</title><rect x="30.2115%" y="837" width="0.2185%" height="15" fill="rgb(242,17,10)" fg:x="842310958" fg:w="6091366"/><text x="30.4615%" y="847.50"></text></g><g><title>folio_add_lru{kernel} (6,091,366 cycles, 0.22%)</title><rect x="30.2115%" y="821" width="0.2185%" height="15" fill="rgb(242,107,0)" fg:x="842310958" fg:w="6091366"/><text x="30.4615%" y="831.50"></text></g><g><title>DefNewGeneration::copy_to_survivor_space(oopDesc*){libjvm.so} (148,487,597 cycles, 5.33%)</title><rect x="25.2703%" y="965" width="5.3259%" height="15" fill="rgb(251,28,31)" fg:x="704547996" fg:w="148487597"/><text x="25.5203%" y="975.50">DefNewG..</text></g><g><title>asm_exc_page_fault{kernel} (33,445,661 cycles, 1.20%)</title><rect x="29.3966%" y="949" width="1.1996%" height="15" fill="rgb(233,223,10)" fg:x="819589932" fg:w="33445661"/><text x="29.6466%" y="959.50"></text></g><g><title>exc_page_fault{kernel} (30,981,439 cycles, 1.11%)</title><rect x="29.4850%" y="933" width="1.1112%" height="15" fill="rgb(215,21,27)" fg:x="822054154" fg:w="30981439"/><text x="29.7350%" y="943.50"></text></g><g><title>do_user_addr_fault{kernel} (30,981,439 cycles, 1.11%)</title><rect x="29.4850%" y="917" width="1.1112%" height="15" fill="rgb(232,23,21)" fg:x="822054154" fg:w="30981439"/><text x="29.7350%" y="927.50"></text></g><g><title>handle_mm_fault{kernel} (29,888,583 cycles, 1.07%)</title><rect x="29.5242%" y="901" width="1.0720%" height="15" fill="rgb(244,5,23)" fg:x="823147010" fg:w="29888583"/><text x="29.7742%" y="911.50"></text></g><g><title>__handle_mm_fault{kernel} (28,690,052 cycles, 1.03%)</title><rect x="29.5672%" y="885" width="1.0290%" height="15" fill="rgb(226,81,46)" fg:x="824345541" fg:w="28690052"/><text x="29.8172%" y="895.50"></text></g><g><title>handle_pte_fault{kernel} (28,690,052 cycles, 1.03%)</title><rect x="29.5672%" y="869" width="1.0290%" height="15" fill="rgb(247,70,30)" fg:x="824345541" fg:w="28690052"/><text x="29.8172%" y="879.50"></text></g><g><title>do_anonymous_page{kernel} (28,690,052 cycles, 1.03%)</title><rect x="29.5672%" y="853" width="1.0290%" height="15" fill="rgb(212,68,19)" fg:x="824345541" fg:w="28690052"/><text x="29.8172%" y="863.50"></text></g><g><title>handle_mm_fault{kernel} (7,311,938 cycles, 0.26%)</title><rect x="30.7157%" y="901" width="0.2623%" height="15" fill="rgb(240,187,13)" fg:x="856367472" fg:w="7311938"/><text x="30.9657%" y="911.50"></text></g><g><title>__handle_mm_fault{kernel} (7,311,938 cycles, 0.26%)</title><rect x="30.7157%" y="885" width="0.2623%" height="15" fill="rgb(223,113,26)" fg:x="856367472" fg:w="7311938"/><text x="30.9657%" y="895.50"></text></g><g><title>handle_pte_fault{kernel} (7,311,938 cycles, 0.26%)</title><rect x="30.7157%" y="869" width="0.2623%" height="15" fill="rgb(206,192,2)" fg:x="856367472" fg:w="7311938"/><text x="30.9657%" y="879.50"></text></g><g><title>SerialHeap::scan_evacuated_objs(YoungGenScanClosure*, OldGenScanClosure*){libjvm.so} (447,739,553 cycles, 16.06%)</title><rect x="14.9576%" y="997" width="16.0593%" height="15" fill="rgb(241,108,4)" fg:x="417024703" fg:w="447739553"/><text x="15.2076%" y="1007.50">SerialHeap::scan_evacuate..</text></g><g><title>void OopOopIterateDispatch&lt;YoungGenScanClosure&gt;::Table::oop_oop_iterate&lt;ObjArrayKlass, narrowOop&gt;(YoungGenScanClosure*, oopDesc*, Klass*){libjvm.so} (204,442,594 cycles, 7.33%)</title><rect x="23.6840%" y="981" width="7.3328%" height="15" fill="rgb(247,173,49)" fg:x="660321662" fg:w="204442594"/><text x="23.9340%" y="991.50">void OopOo..</text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (11,728,663 cycles, 0.42%)</title><rect x="30.5962%" y="965" width="0.4207%" height="15" fill="rgb(224,114,35)" fg:x="853035593" fg:w="11728663"/><text x="30.8462%" y="975.50"></text></g><g><title>asm_exc_page_fault{kernel} (8,396,784 cycles, 0.30%)</title><rect x="30.7157%" y="949" width="0.3012%" height="15" fill="rgb(245,159,27)" fg:x="856367472" fg:w="8396784"/><text x="30.9657%" y="959.50"></text></g><g><title>exc_page_fault{kernel} (8,396,784 cycles, 0.30%)</title><rect x="30.7157%" y="933" width="0.3012%" height="15" fill="rgb(245,172,44)" fg:x="856367472" fg:w="8396784"/><text x="30.9657%" y="943.50"></text></g><g><title>do_user_addr_fault{kernel} (8,396,784 cycles, 0.30%)</title><rect x="30.7157%" y="917" width="0.3012%" height="15" fill="rgb(236,23,11)" fg:x="856367472" fg:w="8396784"/><text x="30.9657%" y="927.50"></text></g><g><title>VM_Thread (478,788,703 cycles, 17.17%)</title><rect x="14.6970%" y="1205" width="17.1729%" height="15" fill="rgb(205,117,38)" fg:x="409757605" fg:w="478788703"/><text x="14.9470%" y="1215.50">VM_Thread</text></g><g><title>__GI___clone3{libc.so.6} (478,788,703 cycles, 17.17%)</title><rect x="14.6970%" y="1189" width="17.1729%" height="15" fill="rgb(237,72,25)" fg:x="409757605" fg:w="478788703"/><text x="14.9470%" y="1199.50">__GI___clone3{libc.so.6}</text></g><g><title>start_thread{libc.so.6} (478,788,703 cycles, 17.17%)</title><rect x="14.6970%" y="1173" width="17.1729%" height="15" fill="rgb(244,70,9)" fg:x="409757605" fg:w="478788703"/><text x="14.9470%" y="1183.50">start_thread{libc.so.6}</text></g><g><title>thread_native_entry(Thread*){libjvm.so} (478,788,703 cycles, 17.17%)</title><rect x="14.6970%" y="1157" width="17.1729%" height="15" fill="rgb(217,125,39)" fg:x="409757605" fg:w="478788703"/><text x="14.9470%" y="1167.50">thread_native_entry(Thread*..</text></g><g><title>Thread::call_run(){libjvm.so} (478,788,703 cycles, 17.17%)</title><rect x="14.6970%" y="1141" width="17.1729%" height="15" fill="rgb(235,36,10)" fg:x="409757605" fg:w="478788703"/><text x="14.9470%" y="1151.50">Thread::call_run(){libjvm.s..</text></g><g><title>VMThread::run(){libjvm.so} (478,788,703 cycles, 17.17%)</title><rect x="14.6970%" y="1125" width="17.1729%" height="15" fill="rgb(251,123,47)" fg:x="409757605" fg:w="478788703"/><text x="14.9470%" y="1135.50">VMThread::run(){libjvm.so}</text></g><g><title>VMThread::inner_execute(VM_Operation*){libjvm.so} (478,788,703 cycles, 17.17%)</title><rect x="14.6970%" y="1109" width="17.1729%" height="15" fill="rgb(221,13,13)" fg:x="409757605" fg:w="478788703"/><text x="14.9470%" y="1119.50">VMThread::inner_execute(VM_..</text></g><g><title>VMThread::evaluate_operation(VM_Operation*){libjvm.so} (478,788,703 cycles, 17.17%)</title><rect x="14.6970%" y="1093" width="17.1729%" height="15" fill="rgb(238,131,9)" fg:x="409757605" fg:w="478788703"/><text x="14.9470%" y="1103.50">VMThread::evaluate_operatio..</text></g><g><title>VM_Operation::evaluate(){libjvm.so} (478,788,703 cycles, 17.17%)</title><rect x="14.6970%" y="1077" width="17.1729%" height="15" fill="rgb(211,50,8)" fg:x="409757605" fg:w="478788703"/><text x="14.9470%" y="1087.50">VM_Operation::evaluate(){li..</text></g><g><title>VM_SerialCollectForAllocation::doit(){libjvm.so} (478,788,703 cycles, 17.17%)</title><rect x="14.6970%" y="1061" width="17.1729%" height="15" fill="rgb(245,182,24)" fg:x="409757605" fg:w="478788703"/><text x="14.9470%" y="1071.50">VM_SerialCollectForAllocati..</text></g><g><title>SerialHeap::satisfy_failed_allocation(unsigned long, bool){libjvm.so} (478,788,703 cycles, 17.17%)</title><rect x="14.6970%" y="1045" width="17.1729%" height="15" fill="rgb(242,14,37)" fg:x="409757605" fg:w="478788703"/><text x="14.9470%" y="1055.50">SerialHeap::satisfy_failed_..</text></g><g><title>SerialHeap::do_young_collection(bool) [clone .part.0]{libjvm.so} (478,788,703 cycles, 17.17%)</title><rect x="14.6970%" y="1029" width="17.1729%" height="15" fill="rgb(246,228,12)" fg:x="409757605" fg:w="478788703"/><text x="14.9470%" y="1039.50">SerialHeap::do_young_collec..</text></g><g><title>DefNewGeneration::collect(bool){libjvm.so} (478,788,703 cycles, 17.17%)</title><rect x="14.6970%" y="1013" width="17.1729%" height="15" fill="rgb(213,55,15)" fg:x="409757605" fg:w="478788703"/><text x="14.9470%" y="1023.50">DefNewGeneration::collect(b..</text></g><g><title>void OopOopIterateDispatch&lt;YoungGenScanClosure&gt;::Table::oop_oop_iterate&lt;TypeArrayKlass, narrowOop&gt;(YoungGenScanClosure*, oopDesc*, Klass*){libjvm.so} (9,137,065 cycles, 0.33%)</title><rect x="31.5422%" y="997" width="0.3277%" height="15" fill="rgb(209,9,3)" fg:x="879409243" fg:w="9137065"/><text x="31.7922%" y="1007.50"></text></g><g><title>handle_mm_fault{kernel} (5,899,972 cycles, 0.21%)</title><rect x="39.8863%" y="725" width="0.2116%" height="15" fill="rgb(230,59,30)" fg:x="1112047677" fg:w="5899972"/><text x="40.1363%" y="735.50"></text></g><g><title>__handle_mm_fault{kernel} (5,899,972 cycles, 0.21%)</title><rect x="39.8863%" y="709" width="0.2116%" height="15" fill="rgb(209,121,21)" fg:x="1112047677" fg:w="5899972"/><text x="40.1363%" y="719.50"></text></g><g><title>handle_pte_fault{kernel} (5,899,972 cycles, 0.21%)</title><rect x="39.8863%" y="693" width="0.2116%" height="15" fill="rgb(220,109,13)" fg:x="1112047677" fg:w="5899972"/><text x="40.1363%" y="703.50"></text></g><g><title>do_anonymous_page{kernel} (5,899,972 cycles, 0.21%)</title><rect x="39.8863%" y="677" width="0.2116%" height="15" fill="rgb(232,18,1)" fg:x="1112047677" fg:w="5899972"/><text x="40.1363%" y="687.50"></text></g><g><title>StubRoutines{perf-1809971.map} (34,356,497 cycles, 1.23%)</title><rect x="38.9610%" y="789" width="1.2323%" height="15" fill="rgb(215,41,42)" fg:x="1086248631" fg:w="34356497"/><text x="39.2110%" y="799.50"></text></g><g><title>asm_exc_page_fault{kernel} (10,494,531 cycles, 0.38%)</title><rect x="39.8168%" y="773" width="0.3764%" height="15" fill="rgb(224,123,36)" fg:x="1110110597" fg:w="10494531"/><text x="40.0668%" y="783.50"></text></g><g><title>exc_page_fault{kernel} (9,187,376 cycles, 0.33%)</title><rect x="39.8637%" y="757" width="0.3295%" height="15" fill="rgb(240,125,3)" fg:x="1111417752" fg:w="9187376"/><text x="40.1137%" y="767.50"></text></g><g><title>do_user_addr_fault{kernel} (8,557,451 cycles, 0.31%)</title><rect x="39.8863%" y="741" width="0.3069%" height="15" fill="rgb(205,98,50)" fg:x="1112047677" fg:w="8557451"/><text x="40.1363%" y="751.50"></text></g><g><title>alloc_anon_folio{kernel} (7,416,164 cycles, 0.27%)</title><rect x="40.3659%" y="677" width="0.2660%" height="15" fill="rgb(205,185,37)" fg:x="1125419648" fg:w="7416164"/><text x="40.6159%" y="687.50"></text></g><g><title>do_anonymous_page{kernel} (11,406,062 cycles, 0.41%)</title><rect x="40.2867%" y="693" width="0.4091%" height="15" fill="rgb(238,207,15)" fg:x="1123211197" fg:w="11406062"/><text x="40.5367%" y="703.50"></text></g><g><title>handle_mm_fault{kernel} (12,912,540 cycles, 0.46%)</title><rect x="40.2606%" y="741" width="0.4631%" height="15" fill="rgb(213,199,42)" fg:x="1122482467" fg:w="12912540"/><text x="40.5106%" y="751.50"></text></g><g><title>__handle_mm_fault{kernel} (12,912,540 cycles, 0.46%)</title><rect x="40.2606%" y="725" width="0.4631%" height="15" fill="rgb(235,201,11)" fg:x="1122482467" fg:w="12912540"/><text x="40.5106%" y="735.50"></text></g><g><title>handle_pte_fault{kernel} (12,912,540 cycles, 0.46%)</title><rect x="40.2606%" y="709" width="0.4631%" height="15" fill="rgb(207,46,11)" fg:x="1122482467" fg:w="12912540"/><text x="40.5106%" y="719.50"></text></g><g><title>asm_exc_page_fault{kernel} (18,535,408 cycles, 0.66%)</title><rect x="40.1932%" y="789" width="0.6648%" height="15" fill="rgb(241,35,35)" fg:x="1120605128" fg:w="18535408"/><text x="40.4432%" y="799.50"></text></g><g><title>exc_page_fault{kernel} (17,267,338 cycles, 0.62%)</title><rect x="40.2387%" y="773" width="0.6193%" height="15" fill="rgb(243,32,47)" fg:x="1121873198" fg:w="17267338"/><text x="40.4887%" y="783.50"></text></g><g><title>do_user_addr_fault{kernel} (17,267,338 cycles, 0.62%)</title><rect x="40.2387%" y="757" width="0.6193%" height="15" fill="rgb(247,202,23)" fg:x="1121873198" fg:w="17267338"/><text x="40.4887%" y="767.50"></text></g><g><title>__x64_sys_ioctl{kernel} (7,238,250 cycles, 0.26%)</title><rect x="42.4005%" y="661" width="0.2596%" height="15" fill="rgb(219,102,11)" fg:x="1182146075" fg:w="7238250"/><text x="42.6505%" y="671.50"></text></g><g><title>int sun.nio.ch.Net.available(java.io.FileDescriptor){jit} (10,747,225 cycles, 0.39%)</title><rect x="42.2916%" y="757" width="0.3855%" height="15" fill="rgb(243,110,44)" fg:x="1179109516" fg:w="10747225"/><text x="42.5416%" y="767.50"></text></g><g><title>Java_sun_nio_ch_Net_available{libnio.so} (7,710,666 cycles, 0.28%)</title><rect x="42.4005%" y="741" width="0.2766%" height="15" fill="rgb(222,74,54)" fg:x="1182146075" fg:w="7710666"/><text x="42.6505%" y="751.50"></text></g><g><title>__GI___ioctl{libc.so.6} (7,710,666 cycles, 0.28%)</title><rect x="42.4005%" y="725" width="0.2766%" height="15" fill="rgb(216,99,12)" fg:x="1182146075" fg:w="7710666"/><text x="42.6505%" y="735.50"></text></g><g><title>entry_SYSCALL_64_after_hwframe{kernel} (7,710,666 cycles, 0.28%)</title><rect x="42.4005%" y="709" width="0.2766%" height="15" fill="rgb(226,22,26)" fg:x="1182146075" fg:w="7710666"/><text x="42.6505%" y="719.50"></text></g><g><title>do_syscall_64{kernel} (7,710,666 cycles, 0.28%)</title><rect x="42.4005%" y="693" width="0.2766%" height="15" fill="rgb(217,163,10)" fg:x="1182146075" fg:w="7710666"/><text x="42.6505%" y="703.50"></text></g><g><title>x64_sys_call{kernel} (7,710,666 cycles, 0.28%)</title><rect x="42.4005%" y="677" width="0.2766%" height="15" fill="rgb(213,25,53)" fg:x="1182146075" fg:w="7710666"/><text x="42.6505%" y="687.50"></text></g><g><title>prepare_task_switch{kernel} (7,088,331 cycles, 0.25%)</title><rect x="43.6093%" y="437" width="0.2542%" height="15" fill="rgb(252,105,26)" fg:x="1215847457" fg:w="7088331"/><text x="43.8593%" y="447.50"></text></g><g><title>__perf_event_task_sched_out{kernel} (7,088,331 cycles, 0.25%)</title><rect x="43.6093%" y="421" width="0.2542%" height="15" fill="rgb(220,39,43)" fg:x="1215847457" fg:w="7088331"/><text x="43.8593%" y="431.50"></text></g><g><title>perf_event_context_sched_out{kernel} (6,677,593 cycles, 0.24%)</title><rect x="43.6241%" y="405" width="0.2395%" height="15" fill="rgb(229,68,48)" fg:x="1216258195" fg:w="6677593"/><text x="43.8741%" y="415.50"></text></g><g><title>sk_wait_data{kernel} (15,315,381 cycles, 0.55%)</title><rect x="43.4214%" y="517" width="0.5493%" height="15" fill="rgb(252,8,32)" fg:x="1210607836" fg:w="15315381"/><text x="43.6714%" y="527.50"></text></g><g><title>wait_woken{kernel} (14,428,778 cycles, 0.52%)</title><rect x="43.4532%" y="501" width="0.5175%" height="15" fill="rgb(223,20,43)" fg:x="1211494439" fg:w="14428778"/><text x="43.7032%" y="511.50"></text></g><g><title>schedule_timeout{kernel} (12,740,967 cycles, 0.46%)</title><rect x="43.5137%" y="485" width="0.4570%" height="15" fill="rgb(229,81,49)" fg:x="1213182250" fg:w="12740967"/><text x="43.7637%" y="495.50"></text></g><g><title>schedule{kernel} (12,740,967 cycles, 0.46%)</title><rect x="43.5137%" y="469" width="0.4570%" height="15" fill="rgb(236,28,36)" fg:x="1213182250" fg:w="12740967"/><text x="43.7637%" y="479.50"></text></g><g><title>__schedule{kernel} (12,740,967 cycles, 0.46%)</title><rect x="43.5137%" y="453" width="0.4570%" height="15" fill="rgb(249,185,26)" fg:x="1213182250" fg:w="12740967"/><text x="43.7637%" y="463.50"></text></g><g><title>skb_copy_datagram_iter{kernel} (9,387,191 cycles, 0.34%)</title><rect x="43.9707%" y="517" width="0.3367%" height="15" fill="rgb(249,174,33)" fg:x="1225923217" fg:w="9387191"/><text x="44.2207%" y="527.50"></text></g><g><title>__skb_datagram_iter{kernel} (9,387,191 cycles, 0.34%)</title><rect x="43.9707%" y="501" width="0.3367%" height="15" fill="rgb(233,201,37)" fg:x="1225923217" fg:w="9387191"/><text x="44.2207%" y="511.50"></text></g><g><title>simple_copy_to_iter{kernel} (9,387,191 cycles, 0.34%)</title><rect x="43.9707%" y="485" width="0.3367%" height="15" fill="rgb(221,78,26)" fg:x="1225923217" fg:w="9387191"/><text x="44.2207%" y="495.50"></text></g><g><title>_copy_to_iter{kernel} (7,365,856 cycles, 0.26%)</title><rect x="44.0432%" y="469" width="0.2642%" height="15" fill="rgb(250,127,30)" fg:x="1227944552" fg:w="7365856"/><text x="44.2932%" y="479.50"></text></g><g><title>tcp_ack{kernel} (7,697,186 cycles, 0.28%)</title><rect x="44.7959%" y="37" width="0.2761%" height="15" fill="rgb(230,49,44)" fg:x="1248928312" fg:w="7697186"/><text x="45.0459%" y="47.50"></text></g><g><title>ip_protocol_deliver_rcu{kernel} (10,990,929 cycles, 0.39%)</title><rect x="44.7167%" y="101" width="0.3942%" height="15" fill="rgb(229,67,23)" fg:x="1246720235" fg:w="10990929"/><text x="44.9667%" y="111.50"></text></g><g><title>tcp_v4_rcv{kernel} (10,516,593 cycles, 0.38%)</title><rect x="44.7337%" y="85" width="0.3772%" height="15" fill="rgb(249,83,47)" fg:x="1247194571" fg:w="10516593"/><text x="44.9837%" y="95.50"></text></g><g><title>tcp_v4_do_rcv{kernel} (10,174,225 cycles, 0.36%)</title><rect x="44.7459%" y="69" width="0.3649%" height="15" fill="rgb(215,43,3)" fg:x="1247536939" fg:w="10174225"/><text x="44.9959%" y="79.50"></text></g><g><title>tcp_rcv_established{kernel} (10,174,225 cycles, 0.36%)</title><rect x="44.7459%" y="53" width="0.3649%" height="15" fill="rgb(238,154,13)" fg:x="1247536939" fg:w="10174225"/><text x="44.9959%" y="63.50"></text></g><g><title>ip_local_deliver_finish{kernel} (12,053,827 cycles, 0.43%)</title><rect x="44.7167%" y="117" width="0.4323%" height="15" fill="rgb(219,56,2)" fg:x="1246720235" fg:w="12053827"/><text x="44.9667%" y="127.50"></text></g><g><title>ip_local_deliver{kernel} (15,681,713 cycles, 0.56%)</title><rect x="44.7167%" y="133" width="0.5625%" height="15" fill="rgb(233,0,4)" fg:x="1246720235" fg:w="15681713"/><text x="44.9667%" y="143.50"></text></g><g><title>__netif_receive_skb{kernel} (17,420,268 cycles, 0.62%)</title><rect x="44.6986%" y="181" width="0.6248%" height="15" fill="rgb(235,30,7)" fg:x="1246217289" fg:w="17420268"/><text x="44.9486%" y="191.50"></text></g><g><title>__netif_receive_skb_one_core{kernel} (17,420,268 cycles, 0.62%)</title><rect x="44.6986%" y="165" width="0.6248%" height="15" fill="rgb(250,79,13)" fg:x="1246217289" fg:w="17420268"/><text x="44.9486%" y="175.50"></text></g><g><title>ip_rcv{kernel} (17,420,268 cycles, 0.62%)</title><rect x="44.6986%" y="149" width="0.6248%" height="15" fill="rgb(211,146,34)" fg:x="1246217289" fg:w="17420268"/><text x="44.9486%" y="159.50"></text></g><g><title>__napi_poll{kernel} (19,023,274 cycles, 0.68%)</title><rect x="44.6986%" y="213" width="0.6823%" height="15" fill="rgb(228,22,38)" fg:x="1246217289" fg:w="19023274"/><text x="44.9486%" y="223.50"></text></g><g><title>process_backlog{kernel} (19,023,274 cycles, 0.68%)</title><rect x="44.6986%" y="197" width="0.6823%" height="15" fill="rgb(235,168,5)" fg:x="1246217289" fg:w="19023274"/><text x="44.9486%" y="207.50"></text></g><g><title>__local_bh_enable_ip{kernel} (20,463,263 cycles, 0.73%)</title><rect x="44.6684%" y="293" width="0.7340%" height="15" fill="rgb(221,155,16)" fg:x="1245375362" fg:w="20463263"/><text x="44.9184%" y="303.50"></text></g><g><title>do_softirq.part.0{kernel} (20,463,263 cycles, 0.73%)</title><rect x="44.6684%" y="277" width="0.7340%" height="15" fill="rgb(215,215,53)" fg:x="1245375362" fg:w="20463263"/><text x="44.9184%" y="287.50"></text></g><g><title>__do_softirq{kernel} (19,969,306 cycles, 0.72%)</title><rect x="44.6861%" y="261" width="0.7162%" height="15" fill="rgb(223,4,10)" fg:x="1245869319" fg:w="19969306"/><text x="44.9361%" y="271.50"></text></g><g><title>handle_softirqs{kernel} (19,969,306 cycles, 0.72%)</title><rect x="44.6861%" y="245" width="0.7162%" height="15" fill="rgb(234,103,6)" fg:x="1245869319" fg:w="19969306"/><text x="44.9361%" y="255.50"></text></g><g><title>net_rx_action{kernel} (19,969,306 cycles, 0.72%)</title><rect x="44.6861%" y="229" width="0.7162%" height="15" fill="rgb(227,97,0)" fg:x="1245869319" fg:w="19969306"/><text x="44.9361%" y="239.50"></text></g><g><title>ip_finish_output2{kernel} (23,859,188 cycles, 0.86%)</title><rect x="44.6482%" y="341" width="0.8558%" height="15" fill="rgb(234,150,53)" fg:x="1244810273" fg:w="23859188"/><text x="44.8982%" y="351.50"></text></g><g><title>neigh_hh_output{kernel} (23,859,188 cycles, 0.86%)</title><rect x="44.6482%" y="325" width="0.8558%" height="15" fill="rgb(228,201,54)" fg:x="1244810273" fg:w="23859188"/><text x="44.8982%" y="335.50"></text></g><g><title>__dev_queue_xmit{kernel} (23,859,188 cycles, 0.86%)</title><rect x="44.6482%" y="309" width="0.8558%" height="15" fill="rgb(222,22,37)" fg:x="1244810273" fg:w="23859188"/><text x="44.8982%" y="319.50"></text></g><g><title>ip_finish_output{kernel} (24,270,310 cycles, 0.87%)</title><rect x="44.6482%" y="373" width="0.8705%" height="15" fill="rgb(237,53,32)" fg:x="1244810273" fg:w="24270310"/><text x="44.8982%" y="383.50"></text></g><g><title>__ip_finish_output{kernel} (24,270,310 cycles, 0.87%)</title><rect x="44.6482%" y="357" width="0.8705%" height="15" fill="rgb(233,25,53)" fg:x="1244810273" fg:w="24270310"/><text x="44.8982%" y="367.50"></text></g><g><title>tcp_cleanup_rbuf{kernel} (34,642,527 cycles, 1.24%)</title><rect x="44.3074%" y="517" width="1.2425%" height="15" fill="rgb(210,40,34)" fg:x="1235310408" fg:w="34642527"/><text x="44.5574%" y="527.50"></text></g><g><title>__tcp_cleanup_rbuf{kernel} (34,642,527 cycles, 1.24%)</title><rect x="44.3074%" y="501" width="1.2425%" height="15" fill="rgb(241,220,44)" fg:x="1235310408" fg:w="34642527"/><text x="44.5574%" y="511.50"></text></g><g><title>tcp_send_ack{kernel} (34,642,527 cycles, 1.24%)</title><rect x="44.3074%" y="485" width="1.2425%" height="15" fill="rgb(235,28,35)" fg:x="1235310408" fg:w="34642527"/><text x="44.5574%" y="495.50"></text></g><g><title>__tcp_send_ack.part.0{kernel} (34,642,527 cycles, 1.24%)</title><rect x="44.3074%" y="469" width="1.2425%" height="15" fill="rgb(210,56,17)" fg:x="1235310408" fg:w="34642527"/><text x="44.5574%" y="479.50"></text></g><g><title>__tcp_transmit_skb{kernel} (33,294,093 cycles, 1.19%)</title><rect x="44.3558%" y="453" width="1.1942%" height="15" fill="rgb(224,130,29)" fg:x="1236658842" fg:w="33294093"/><text x="44.6058%" y="463.50"></text></g><g><title>ip_queue_xmit{kernel} (32,202,199 cycles, 1.16%)</title><rect x="44.3949%" y="437" width="1.1550%" height="15" fill="rgb(235,212,8)" fg:x="1237750736" fg:w="32202199"/><text x="44.6449%" y="447.50"></text></g><g><title>__ip_queue_xmit{kernel} (32,202,199 cycles, 1.16%)</title><rect x="44.3949%" y="421" width="1.1550%" height="15" fill="rgb(223,33,50)" fg:x="1237750736" fg:w="32202199"/><text x="44.6449%" y="431.50"></text></g><g><title>ip_local_out{kernel} (31,698,617 cycles, 1.14%)</title><rect x="44.4130%" y="405" width="1.1369%" height="15" fill="rgb(219,149,13)" fg:x="1238254318" fg:w="31698617"/><text x="44.6630%" y="415.50"></text></g><g><title>ip_output{kernel} (26,410,059 cycles, 0.95%)</title><rect x="44.6027%" y="389" width="0.9473%" height="15" fill="rgb(250,156,29)" fg:x="1243542876" fg:w="26410059"/><text x="44.8527%" y="399.50"></text></g><g><title>inet6_recvmsg{kernel} (63,772,487 cycles, 2.29%)</title><rect x="43.2917%" y="565" width="2.2874%" height="15" fill="rgb(216,193,19)" fg:x="1206992180" fg:w="63772487"/><text x="43.5417%" y="575.50">i..</text></g><g><title>tcp_recvmsg{kernel} (63,772,487 cycles, 2.29%)</title><rect x="43.2917%" y="549" width="2.2874%" height="15" fill="rgb(216,135,14)" fg:x="1206992180" fg:w="63772487"/><text x="43.5417%" y="559.50">t..</text></g><g><title>tcp_recvmsg_locked{kernel} (62,031,085 cycles, 2.22%)</title><rect x="43.3542%" y="533" width="2.2249%" height="15" fill="rgb(241,47,5)" fg:x="1208733582" fg:w="62031085"/><text x="43.6042%" y="543.50">t..</text></g><g><title>__syscall_cancel_arch_end{libc.so.6} (76,525,259 cycles, 2.74%)</title><rect x="42.8906%" y="709" width="2.7448%" height="15" fill="rgb(233,42,35)" fg:x="1195809311" fg:w="76525259"/><text x="43.1406%" y="719.50">__..</text></g><g><title>entry_SYSCALL_64_after_hwframe{kernel} (75,783,508 cycles, 2.72%)</title><rect x="42.9172%" y="693" width="2.7182%" height="15" fill="rgb(231,13,6)" fg:x="1196551062" fg:w="75783508"/><text x="43.1672%" y="703.50">en..</text></g><g><title>do_syscall_64{kernel} (75,427,953 cycles, 2.71%)</title><rect x="42.9300%" y="677" width="2.7054%" height="15" fill="rgb(207,181,40)" fg:x="1196906617" fg:w="75427953"/><text x="43.1800%" y="687.50">do..</text></g><g><title>x64_sys_call{kernel} (72,968,826 cycles, 2.62%)</title><rect x="43.0182%" y="661" width="2.6172%" height="15" fill="rgb(254,173,49)" fg:x="1199365744" fg:w="72968826"/><text x="43.2682%" y="671.50">x6..</text></g><g><title>__x64_sys_read{kernel} (72,968,826 cycles, 2.62%)</title><rect x="43.0182%" y="645" width="2.6172%" height="15" fill="rgb(221,1,38)" fg:x="1199365744" fg:w="72968826"/><text x="43.2682%" y="655.50">__..</text></g><g><title>ksys_read{kernel} (72,968,826 cycles, 2.62%)</title><rect x="43.0182%" y="629" width="2.6172%" height="15" fill="rgb(206,124,46)" fg:x="1199365744" fg:w="72968826"/><text x="43.2682%" y="639.50">ks..</text></g><g><title>vfs_read{kernel} (67,746,853 cycles, 2.43%)</title><rect x="43.2055%" y="613" width="2.4299%" height="15" fill="rgb(249,21,11)" fg:x="1204587717" fg:w="67746853"/><text x="43.4555%" y="623.50">vf..</text></g><g><title>sock_read_iter{kernel} (66,229,438 cycles, 2.38%)</title><rect x="43.2599%" y="597" width="2.3755%" height="15" fill="rgb(222,201,40)" fg:x="1206105132" fg:w="66229438"/><text x="43.5099%" y="607.50">so..</text></g><g><title>sock_recvmsg{kernel} (66,229,438 cycles, 2.38%)</title><rect x="43.2599%" y="581" width="2.3755%" height="15" fill="rgb(235,61,29)" fg:x="1206105132" fg:w="66229438"/><text x="43.5099%" y="591.50">so..</text></g><g><title>Java_sun_nio_ch_SocketDispatcher_read0{libnio.so} (78,012,236 cycles, 2.80%)</title><rect x="42.8647%" y="741" width="2.7981%" height="15" fill="rgb(219,207,3)" fg:x="1195085590" fg:w="78012236"/><text x="43.1147%" y="751.50">Ja..</text></g><g><title>read{libc.so.6} (77,288,515 cycles, 2.77%)</title><rect x="42.8906%" y="725" width="2.7721%" height="15" fill="rgb(222,56,46)" fg:x="1195809311" fg:w="77288515"/><text x="43.1406%" y="735.50">re..</text></g><g><title>int com.mysql.cj.protocol.FullReadInputStream.readFully(byte[], int, int){jit} (132,508,064 cycles, 4.75%)</title><rect x="40.9348%" y="789" width="4.7527%" height="15" fill="rgb(239,76,54)" fg:x="1141281203" fg:w="132508064"/><text x="41.1848%" y="799.50">int co..</text></g><g><title>void com.mysql.cj.protocol.ReadAheadInputStream.fill(int){jit} (103,042,641 cycles, 3.70%)</title><rect x="41.9917%" y="773" width="3.6959%" height="15" fill="rgb(231,124,27)" fg:x="1170746626" fg:w="103042641"/><text x="42.2417%" y="783.50">void..</text></g><g><title>int sun.nio.ch.SocketDispatcher.read0(java.io.FileDescriptor, long, int){jit} (83,932,526 cycles, 3.01%)</title><rect x="42.6771%" y="757" width="3.0104%" height="15" fill="rgb(249,195,6)" fg:x="1189856741" fg:w="83932526"/><text x="42.9271%" y="767.50">int..</text></g><g><title>com.mysql.cj.protocol.ProtocolEntity com.mysql.cj.protocol.a.NativeProtocol.read(java.lang.Class, com.mysql.cj.protocol.ProtocolEntityFactory){jit} (332,192,395 cycles, 11.91%)</title><rect x="34.5934%" y="805" width="11.9149%" height="15" fill="rgb(237,174,47)" fg:x="964477965" fg:w="332192395"/><text x="34.8434%" y="815.50">com.mysql.cj.proto..</text></g><g><title>long com.mysql.cj.protocol.a.NativePacketPayload.readInteger(com.mysql.cj.protocol.a.NativeConstants$IntegerDataType){jit} (22,881,093 cycles, 0.82%)</title><rect x="45.6876%" y="789" width="0.8207%" height="15" fill="rgb(206,201,31)" fg:x="1273789267" fg:w="22881093"/><text x="45.9376%" y="799.50"></text></g><g><title>Interpreter{jit} (346,796,258 cycles, 12.44%)</title><rect x="34.2134%" y="869" width="12.4387%" height="15" fill="rgb(231,57,52)" fg:x="953885386" fg:w="346796258"/><text x="34.4634%" y="879.50">Interpreter{jit}</text></g><g><title>Interpreter{jit} (346,796,258 cycles, 12.44%)</title><rect x="34.2134%" y="853" width="12.4387%" height="15" fill="rgb(248,177,22)" fg:x="953885386" fg:w="346796258"/><text x="34.4634%" y="863.50">Interpreter{jit}</text></g><g><title>Interpreter{jit} (346,796,258 cycles, 12.44%)</title><rect x="34.2134%" y="837" width="12.4387%" height="15" fill="rgb(215,211,37)" fg:x="953885386" fg:w="346796258"/><text x="34.4634%" y="847.50">Interpreter{jit}</text></g><g><title>com.mysql.cj.protocol.Resultset com.mysql.cj.protocol.a.TextResultsetReader.read(int, boolean, com.mysql.cj.protocol.a.NativePacketPayload, com.mysql.cj.protocol.ColumnDefinition, com.mysql.cj.protocol.ProtocolEntityFactory){jit} (343,064,124 cycles, 12.30%)</title><rect x="34.3473%" y="821" width="12.3048%" height="15" fill="rgb(241,128,51)" fg:x="957617520" fg:w="343064124"/><text x="34.5973%" y="831.50">com.mysql.cj.proto..</text></g><g><title>Interpreter{jit} (347,302,274 cycles, 12.46%)</title><rect x="34.2134%" y="901" width="12.4568%" height="15" fill="rgb(227,165,31)" fg:x="953885386" fg:w="347302274"/><text x="34.4634%" y="911.50">Interpreter{jit}</text></g><g><title>Interpreter{jit} (347,302,274 cycles, 12.46%)</title><rect x="34.2134%" y="885" width="12.4568%" height="15" fill="rgb(228,167,24)" fg:x="953885386" fg:w="347302274"/><text x="34.4634%" y="895.50">Interpreter{jit}</text></g><g><title>boolean com.mysql.cj.jdbc.result.ResultSetImpl.next(){jit} (11,954,753 cycles, 0.43%)</title><rect x="46.6703%" y="885" width="0.4288%" height="15" fill="rgb(228,143,12)" fg:x="1301187660" fg:w="11954753"/><text x="46.9203%" y="895.50"></text></g><g><title>asm_exc_page_fault{kernel} (6,172,226 cycles, 0.22%)</title><rect x="49.6514%" y="869" width="0.2214%" height="15" fill="rgb(249,149,8)" fg:x="1384302997" fg:w="6172226"/><text x="49.9014%" y="879.50"></text></g><g><title>exc_page_fault{kernel} (6,172,226 cycles, 0.22%)</title><rect x="49.6514%" y="853" width="0.2214%" height="15" fill="rgb(243,35,44)" fg:x="1384302997" fg:w="6172226"/><text x="49.9014%" y="863.50"></text></g><g><title>do_user_addr_fault{kernel} (6,172,226 cycles, 0.22%)</title><rect x="49.6514%" y="837" width="0.2214%" height="15" fill="rgb(246,89,9)" fg:x="1384302997" fg:w="6172226"/><text x="49.9014%" y="847.50"></text></g><g><title>Interpreter{jit} (9,407,145 cycles, 0.34%)</title><rect x="79.5723%" y="821" width="0.3374%" height="15" fill="rgb(233,213,13)" fg:x="2218511475" fg:w="9407145"/><text x="79.8223%" y="831.50"></text></g><g><title>Interpreter{jit} (16,157,595 cycles, 0.58%)</title><rect x="79.3627%" y="837" width="0.5795%" height="15" fill="rgb(233,141,41)" fg:x="2212667717" fg:w="16157595"/><text x="79.6127%" y="847.50"></text></g><g><title>Interpreter{jit} (21,676,140 cycles, 0.78%)</title><rect x="80.9195%" y="789" width="0.7775%" height="15" fill="rgb(239,167,4)" fg:x="2256071832" fg:w="21676140"/><text x="81.1695%" y="799.50"></text></g><g><title>Interpreter{jit} (38,827,959 cycles, 1.39%)</title><rect x="80.3875%" y="805" width="1.3927%" height="15" fill="rgb(209,217,16)" fg:x="2241240426" fg:w="38827959"/><text x="80.6375%" y="815.50"></text></g><g><title>Interpreter{jit} (52,527,503 cycles, 1.88%)</title><rect x="79.9837%" y="821" width="1.8840%" height="15" fill="rgb(219,88,35)" fg:x="2229981541" fg:w="52527503"/><text x="80.2337%" y="831.50">I..</text></g><g><title>java.lang.Object com.mysql.cj.protocol.a.MysqlTextValueDecoder.decodeDatetime(byte[], int, int, int, com.mysql.cj.result.ValueFactory){jit} (57,182,252 cycles, 2.05%)</title><rect x="79.9837%" y="837" width="2.0510%" height="15" fill="rgb(220,193,23)" fg:x="2229981541" fg:w="57182252"/><text x="80.2337%" y="847.50">j..</text></g><g><title>Interpreter{jit} (120,375,247 cycles, 4.32%)</title><rect x="77.9199%" y="853" width="4.3176%" height="15" fill="rgb(230,90,52)" fg:x="2172442031" fg:w="120375247"/><text x="78.1699%" y="863.50">Inter..</text></g><g><title>java.lang.Object com.mysql.cj.protocol.a.MysqlTextValueDecoder.decodeInt8(byte[], int, int, com.mysql.cj.result.ValueFactory){jit} (5,653,485 cycles, 0.20%)</title><rect x="82.0347%" y="837" width="0.2028%" height="15" fill="rgb(252,106,19)" fg:x="2287163793" fg:w="5653485"/><text x="82.2847%" y="847.50"></text></g><g><title>Interpreter{jit} (5,653,485 cycles, 0.20%)</title><rect x="82.0347%" y="821" width="0.2028%" height="15" fill="rgb(206,74,20)" fg:x="2287163793" fg:w="5653485"/><text x="82.2847%" y="831.50"></text></g><g><title>double jdk.internal.math.FloatingDecimal$ASCIIToBinaryBuffer.doubleValue(){jit} (6,583,248 cycles, 0.24%)</title><rect x="82.7667%" y="821" width="0.2361%" height="15" fill="rgb(230,138,44)" fg:x="2307572678" fg:w="6583248"/><text x="83.0167%" y="831.50"></text></g><g><title>java.lang.Object com.mysql.cj.protocol.a.result.TextBufferRow.getValue(int, com.mysql.cj.result.ValueFactory){jit} (36,275,053 cycles, 1.30%)</title><rect x="82.4655%" y="853" width="1.3011%" height="15" fill="rgb(235,182,43)" fg:x="2299173878" fg:w="36275053"/><text x="82.7155%" y="863.50"></text></g><g><title>java.lang.Object com.mysql.cj.protocol.result.AbstractResultsetRow.decodeAndCreateReturnValue(int, byte[], int, int, com.mysql.cj.result.ValueFactory){jit} (34,067,949 cycles, 1.22%)</title><rect x="82.5446%" y="837" width="1.2219%" height="15" fill="rgb(242,16,51)" fg:x="2301380982" fg:w="34067949"/><text x="82.7946%" y="847.50"></text></g><g><title>jdk.internal.math.FloatingDecimal$ASCIIToBinaryConverter jdk.internal.math.FloatingDecimal.readJavaFormatString(java.lang.String, int){jit} (21,293,005 cycles, 0.76%)</title><rect x="83.0028%" y="821" width="0.7637%" height="15" fill="rgb(248,9,4)" fg:x="2314155926" fg:w="21293005"/><text x="83.2528%" y="831.50"></text></g><g><title>Interpreter{jit} (28,243,834 cycles, 1.01%)</title><rect x="86.1897%" y="821" width="1.0130%" height="15" fill="rgb(210,31,22)" fg:x="2403008251" fg:w="28243834"/><text x="86.4397%" y="831.50"></text></g><g><title>Interpreter{jit} (54,524,770 cycles, 1.96%)</title><rect x="85.3262%" y="837" width="1.9557%" height="15" fill="rgb(239,54,39)" fg:x="2378931853" fg:w="54524770"/><text x="85.5762%" y="847.50">I..</text></g><g><title>asm_exc_page_fault{kernel} (6,249,813 cycles, 0.22%)</title><rect x="87.2818%" y="837" width="0.2242%" height="15" fill="rgb(230,99,41)" fg:x="2433456623" fg:w="6249813"/><text x="87.5318%" y="847.50"></text></g><g><title>exc_page_fault{kernel} (6,249,813 cycles, 0.22%)</title><rect x="87.2818%" y="821" width="0.2242%" height="15" fill="rgb(253,106,12)" fg:x="2433456623" fg:w="6249813"/><text x="87.5318%" y="831.50"></text></g><g><title>do_user_addr_fault{kernel} (6,249,813 cycles, 0.22%)</title><rect x="87.2818%" y="805" width="0.2242%" height="15" fill="rgb(213,46,41)" fg:x="2433456623" fg:w="6249813"/><text x="87.5318%" y="815.50"></text></g><g><title>com.mysql.cj.protocol.InternalTimestamp com.mysql.cj.protocol.a.MysqlTextValueDecoder.getTimestamp(byte[], int, int, int){jit} (113,330,225 cycles, 4.06%)</title><rect x="87.5060%" y="837" width="4.0649%" height="15" fill="rgb(215,133,35)" fg:x="2439706436" fg:w="113330225"/><text x="87.7560%" y="847.50">com...</text></g><g><title>double jdk.internal.math.FloatingDecimal$ASCIIToBinaryBuffer.doubleValue(){jit} (14,511,255 cycles, 0.52%)</title><rect x="91.5709%" y="837" width="0.5205%" height="15" fill="rgb(213,28,5)" fg:x="2553036661" fg:w="14511255"/><text x="91.8209%" y="847.50"></text></g><g><title>java.lang.Object com.mysql.cj.protocol.a.MysqlTextValueDecoder.decodeDate(byte[], int, int, com.mysql.cj.result.ValueFactory){jit} (11,150,729 cycles, 0.40%)</title><rect x="92.0914%" y="837" width="0.3999%" height="15" fill="rgb(215,77,49)" fg:x="2567547916" fg:w="11150729"/><text x="92.3414%" y="847.50"></text></g><g><title>java.lang.Object com.mysql.cj.protocol.result.AbstractResultsetRow.decodeAndCreateReturnValue(int, byte[], int, int, com.mysql.cj.result.ValueFactory){jit} (282,152,188 cycles, 10.12%)</title><rect x="83.7666%" y="853" width="10.1201%" height="15" fill="rgb(248,100,22)" fg:x="2335448931" fg:w="282152188"/><text x="84.0166%" y="863.50">java.lang.Objec..</text></g><g><title>jdk.internal.math.FloatingDecimal$ASCIIToBinaryConverter jdk.internal.math.FloatingDecimal.readJavaFormatString(java.lang.String, int){jit} (38,902,474 cycles, 1.40%)</title><rect x="92.4913%" y="837" width="1.3953%" height="15" fill="rgb(208,67,9)" fg:x="2578698645" fg:w="38902474"/><text x="92.7413%" y="847.50"></text></g><g><title>java.lang.Object com.mysql.cj.jdbc.result.ResultSetImpl.getObject(int, java.lang.Class){jit} (1,248,890,504 cycles, 44.79%)</title><rect x="49.8728%" y="869" width="44.7945%" height="15" fill="rgb(219,133,21)" fg:x="1390475223" fg:w="1248890504"/><text x="50.1228%" y="879.50">java.lang.Object com.mysql.cj.jdbc.result.ResultSetImpl.getObject(int, ja..</text></g><g><title>void com.mysql.cj.jdbc.result.ResultSetImpl.checkColumnBounds(int){jit} (19,298,513 cycles, 0.69%)</title><rect x="93.9751%" y="853" width="0.6922%" height="15" fill="rgb(246,46,29)" fg:x="2620067214" fg:w="19298513"/><text x="94.2251%" y="863.50"></text></g><g><title>java.lang.Object com.mysql.cj.protocol.result.AbstractResultsetRow.decodeAndCreateReturnValue(int, byte[], int, int, com.mysql.cj.result.ValueFactory){jit} (46,458,571 cycles, 1.67%)</title><rect x="94.6673%" y="869" width="1.6663%" height="15" fill="rgb(246,185,52)" fg:x="2639365727" fg:w="46458571"/><text x="94.9173%" y="879.50"></text></g><g><title>void java.math.BigDecimal.&lt;init&gt;(char[], int, int, java.math.MathContext){jit} (26,354,431 cycles, 0.95%)</title><rect x="95.3884%" y="853" width="0.9453%" height="15" fill="rgb(252,136,11)" fg:x="2659469867" fg:w="26354431"/><text x="95.6384%" y="863.50"></text></g><g><title>Interpreter{jit} (13,012,586 cycles, 0.47%)</title><rect x="97.8042%" y="853" width="0.4667%" height="15" fill="rgb(219,138,53)" fg:x="2726824533" fg:w="13012586"/><text x="98.0542%" y="863.50"></text></g><g><title>java.lang.Object com.mysql.cj.protocol.a.MysqlTextValueDecoder.decodeByteArray(byte[], int, int, com.mysql.cj.result.Field, com.mysql.cj.result.ValueFactory){jit} (31,996,487 cycles, 1.15%)</title><rect x="98.4848%" y="837" width="1.1476%" height="15" fill="rgb(211,51,23)" fg:x="2745801346" fg:w="31996487"/><text x="98.7348%" y="847.50"></text></g><g><title>void java.lang.String.&lt;init&gt;(java.nio.charset.Charset, byte[], int, int){jit} (26,054,580 cycles, 0.93%)</title><rect x="98.6980%" y="821" width="0.9345%" height="15" fill="rgb(247,221,28)" fg:x="2751743253" fg:w="26054580"/><text x="98.9480%" y="831.50"></text></g><g><title>java.lang.Object[] bench.fw.Fw$Tmpl.rowValues(java.sql.ResultSet){jit} (1,466,179,798 cycles, 52.59%)</title><rect x="47.3247%" y="885" width="52.5881%" height="15" fill="rgb(251,222,45)" fg:x="1319433206" fg:w="1466179798"/><text x="47.5747%" y="895.50">java.lang.Object[] bench.fw.Fw$Tmpl.rowValues(java.sql.ResultSet){jit}</text></g><g><title>java.lang.String com.mysql.cj.jdbc.result.ResultSetImpl.getString(int){jit} (99,788,706 cycles, 3.58%)</title><rect x="96.3336%" y="869" width="3.5792%" height="15" fill="rgb(217,162,53)" fg:x="2685824298" fg:w="99788706"/><text x="96.5836%" y="879.50">java..</text></g><g><title>java.lang.Object com.mysql.cj.protocol.result.AbstractResultsetRow.decodeAndCreateReturnValue(int, byte[], int, int, com.mysql.cj.result.ValueFactory){jit} (41,963,502 cycles, 1.51%)</title><rect x="98.4077%" y="853" width="1.5051%" height="15" fill="rgb(229,93,14)" fg:x="2743649502" fg:w="41963502"/><text x="98.6577%" y="863.50"></text></g><g><title>void java.lang.String.&lt;init&gt;(java.nio.charset.Charset, byte[], int, int){jit} (7,815,171 cycles, 0.28%)</title><rect x="99.6325%" y="837" width="0.2803%" height="15" fill="rgb(209,67,49)" fg:x="2777797833" fg:w="7815171"/><text x="99.8825%" y="847.50"></text></g><g><title>Interpreter{jit} (1,834,251,145 cycles, 65.79%)</title><rect x="34.1693%" y="965" width="65.7899%" height="15" fill="rgb(213,87,29)" fg:x="952654367" fg:w="1834251145"/><text x="34.4193%" y="975.50">Interpreter{jit}</text></g><g><title>Interpreter{jit} (1,834,251,145 cycles, 65.79%)</title><rect x="34.1693%" y="949" width="65.7899%" height="15" fill="rgb(205,151,52)" fg:x="952654367" fg:w="1834251145"/><text x="34.4193%" y="959.50">Interpreter{jit}</text></g><g><title>Interpreter{jit} (1,834,251,145 cycles, 65.79%)</title><rect x="34.1693%" y="933" width="65.7899%" height="15" fill="rgb(253,215,39)" fg:x="952654367" fg:w="1834251145"/><text x="34.4193%" y="943.50">Interpreter{jit}</text></g><g><title>Interpreter{jit} (1,834,251,145 cycles, 65.79%)</title><rect x="34.1693%" y="917" width="65.7899%" height="15" fill="rgb(221,220,41)" fg:x="952654367" fg:w="1834251145"/><text x="34.4193%" y="927.50">Interpreter{jit}</text></g><g><title>java.util.List org.springframework.jdbc.core.RowMapperResultSetExtractor.extractData(java.sql.ResultSet){jit} (1,485,717,852 cycles, 53.29%)</title><rect x="46.6703%" y="901" width="53.2889%" height="15" fill="rgb(218,133,21)" fg:x="1301187660" fg:w="1485717852"/><text x="46.9203%" y="911.50">java.util.List org.springframework.jdbc.core.RowMapperResultSetExtractor.extractData(jav..</text></g><g><title>all (2,788,044,416 cycles, 100%)</title><rect x="0.0000%" y="1221" width="100.0000%" height="15" fill="rgb(221,193,43)" fg:x="0" fg:w="2788044416"/><text x="0.2500%" y="1231.50"></text></g><g><title>java (1,899,498,108 cycles, 68.13%)</title><rect x="31.8699%" y="1205" width="68.1301%" height="15" fill="rgb(240,128,52)" fg:x="888546308" fg:w="1899498108"/><text x="32.1199%" y="1215.50">java</text></g><g><title>__GI___clone3{libc.so.6} (1,898,812,462 cycles, 68.11%)</title><rect x="31.8945%" y="1189" width="68.1055%" height="15" fill="rgb(253,114,12)" fg:x="889231954" fg:w="1898812462"/><text x="32.1445%" y="1199.50">__GI___clone3{libc.so.6}</text></g><g><title>start_thread{libc.so.6} (1,898,812,462 cycles, 68.11%)</title><rect x="31.8945%" y="1173" width="68.1055%" height="15" fill="rgb(215,223,47)" fg:x="889231954" fg:w="1898812462"/><text x="32.1445%" y="1183.50">start_thread{libc.so.6}</text></g><g><title>ThreadJavaMain{libjli.so} (1,898,812,462 cycles, 68.11%)</title><rect x="31.8945%" y="1157" width="68.1055%" height="15" fill="rgb(248,225,23)" fg:x="889231954" fg:w="1898812462"/><text x="32.1445%" y="1167.50">ThreadJavaMain{libjli.so}</text></g><g><title>JavaMain{libjli.so} (1,898,812,462 cycles, 68.11%)</title><rect x="31.8945%" y="1141" width="68.1055%" height="15" fill="rgb(250,108,0)" fg:x="889231954" fg:w="1898812462"/><text x="32.1445%" y="1151.50">JavaMain{libjli.so}</text></g><g><title>invokeStaticMainWithArgs{libjli.so} (1,898,812,462 cycles, 68.11%)</title><rect x="31.8945%" y="1125" width="68.1055%" height="15" fill="rgb(228,208,7)" fg:x="889231954" fg:w="1898812462"/><text x="32.1445%" y="1135.50">invokeStaticMainWithArgs{libjli.so}</text></g><g><title>jni_CallStaticVoidMethod{libjvm.so} (1,898,812,462 cycles, 68.11%)</title><rect x="31.8945%" y="1109" width="68.1055%" height="15" fill="rgb(244,45,10)" fg:x="889231954" fg:w="1898812462"/><text x="32.1445%" y="1119.50">jni_CallStaticVoidMethod{libjvm.so}</text></g><g><title>jni_invoke_static(JNIEnv_*, JavaValue*, _jobject*, JNICallType, _jmethodID*, JNI_ArgumentPusher*, JavaThread*) [clone .constprop.1]{libjvm.so} (1,898,812,462 cycles, 68.11%)</title><rect x="31.8945%" y="1093" width="68.1055%" height="15" fill="rgb(207,125,25)" fg:x="889231954" fg:w="1898812462"/><text x="32.1445%" y="1103.50">jni_invoke_static(JNIEnv_*, JavaValue*, _jobject*, JNICallType, _jmethodID*, JNI_ArgumentPusher*, JavaThread*) [c..</text></g><g><title>JavaCalls::call_helper(JavaValue*, methodHandle const&amp;, JavaCallArguments*, JavaThread*){libjvm.so} (1,898,812,462 cycles, 68.11%)</title><rect x="31.8945%" y="1077" width="68.1055%" height="15" fill="rgb(210,195,18)" fg:x="889231954" fg:w="1898812462"/><text x="32.1445%" y="1087.50">JavaCalls::call_helper(JavaValue*, methodHandle const&amp;, JavaCallArguments*, JavaThread*){libjvm.so}</text></g><g><title>StubRoutines{perf-1809971.map} (1,898,812,462 cycles, 68.11%)</title><rect x="31.8945%" y="1061" width="68.1055%" height="15" fill="rgb(249,80,12)" fg:x="889231954" fg:w="1898812462"/><text x="32.1445%" y="1071.50">StubRoutines{perf-1809971.map}</text></g><g><title>Interpreter{jit} (1,898,812,462 cycles, 68.11%)</title><rect x="31.8945%" y="1045" width="68.1055%" height="15" fill="rgb(221,65,9)" fg:x="889231954" fg:w="1898812462"/><text x="32.1445%" y="1055.50">Interpreter{jit}</text></g><g><title>Interpreter{jit} (1,898,812,462 cycles, 68.11%)</title><rect x="31.8945%" y="1029" width="68.1055%" height="15" fill="rgb(235,49,36)" fg:x="889231954" fg:w="1898812462"/><text x="32.1445%" y="1039.50">Interpreter{jit}</text></g><g><title>Interpreter{jit} (1,898,812,462 cycles, 68.11%)</title><rect x="31.8945%" y="1013" width="68.1055%" height="15" fill="rgb(225,32,20)" fg:x="889231954" fg:w="1898812462"/><text x="32.1445%" y="1023.50">Interpreter{jit}</text></g><g><title>Interpreter{jit} (1,898,812,462 cycles, 68.11%)</title><rect x="31.8945%" y="997" width="68.1055%" height="15" fill="rgb(215,141,46)" fg:x="889231954" fg:w="1898812462"/><text x="32.1445%" y="1007.50">Interpreter{jit}</text></g><g><title>long[] bench.fw.Fw$Tmpl.t4(boolean){jit} (1,895,048,616 cycles, 67.97%)</title><rect x="32.0295%" y="981" width="67.9705%" height="15" fill="rgb(250,160,47)" fg:x="892995800" fg:w="1895048616"/><text x="32.2795%" y="991.50">long[] bench.fw.Fw$Tmpl.t4(boolean){jit}</text></g></svg></svg>

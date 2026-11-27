@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="1190" onload="init(evt)" viewBox="0 0 1200 1190" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="1190" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">go-sql-driver/T4-mix-binary-default-0.folded (Percona, default; sampled CPU cycles)</text><text id="details" fill="rgb(0,0,0)" x="10" y="1173.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="1173.00"> </text><svg id="frames" x="10" width="1180" total_samples="946349178"><g><title>runtime.gcBgMarkStartWorkers.gowrap1{runner} (2,502,994 cycles, 0.26%)</title><rect x="0.0000%" y="1093" width="0.2645%" height="15" fill="rgb(227,0,7)" fg:x="0" fg:w="2502994"/><text x="0.2500%" y="1103.50"></text></g><g><title>runtime.gcBgMarkWorker{runner} (2,502,994 cycles, 0.26%)</title><rect x="0.0000%" y="1077" width="0.2645%" height="15" fill="rgb(217,0,24)" fg:x="0" fg:w="2502994"/><text x="0.2500%" y="1087.50"></text></g><g><title>runtime.systemstack.abi0{runner} (2,502,994 cycles, 0.26%)</title><rect x="0.0000%" y="1061" width="0.2645%" height="15" fill="rgb(221,193,54)" fg:x="0" fg:w="2502994"/><text x="0.2500%" y="1071.50"></text></g><g><title>runtime.gcBgMarkWorker.func2{runner} (2,502,994 cycles, 0.26%)</title><rect x="0.0000%" y="1045" width="0.2645%" height="15" fill="rgb(248,212,6)" fg:x="0" fg:w="2502994"/><text x="0.2500%" y="1055.50"></text></g><g><title>runtime.gcDrainMarkWorkerFractional{inlined} (2,502,994 cycles, 0.26%)</title><rect x="0.0000%" y="1029" width="0.2645%" height="15" fill="rgb(208,68,35)" fg:x="0" fg:w="2502994"/><text x="0.2500%" y="1039.50"></text></g><g><title>runtime.gcDrain{runner} (2,502,994 cycles, 0.26%)</title><rect x="0.0000%" y="1013" width="0.2645%" height="15" fill="rgb(232,128,0)" fg:x="0" fg:w="2502994"/><text x="0.2500%" y="1023.50"></text></g><g><title>runtime.scanObject{runner} (2,502,994 cycles, 0.26%)</title><rect x="0.0000%" y="997" width="0.2645%" height="15" fill="rgb(207,160,47)" fg:x="0" fg:w="2502994"/><text x="0.2500%" y="1007.50"></text></g><g><title>runtime.tryDeferToSpanScan{runner} (2,502,994 cycles, 0.26%)</title><rect x="0.0000%" y="981" width="0.2645%" height="15" fill="rgb(228,23,34)" fg:x="0" fg:w="2502994"/><text x="0.2500%" y="991.50"></text></g><g><title>database/sql.(*Rows).Next.func1.deferwrap1{runner} (3,583,886 cycles, 0.38%)</title><rect x="1.6151%" y="965" width="0.3787%" height="15" fill="rgb(218,30,26)" fg:x="15284916" fg:w="3583886"/><text x="1.8651%" y="975.50"></text></g><g><title>database/sql.(*closingMutex).RUnlock{runner} (3,583,886 cycles, 0.38%)</title><rect x="1.6151%" y="949" width="0.3787%" height="15" fill="rgb(220,122,19)" fg:x="15284916" fg:w="3583886"/><text x="1.8651%" y="959.50"></text></g><g><title>sync/atomic.(*Int64).CompareAndSwap{inlined} (3,583,886 cycles, 0.38%)</title><rect x="1.6151%" y="933" width="0.3787%" height="15" fill="rgb(250,228,42)" fg:x="15284916" fg:w="3583886"/><text x="1.8651%" y="943.50"></text></g><g><title>database/sql.(*Rows).nextLocked.deferwrap1{runner} (2,515,791 cycles, 0.27%)</title><rect x="1.9939%" y="949" width="0.2658%" height="15" fill="rgb(240,193,28)" fg:x="18868802" fg:w="2515791"/><text x="2.2439%" y="959.50"></text></g><g><title>sync.(*Mutex).Unlock{inlined} (2,515,791 cycles, 0.27%)</title><rect x="1.9939%" y="933" width="0.2658%" height="15" fill="rgb(216,20,37)" fg:x="18868802" fg:w="2515791"/><text x="2.2439%" y="943.50"></text></g><g><title>internal/sync.(*Mutex).Unlock{inlined} (2,515,791 cycles, 0.27%)</title><rect x="1.9939%" y="917" width="0.2658%" height="15" fill="rgb(206,188,39)" fg:x="18868802" fg:w="2515791"/><text x="2.2439%" y="927.50"></text></g><g><title>gcWriteBarrier{runner} (2,566,638 cycles, 0.27%)</title><rect x="2.2597%" y="949" width="0.2712%" height="15" fill="rgb(217,207,13)" fg:x="21384593" fg:w="2566638"/><text x="2.5097%" y="959.50"></text></g><g><title>runtime.wbBufFlush{runner} (2,566,638 cycles, 0.27%)</title><rect x="2.2597%" y="933" width="0.2712%" height="15" fill="rgb(231,73,38)" fg:x="21384593" fg:w="2566638"/><text x="2.5097%" y="943.50"></text></g><g><title>runtime.systemstack.abi0{runner} (2,566,638 cycles, 0.27%)</title><rect x="2.2597%" y="917" width="0.2712%" height="15" fill="rgb(225,20,46)" fg:x="21384593" fg:w="2566638"/><text x="2.5097%" y="927.50"></text></g><g><title>runtime.(*mspan).objIndex{inlined} (2,745,979 cycles, 0.29%)</title><rect x="7.9119%" y="821" width="0.2902%" height="15" fill="rgb(210,31,41)" fg:x="74874047" fg:w="2745979"/><text x="8.1619%" y="831.50"></text></g><g><title>runtime.(*mspan).divideByElemSize{inlined} (2,745,979 cycles, 0.29%)</title><rect x="7.9119%" y="805" width="0.2902%" height="15" fill="rgb(221,200,47)" fg:x="74874047" fg:w="2745979"/><text x="8.1619%" y="815.50"></text></g><g><title>runtime.findObject{runner} (5,305,343 cycles, 0.56%)</title><rect x="7.7779%" y="837" width="0.5606%" height="15" fill="rgb(226,26,5)" fg:x="73605636" fg:w="5305343"/><text x="8.0279%" y="847.50"></text></g><g><title>gcWriteBarrier{runner} (27,863,800 cycles, 2.94%)</title><rect x="6.7322%" y="917" width="2.9443%" height="15" fill="rgb(249,33,26)" fg:x="63710291" fg:w="27863800"/><text x="6.9822%" y="927.50">gc..</text></g><g><title>runtime.wbBufFlush{runner} (26,703,237 cycles, 2.82%)</title><rect x="6.8549%" y="901" width="2.8217%" height="15" fill="rgb(235,183,28)" fg:x="64870854" fg:w="26703237"/><text x="7.1049%" y="911.50">ru..</text></g><g><title>runtime.systemstack.abi0{runner} (26,703,237 cycles, 2.82%)</title><rect x="6.8549%" y="885" width="2.8217%" height="15" fill="rgb(221,5,38)" fg:x="64870854" fg:w="26703237"/><text x="7.1049%" y="895.50">ru..</text></g><g><title>runtime.wbBufFlush.func1{runner} (26,703,237 cycles, 2.82%)</title><rect x="6.8549%" y="869" width="2.8217%" height="15" fill="rgb(247,18,42)" fg:x="64870854" fg:w="26703237"/><text x="7.1049%" y="879.50">ru..</text></g><g><title>runtime.wbBufFlush1{runner} (25,500,938 cycles, 2.69%)</title><rect x="6.9819%" y="853" width="2.6947%" height="15" fill="rgb(241,131,45)" fg:x="66073153" fg:w="25500938"/><text x="7.2319%" y="863.50">ru..</text></g><g><title>runtime.tryDeferToSpanScan{runner} (12,663,112 cycles, 1.34%)</title><rect x="8.3385%" y="837" width="1.3381%" height="15" fill="rgb(249,31,29)" fg:x="78910979" fg:w="12663112"/><text x="8.5885%" y="847.50"></text></g><g><title>runtime.heapArenaOf{inlined} (2,518,185 cycles, 0.27%)</title><rect x="9.4105%" y="821" width="0.2661%" height="15" fill="rgb(225,111,53)" fg:x="89055906" fg:w="2518185"/><text x="9.6605%" y="831.50"></text></g><g><title>internal/poll.(*FD).Read.deferwrap1{runner} (7,463,573 cycles, 0.79%)</title><rect x="9.9451%" y="757" width="0.7887%" height="15" fill="rgb(238,160,17)" fg:x="94115355" fg:w="7463573"/><text x="10.1951%" y="767.50"></text></g><g><title>internal/poll.(*FD).readUnlock{runner} (7,463,573 cycles, 0.79%)</title><rect x="9.9451%" y="741" width="0.7887%" height="15" fill="rgb(214,148,48)" fg:x="94115355" fg:w="7463573"/><text x="10.1951%" y="751.50"></text></g><g><title>internal/poll.(*fdMutex).rwunlock{runner} (7,463,573 cycles, 0.79%)</title><rect x="9.9451%" y="725" width="0.7887%" height="15" fill="rgb(232,36,49)" fg:x="94115355" fg:w="7463573"/><text x="10.1951%" y="735.50"></text></g><g><title>fdget_pos{kernel} (3,573,575 cycles, 0.38%)</title><rect x="10.9972%" y="597" width="0.3776%" height="15" fill="rgb(209,103,24)" fg:x="104072048" fg:w="3573575"/><text x="11.2472%" y="607.50"></text></g><g><title>fput{kernel} (3,771,004 cycles, 0.40%)</title><rect x="11.3748%" y="597" width="0.3985%" height="15" fill="rgb(229,88,8)" fg:x="107645623" fg:w="3771004"/><text x="11.6248%" y="607.50"></text></g><g><title>_raw_spin_lock_bh{kernel} (3,573,877 cycles, 0.38%)</title><rect x="12.0381%" y="517" width="0.3776%" height="15" fill="rgb(213,181,19)" fg:x="113922731" fg:w="3573877"/><text x="12.2881%" y="527.50"></text></g><g><title>skb_copy_datagram_iter{kernel} (8,498,531 cycles, 0.90%)</title><rect x="12.6696%" y="501" width="0.8980%" height="15" fill="rgb(254,191,54)" fg:x="119898628" fg:w="8498531"/><text x="12.9196%" y="511.50"></text></g><g><title>__skb_datagram_iter{kernel} (8,498,531 cycles, 0.90%)</title><rect x="12.6696%" y="485" width="0.8980%" height="15" fill="rgb(241,83,37)" fg:x="119898628" fg:w="8498531"/><text x="12.9196%" y="495.50"></text></g><g><title>simple_copy_to_iter{kernel} (4,870,328 cycles, 0.51%)</title><rect x="13.0530%" y="469" width="0.5146%" height="15" fill="rgb(233,36,39)" fg:x="123526831" fg:w="4870328"/><text x="13.3030%" y="479.50"></text></g><g><title>__check_object_size{kernel} (4,870,328 cycles, 0.51%)</title><rect x="13.0530%" y="453" width="0.5146%" height="15" fill="rgb(226,3,54)" fg:x="123526831" fg:w="4870328"/><text x="13.3030%" y="463.50"></text></g><g><title>check_heap_object{kernel} (4,870,328 cycles, 0.51%)</title><rect x="13.0530%" y="437" width="0.5146%" height="15" fill="rgb(245,192,40)" fg:x="123526831" fg:w="4870328"/><text x="13.3030%" y="447.50"></text></g><g><title>__nr_to_section{kernel} (3,652,405 cycles, 0.39%)</title><rect x="13.1817%" y="421" width="0.3859%" height="15" fill="rgb(238,167,29)" fg:x="124744754" fg:w="3652405"/><text x="13.4317%" y="431.50"></text></g><g><title>__tcp_select_window{kernel} (2,417,352 cycles, 0.26%)</title><rect x="13.5676%" y="469" width="0.2554%" height="15" fill="rgb(232,182,51)" fg:x="128397159" fg:w="2417352"/><text x="13.8176%" y="479.50"></text></g><g><title>__SCT__tp_func_amdgpu_dm_ism_event{kernel} (2,449,258 cycles, 0.26%)</title><rect x="13.8231%" y="309" width="0.2588%" height="15" fill="rgb(231,60,39)" fg:x="130814511" fg:w="2449258"/><text x="14.0731%" y="319.50"></text></g><g><title>__ip_local_out{kernel} (3,647,452 cycles, 0.39%)</title><rect x="13.8231%" y="373" width="0.3854%" height="15" fill="rgb(208,69,12)" fg:x="130814511" fg:w="3647452"/><text x="14.0731%" y="383.50"></text></g><g><title>nf_hook_slow{kernel} (3,647,452 cycles, 0.39%)</title><rect x="13.8231%" y="357" width="0.3854%" height="15" fill="rgb(235,93,37)" fg:x="130814511" fg:w="3647452"/><text x="14.0731%" y="367.50"></text></g><g><title>nft_do_chain_ipv4{kernel} (3,647,452 cycles, 0.39%)</title><rect x="13.8231%" y="341" width="0.3854%" height="15" fill="rgb(213,116,39)" fg:x="130814511" fg:w="3647452"/><text x="14.0731%" y="351.50"></text></g><g><title>nft_do_chain{kernel} (3,647,452 cycles, 0.39%)</title><rect x="13.8231%" y="325" width="0.3854%" height="15" fill="rgb(222,207,29)" fg:x="130814511" fg:w="3647452"/><text x="14.0731%" y="335.50"></text></g><g><title>tcp_cleanup_rbuf{kernel} (11,216,812 cycles, 1.19%)</title><rect x="13.5676%" y="501" width="1.1853%" height="15" fill="rgb(206,96,30)" fg:x="128397159" fg:w="11216812"/><text x="13.8176%" y="511.50"></text></g><g><title>__tcp_cleanup_rbuf{kernel} (11,216,812 cycles, 1.19%)</title><rect x="13.5676%" y="485" width="1.1853%" height="15" fill="rgb(218,138,4)" fg:x="128397159" fg:w="11216812"/><text x="13.8176%" y="495.50"></text></g><g><title>tcp_send_ack{kernel} (8,799,460 cycles, 0.93%)</title><rect x="13.8231%" y="469" width="0.9298%" height="15" fill="rgb(250,191,14)" fg:x="130814511" fg:w="8799460"/><text x="14.0731%" y="479.50"></text></g><g><title>__tcp_send_ack.part.0{kernel} (8,799,460 cycles, 0.93%)</title><rect x="13.8231%" y="453" width="0.9298%" height="15" fill="rgb(239,60,40)" fg:x="130814511" fg:w="8799460"/><text x="14.0731%" y="463.50"></text></g><g><title>__tcp_transmit_skb{kernel} (8,799,460 cycles, 0.93%)</title><rect x="13.8231%" y="437" width="0.9298%" height="15" fill="rgb(206,27,48)" fg:x="130814511" fg:w="8799460"/><text x="14.0731%" y="447.50"></text></g><g><title>ip_queue_xmit{kernel} (8,799,460 cycles, 0.93%)</title><rect x="13.8231%" y="421" width="0.9298%" height="15" fill="rgb(225,35,8)" fg:x="130814511" fg:w="8799460"/><text x="14.0731%" y="431.50"></text></g><g><title>__ip_queue_xmit{kernel} (8,799,460 cycles, 0.93%)</title><rect x="13.8231%" y="405" width="0.9298%" height="15" fill="rgb(250,213,24)" fg:x="130814511" fg:w="8799460"/><text x="14.0731%" y="415.50"></text></g><g><title>ip_local_out{kernel} (8,799,460 cycles, 0.93%)</title><rect x="13.8231%" y="389" width="0.9298%" height="15" fill="rgb(247,123,22)" fg:x="130814511" fg:w="8799460"/><text x="14.0731%" y="399.50"></text></g><g><title>ip_output{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="373" width="0.5444%" height="15" fill="rgb(231,138,38)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="383.50"></text></g><g><title>ip_finish_output{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="357" width="0.5444%" height="15" fill="rgb(231,145,46)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="367.50"></text></g><g><title>__ip_finish_output{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="341" width="0.5444%" height="15" fill="rgb(251,118,11)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="351.50"></text></g><g><title>ip_finish_output2{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="325" width="0.5444%" height="15" fill="rgb(217,147,25)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="335.50"></text></g><g><title>neigh_hh_output{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="309" width="0.5444%" height="15" fill="rgb(247,81,37)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="319.50"></text></g><g><title>__dev_queue_xmit{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="293" width="0.5444%" height="15" fill="rgb(209,12,38)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="303.50"></text></g><g><title>__local_bh_enable_ip{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="277" width="0.5444%" height="15" fill="rgb(227,1,9)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="287.50"></text></g><g><title>do_softirq.part.0{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="261" width="0.5444%" height="15" fill="rgb(248,47,43)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="271.50"></text></g><g><title>__do_softirq{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="245" width="0.5444%" height="15" fill="rgb(221,10,30)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="255.50"></text></g><g><title>handle_softirqs{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="229" width="0.5444%" height="15" fill="rgb(210,229,1)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="239.50"></text></g><g><title>net_rx_action{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="213" width="0.5444%" height="15" fill="rgb(222,148,37)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="223.50"></text></g><g><title>__napi_poll{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="197" width="0.5444%" height="15" fill="rgb(234,67,33)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="207.50"></text></g><g><title>process_backlog{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="181" width="0.5444%" height="15" fill="rgb(247,98,35)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="191.50"></text></g><g><title>__netif_receive_skb{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="165" width="0.5444%" height="15" fill="rgb(247,138,52)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="175.50"></text></g><g><title>__netif_receive_skb_one_core{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="149" width="0.5444%" height="15" fill="rgb(213,79,30)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="159.50"></text></g><g><title>ip_rcv{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="133" width="0.5444%" height="15" fill="rgb(246,177,23)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="143.50"></text></g><g><title>ip_local_deliver{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="117" width="0.5444%" height="15" fill="rgb(230,62,27)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="127.50"></text></g><g><title>ip_local_deliver_finish{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="101" width="0.5444%" height="15" fill="rgb(216,154,8)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="111.50"></text></g><g><title>ip_protocol_deliver_rcu{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="85" width="0.5444%" height="15" fill="rgb(244,35,45)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="95.50"></text></g><g><title>tcp_v4_rcv{kernel} (5,152,008 cycles, 0.54%)</title><rect x="14.2085%" y="69" width="0.5444%" height="15" fill="rgb(251,115,12)" fg:x="134461963" fg:w="5152008"/><text x="14.4585%" y="79.50"></text></g><g><title>tcp_v4_do_rcv{kernel} (2,578,108 cycles, 0.27%)</title><rect x="14.4805%" y="53" width="0.2724%" height="15" fill="rgb(240,54,50)" fg:x="137035863" fg:w="2578108"/><text x="14.7305%" y="63.50"></text></g><g><title>tcp_rcv_established{kernel} (2,578,108 cycles, 0.27%)</title><rect x="14.4805%" y="37" width="0.2724%" height="15" fill="rgb(233,84,52)" fg:x="137035863" fg:w="2578108"/><text x="14.7305%" y="47.50"></text></g><g><title>inet_recvmsg{kernel} (28,271,918 cycles, 2.99%)</title><rect x="11.9018%" y="549" width="2.9875%" height="15" fill="rgb(207,117,47)" fg:x="112633019" fg:w="28271918"/><text x="12.1518%" y="559.50">ine..</text></g><g><title>tcp_recvmsg{kernel} (26,982,206 cycles, 2.85%)</title><rect x="12.0381%" y="533" width="2.8512%" height="15" fill="rgb(249,43,39)" fg:x="113922731" fg:w="26982206"/><text x="12.2881%" y="543.50">tc..</text></g><g><title>tcp_recvmsg_locked{kernel} (23,408,329 cycles, 2.47%)</title><rect x="12.4158%" y="517" width="2.4735%" height="15" fill="rgb(209,38,44)" fg:x="117496608" fg:w="23408329"/><text x="12.6658%" y="527.50">tc..</text></g><g><title>internal/runtime/syscall/linux.Syscall6{runner} (39,324,065 cycles, 4.16%)</title><rect x="10.8700%" y="693" width="4.1553%" height="15" fill="rgb(236,212,23)" fg:x="102868351" fg:w="39324065"/><text x="11.1200%" y="703.50">inter..</text></g><g><title>entry_SYSCALL_64_after_hwframe{kernel} (39,324,065 cycles, 4.16%)</title><rect x="10.8700%" y="677" width="4.1553%" height="15" fill="rgb(242,79,21)" fg:x="102868351" fg:w="39324065"/><text x="11.1200%" y="687.50">entry..</text></g><g><title>do_syscall_64{kernel} (39,324,065 cycles, 4.16%)</title><rect x="10.8700%" y="661" width="4.1553%" height="15" fill="rgb(211,96,35)" fg:x="102868351" fg:w="39324065"/><text x="11.1200%" y="671.50">do_sy..</text></g><g><title>x64_sys_call{kernel} (38,120,368 cycles, 4.03%)</title><rect x="10.9972%" y="645" width="4.0282%" height="15" fill="rgb(253,215,40)" fg:x="104072048" fg:w="38120368"/><text x="11.2472%" y="655.50">x64_..</text></g><g><title>__x64_sys_read{kernel} (38,120,368 cycles, 4.03%)</title><rect x="10.9972%" y="629" width="4.0282%" height="15" fill="rgb(211,81,21)" fg:x="104072048" fg:w="38120368"/><text x="11.2472%" y="639.50">__x6..</text></g><g><title>ksys_read{kernel} (38,120,368 cycles, 4.03%)</title><rect x="10.9972%" y="613" width="4.0282%" height="15" fill="rgb(208,190,38)" fg:x="104072048" fg:w="38120368"/><text x="11.2472%" y="623.50">ksys..</text></g><g><title>vfs_read{kernel} (30,775,789 cycles, 3.25%)</title><rect x="11.7733%" y="597" width="3.2521%" height="15" fill="rgb(235,213,38)" fg:x="111416627" fg:w="30775789"/><text x="12.0233%" y="607.50">vfs..</text></g><g><title>sock_read_iter{kernel} (30,775,789 cycles, 3.25%)</title><rect x="11.7733%" y="581" width="3.2521%" height="15" fill="rgb(237,122,38)" fg:x="111416627" fg:w="30775789"/><text x="12.0233%" y="591.50">soc..</text></g><g><title>sock_recvmsg{kernel} (30,775,789 cycles, 3.25%)</title><rect x="11.7733%" y="565" width="3.2521%" height="15" fill="rgb(244,218,35)" fg:x="111416627" fg:w="30775789"/><text x="12.0233%" y="575.50">soc..</text></g><g><title>runtime.entersyscall{runner} (2,545,217 cycles, 0.27%)</title><rect x="15.0254%" y="693" width="0.2690%" height="15" fill="rgb(240,68,47)" fg:x="142192416" fg:w="2545217"/><text x="15.2754%" y="703.50"></text></g><g><title>runtime.reentersyscall{runner} (2,545,217 cycles, 0.27%)</title><rect x="15.0254%" y="677" width="0.2690%" height="15" fill="rgb(210,16,53)" fg:x="142192416" fg:w="2545217"/><text x="15.2754%" y="687.50"></text></g><g><title>internal/runtime/atomic.(*Uint32).CompareAndSwap{inlined} (2,545,217 cycles, 0.27%)</title><rect x="15.0254%" y="661" width="0.2690%" height="15" fill="rgb(235,124,12)" fg:x="142192416" fg:w="2545217"/><text x="15.2754%" y="671.50"></text></g><g><title>github.com/go-sql-driver/mysql.(*buffer).fill{runner} (55,406,879 cycles, 5.85%)</title><rect x="9.8089%" y="869" width="5.8548%" height="15" fill="rgb(224,169,11)" fg:x="92826760" fg:w="55406879"/><text x="10.0589%" y="879.50">github...</text></g><g><title>github.com/go-sql-driver/mysql.(*mysqlConn).readWithTimeout-fm{runner} (55,406,879 cycles, 5.85%)</title><rect x="9.8089%" y="853" width="5.8548%" height="15" fill="rgb(250,166,2)" fg:x="92826760" fg:w="55406879"/><text x="10.0589%" y="863.50">github...</text></g><g><title>github.com/go-sql-driver/mysql.(*mysqlConn).readWithTimeout{runner} (55,406,879 cycles, 5.85%)</title><rect x="9.8089%" y="837" width="5.8548%" height="15" fill="rgb(242,216,29)" fg:x="92826760" fg:w="55406879"/><text x="10.0589%" y="847.50">github...</text></g><g><title>net.(*conn).Read{runner} (54,118,284 cycles, 5.72%)</title><rect x="9.9451%" y="821" width="5.7186%" height="15" fill="rgb(230,116,27)" fg:x="94115355" fg:w="54118284"/><text x="10.1951%" y="831.50">net.(*c..</text></g><g><title>net.(*netFD).Read{runner} (54,118,284 cycles, 5.72%)</title><rect x="9.9451%" y="805" width="5.7186%" height="15" fill="rgb(228,99,48)" fg:x="94115355" fg:w="54118284"/><text x="10.1951%" y="815.50">net.(*n..</text></g><g><title>net.wrapSyscallError{inlined} (54,118,284 cycles, 5.72%)</title><rect x="9.9451%" y="789" width="5.7186%" height="15" fill="rgb(253,11,6)" fg:x="94115355" fg:w="54118284"/><text x="10.1951%" y="799.50">net.wra..</text></g><g><title>internal/poll.(*FD).Read{runner} (54,118,284 cycles, 5.72%)</title><rect x="9.9451%" y="773" width="5.7186%" height="15" fill="rgb(247,143,39)" fg:x="94115355" fg:w="54118284"/><text x="10.1951%" y="783.50">interna..</text></g><g><title>internal/poll.ignoringEINTRIO{inlined} (46,654,711 cycles, 4.93%)</title><rect x="10.7338%" y="757" width="4.9300%" height="15" fill="rgb(236,97,10)" fg:x="101578928" fg:w="46654711"/><text x="10.9838%" y="767.50">intern..</text></g><g><title>syscall.Read{inlined} (46,654,711 cycles, 4.93%)</title><rect x="10.7338%" y="741" width="4.9300%" height="15" fill="rgb(233,208,19)" fg:x="101578928" fg:w="46654711"/><text x="10.9838%" y="751.50">syscal..</text></g><g><title>syscall.read{runner} (46,654,711 cycles, 4.93%)</title><rect x="10.7338%" y="725" width="4.9300%" height="15" fill="rgb(216,164,2)" fg:x="101578928" fg:w="46654711"/><text x="10.9838%" y="735.50">syscal..</text></g><g><title>syscall.Syscall{runner} (45,365,288 cycles, 4.79%)</title><rect x="10.8700%" y="709" width="4.7937%" height="15" fill="rgb(220,129,5)" fg:x="102868351" fg:w="45365288"/><text x="11.1200%" y="719.50">syscal..</text></g><g><title>runtime.exitsyscall{runner} (3,496,006 cycles, 0.37%)</title><rect x="15.2943%" y="693" width="0.3694%" height="15" fill="rgb(242,17,10)" fg:x="144737633" fg:w="3496006"/><text x="15.5443%" y="703.50"></text></g><g><title>internal/runtime/atomic.(*Uint32).CompareAndSwap{inlined} (3,496,006 cycles, 0.37%)</title><rect x="15.2943%" y="677" width="0.3694%" height="15" fill="rgb(242,107,0)" fg:x="144737633" fg:w="3496006"/><text x="15.5443%" y="687.50"></text></g><g><title>github.com/go-sql-driver/mysql.(*buffer).readNext{inlined} (3,819,947 cycles, 0.40%)</title><rect x="15.6637%" y="869" width="0.4037%" height="15" fill="rgb(251,28,31)" fg:x="148233639" fg:w="3819947"/><text x="15.9137%" y="879.50"></text></g><g><title>gcWriteBarrier{runner} (2,575,747 cycles, 0.27%)</title><rect x="15.7952%" y="853" width="0.2722%" height="15" fill="rgb(233,223,10)" fg:x="149477839" fg:w="2575747"/><text x="16.0452%" y="863.50"></text></g><g><title>runtime.wbBufFlush{runner} (2,575,747 cycles, 0.27%)</title><rect x="15.7952%" y="837" width="0.2722%" height="15" fill="rgb(215,21,27)" fg:x="149477839" fg:w="2575747"/><text x="16.0452%" y="847.50"></text></g><g><title>runtime.systemstack.abi0{runner} (2,575,747 cycles, 0.27%)</title><rect x="15.7952%" y="821" width="0.2722%" height="15" fill="rgb(232,23,21)" fg:x="149477839" fg:w="2575747"/><text x="16.0452%" y="831.50"></text></g><g><title>runtime.wbBufFlush.func1{runner} (2,575,747 cycles, 0.27%)</title><rect x="15.7952%" y="805" width="0.2722%" height="15" fill="rgb(244,5,23)" fg:x="149477839" fg:w="2575747"/><text x="16.0452%" y="815.50"></text></g><g><title>runtime.wbBufFlush1{runner} (2,575,747 cycles, 0.27%)</title><rect x="15.7952%" y="789" width="0.2722%" height="15" fill="rgb(226,81,46)" fg:x="149477839" fg:w="2575747"/><text x="16.0452%" y="799.50"></text></g><g><title>runtime.tryDeferToSpanScan{runner} (2,575,747 cycles, 0.27%)</title><rect x="15.7952%" y="773" width="0.2722%" height="15" fill="rgb(247,70,30)" fg:x="149477839" fg:w="2575747"/><text x="16.0452%" y="783.50"></text></g><g><title>github.com/go-sql-driver/mysql.(*mysqlConn).readPacket{runner} (62,745,699 cycles, 6.63%)</title><rect x="9.6766%" y="917" width="6.6303%" height="15" fill="rgb(212,68,19)" fg:x="91574091" fg:w="62745699"/><text x="9.9266%" y="927.50">github.co..</text></g><g><title>github.com/go-sql-driver/mysql.(*mysqlConn).readNext-fm{runner} (62,745,699 cycles, 6.63%)</title><rect x="9.6766%" y="901" width="6.6303%" height="15" fill="rgb(240,187,13)" fg:x="91574091" fg:w="62745699"/><text x="9.9266%" y="911.50">github.co..</text></g><g><title>github.com/go-sql-driver/mysql.(*mysqlConn).readNext{runner} (61,493,030 cycles, 6.50%)</title><rect x="9.8089%" y="885" width="6.4979%" height="15" fill="rgb(223,113,26)" fg:x="92826760" fg:w="61493030"/><text x="10.0589%" y="895.50">github.co..</text></g><g><title>runtime.memmove{runner} (2,266,204 cycles, 0.24%)</title><rect x="16.0674%" y="869" width="0.2395%" height="15" fill="rgb(206,192,2)" fg:x="152053586" fg:w="2266204"/><text x="16.3174%" y="879.50"></text></g><g><title>runtime.tryDeferToSpanScan{runner} (2,481,126 cycles, 0.26%)</title><rect x="19.8449%" y="741" width="0.2622%" height="15" fill="rgb(241,108,4)" fg:x="187802046" fg:w="2481126"/><text x="20.0949%" y="751.50"></text></g><g><title>runtime.gcAssistAlloc{runner} (7,553,416 cycles, 0.80%)</title><rect x="19.4452%" y="837" width="0.7982%" height="15" fill="rgb(247,173,49)" fg:x="184019321" fg:w="7553416"/><text x="19.6952%" y="847.50"></text></g><g><title>runtime.systemstack.abi0{runner} (7,553,416 cycles, 0.80%)</title><rect x="19.4452%" y="821" width="0.7982%" height="15" fill="rgb(224,114,35)" fg:x="184019321" fg:w="7553416"/><text x="19.6952%" y="831.50"></text></g><g><title>runtime.gcAssistAlloc.func2{runner} (7,553,416 cycles, 0.80%)</title><rect x="19.4452%" y="805" width="0.7982%" height="15" fill="rgb(245,159,27)" fg:x="184019321" fg:w="7553416"/><text x="19.6952%" y="815.50"></text></g><g><title>runtime.gcAssistAlloc1{runner} (7,553,416 cycles, 0.80%)</title><rect x="19.4452%" y="789" width="0.7982%" height="15" fill="rgb(245,172,44)" fg:x="184019321" fg:w="7553416"/><text x="19.6952%" y="799.50"></text></g><g><title>runtime.gcDrainN{runner} (7,553,416 cycles, 0.80%)</title><rect x="19.4452%" y="773" width="0.7982%" height="15" fill="rgb(236,23,11)" fg:x="184019321" fg:w="7553416"/><text x="19.6952%" y="783.50"></text></g><g><title>runtime.scanObject{runner} (5,033,918 cycles, 0.53%)</title><rect x="19.7114%" y="757" width="0.5319%" height="15" fill="rgb(205,117,38)" fg:x="186538819" fg:w="5033918"/><text x="19.9614%" y="767.50"></text></g><g><title>runtime.gcmarknewobject{runner} (13,956,976 cycles, 1.47%)</title><rect x="20.2433%" y="837" width="1.4748%" height="15" fill="rgb(237,72,25)" fg:x="191572737" fg:w="13956976"/><text x="20.4933%" y="847.50"></text></g><g><title>runtime.mallocgc{runner} (43,807,264 cycles, 4.63%)</title><rect x="17.2242%" y="885" width="4.6291%" height="15" fill="rgb(244,70,9)" fg:x="163001378" fg:w="43807264"/><text x="17.4742%" y="895.50">runti..</text></g><g><title>runtime.mallocgcSmallScanNoHeaderSC3{runner} (43,807,264 cycles, 4.63%)</title><rect x="17.2242%" y="869" width="4.6291%" height="15" fill="rgb(217,125,39)" fg:x="163001378" fg:w="43807264"/><text x="17.4742%" y="879.50">runti..</text></g><g><title>runtime.mallocgcSmallScanSlowPath{runner} (24,046,366 cycles, 2.54%)</title><rect x="19.3124%" y="853" width="2.5410%" height="15" fill="rgb(235,36,10)" fg:x="182762276" fg:w="24046366"/><text x="19.5624%" y="863.50">ru..</text></g><g><title>runtime.memmove{runner} (7,390,729 cycles, 0.78%)</title><rect x="21.8533%" y="885" width="0.7810%" height="15" fill="rgb(251,123,47)" fg:x="206808642" fg:w="7390729"/><text x="22.1033%" y="895.50"></text></g><g><title>runtime.typePointers.next{runner} (2,512,389 cycles, 0.27%)</title><rect x="22.9048%" y="853" width="0.2655%" height="15" fill="rgb(221,13,13)" fg:x="216759810" fg:w="2512389"/><text x="23.1548%" y="863.50"></text></g><g><title>runtime.convT{runner} (66,252,329 cycles, 7.00%)</title><rect x="16.9576%" y="901" width="7.0008%" height="15" fill="rgb(238,131,9)" fg:x="160477954" fg:w="66252329"/><text x="17.2076%" y="911.50">runtime.c..</text></g><g><title>runtime.typedmemmove{runner} (12,530,912 cycles, 1.32%)</title><rect x="22.6343%" y="885" width="1.3241%" height="15" fill="rgb(211,50,8)" fg:x="214199371" fg:w="12530912"/><text x="22.8843%" y="895.50"></text></g><g><title>runtime.bulkBarrierPreWrite{runner} (12,530,912 cycles, 1.32%)</title><rect x="22.6343%" y="869" width="1.3241%" height="15" fill="rgb(245,182,24)" fg:x="214199371" fg:w="12530912"/><text x="22.8843%" y="879.50"></text></g><g><title>runtime.wbBufFlush{runner} (7,458,084 cycles, 0.79%)</title><rect x="23.1703%" y="853" width="0.7881%" height="15" fill="rgb(242,14,37)" fg:x="219272199" fg:w="7458084"/><text x="23.4203%" y="863.50"></text></g><g><title>runtime.systemstack.abi0{runner} (7,458,084 cycles, 0.79%)</title><rect x="23.1703%" y="837" width="0.7881%" height="15" fill="rgb(246,228,12)" fg:x="219272199" fg:w="7458084"/><text x="23.4203%" y="847.50"></text></g><g><title>runtime.wbBufFlush.func1{runner} (7,458,084 cycles, 0.79%)</title><rect x="23.1703%" y="821" width="0.7881%" height="15" fill="rgb(213,55,15)" fg:x="219272199" fg:w="7458084"/><text x="23.4203%" y="831.50"></text></g><g><title>runtime.wbBufFlush1{runner} (7,458,084 cycles, 0.79%)</title><rect x="23.1703%" y="805" width="0.7881%" height="15" fill="rgb(209,9,3)" fg:x="219272199" fg:w="7458084"/><text x="23.4203%" y="815.50"></text></g><g><title>runtime.tryDeferToSpanScan{runner} (6,327,464 cycles, 0.67%)</title><rect x="23.2898%" y="789" width="0.6686%" height="15" fill="rgb(230,59,30)" fg:x="220402819" fg:w="6327464"/><text x="23.5398%" y="799.50"></text></g><g><title>runtime.heapArenaOf{inlined} (2,556,404 cycles, 0.27%)</title><rect x="23.6883%" y="773" width="0.2701%" height="15" fill="rgb(209,121,21)" fg:x="224173879" fg:w="2556404"/><text x="23.9383%" y="783.50"></text></g><g><title>runtime.mallocgc{runner} (2,545,140 cycles, 0.27%)</title><rect x="23.9584%" y="901" width="0.2689%" height="15" fill="rgb(220,109,13)" fg:x="226730283" fg:w="2545140"/><text x="24.2084%" y="911.50"></text></g><g><title>time.(*Time).setLoc{inlined} (2,384,626 cycles, 0.25%)</title><rect x="25.4748%" y="885" width="0.2520%" height="15" fill="rgb(232,18,1)" fg:x="241080913" fg:w="2384626"/><text x="25.7248%" y="895.50"></text></g><g><title>time.Date{runner} (15,478,538 cycles, 1.64%)</title><rect x="24.2274%" y="901" width="1.6356%" height="15" fill="rgb(215,41,42)" fg:x="229275423" fg:w="15478538"/><text x="24.4774%" y="911.50"></text></g><g><title>github.com/go-sql-driver/mysql.parseBinaryDateTime{runner} (109,362,582 cycles, 11.56%)</title><rect x="16.3069%" y="917" width="11.5563%" height="15" fill="rgb(224,123,36)" fg:x="154319790" fg:w="109362582"/><text x="16.5569%" y="927.50">github.com/go-sql..</text></g><g><title>time.dateToAbsDays{runner} (18,928,411 cycles, 2.00%)</title><rect x="25.8630%" y="901" width="2.0002%" height="15" fill="rgb(240,125,3)" fg:x="244753961" fg:w="18928411"/><text x="26.1130%" y="911.50">t..</text></g><g><title>runtime.(*mcache).nextFree{runner} (3,775,316 cycles, 0.40%)</title><rect x="30.4893%" y="869" width="0.3989%" height="15" fill="rgb(205,98,50)" fg:x="288535589" fg:w="3775316"/><text x="30.7393%" y="879.50"></text></g><g><title>runtime.(*mcache).refill{runner} (3,775,316 cycles, 0.40%)</title><rect x="30.4893%" y="853" width="0.3989%" height="15" fill="rgb(205,185,37)" fg:x="288535589" fg:w="3775316"/><text x="30.7393%" y="863.50"></text></g><g><title>runtime.(*mcentral).cacheSpan{runner} (3,775,316 cycles, 0.40%)</title><rect x="30.4893%" y="837" width="0.3989%" height="15" fill="rgb(238,207,15)" fg:x="288535589" fg:w="3775316"/><text x="30.7393%" y="847.50"></text></g><g><title>runtime.traceAcquire{inlined} (3,775,316 cycles, 0.40%)</title><rect x="30.4893%" y="821" width="0.3989%" height="15" fill="rgb(213,199,42)" fg:x="288535589" fg:w="3775316"/><text x="30.7393%" y="831.50"></text></g><g><title>runtime.traceEnabled{inlined} (3,775,316 cycles, 0.40%)</title><rect x="30.4893%" y="805" width="0.3989%" height="15" fill="rgb(235,201,11)" fg:x="288535589" fg:w="3775316"/><text x="30.7393%" y="815.50"></text></g><g><title>runtime.deductSweepCredit{runner} (3,775,316 cycles, 0.40%)</title><rect x="30.4893%" y="789" width="0.3989%" height="15" fill="rgb(207,46,11)" fg:x="288535589" fg:w="3775316"/><text x="30.7393%" y="799.50"></text></g><g><title>runtime.sweepone{runner} (3,775,316 cycles, 0.40%)</title><rect x="30.4893%" y="773" width="0.3989%" height="15" fill="rgb(241,35,35)" fg:x="288535589" fg:w="3775316"/><text x="30.7393%" y="783.50"></text></g><g><title>runtime.(*sweepLocked).sweep{runner} (2,437,284 cycles, 0.26%)</title><rect x="30.6307%" y="757" width="0.2575%" height="15" fill="rgb(243,32,47)" fg:x="289873621" fg:w="2437284"/><text x="30.8807%" y="767.50"></text></g><g><title>runtime.acquirem{inlined} (2,446,144 cycles, 0.26%)</title><rect x="32.2198%" y="853" width="0.2585%" height="15" fill="rgb(247,202,23)" fg:x="304912249" fg:w="2446144"/><text x="32.4698%" y="863.50"></text></g><g><title>runtime.markrootBlock{runner} (5,935,370 cycles, 0.63%)</title><rect x="32.4783%" y="757" width="0.6272%" height="15" fill="rgb(219,102,11)" fg:x="307358393" fg:w="5935370"/><text x="32.7283%" y="767.50"></text></g><g><title>runtime.scanblock{runner} (5,935,370 cycles, 0.63%)</title><rect x="32.4783%" y="741" width="0.6272%" height="15" fill="rgb(243,110,44)" fg:x="307358393" fg:w="5935370"/><text x="32.7283%" y="751.50"></text></g><g><title>runtime.markroot{runner} (7,210,086 cycles, 0.76%)</title><rect x="32.4783%" y="773" width="0.7619%" height="15" fill="rgb(222,74,54)" fg:x="307358393" fg:w="7210086"/><text x="32.7283%" y="783.50"></text></g><g><title>runtime.gcAssistAlloc{runner} (8,492,432 cycles, 0.90%)</title><rect x="32.4783%" y="853" width="0.8974%" height="15" fill="rgb(216,99,12)" fg:x="307358393" fg:w="8492432"/><text x="32.7283%" y="863.50"></text></g><g><title>runtime.systemstack.abi0{runner} (8,492,432 cycles, 0.90%)</title><rect x="32.4783%" y="837" width="0.8974%" height="15" fill="rgb(226,22,26)" fg:x="307358393" fg:w="8492432"/><text x="32.7283%" y="847.50"></text></g><g><title>runtime.gcAssistAlloc.func2{runner} (8,492,432 cycles, 0.90%)</title><rect x="32.4783%" y="821" width="0.8974%" height="15" fill="rgb(217,163,10)" fg:x="307358393" fg:w="8492432"/><text x="32.7283%" y="831.50"></text></g><g><title>runtime.gcAssistAlloc1{runner} (8,492,432 cycles, 0.90%)</title><rect x="32.4783%" y="805" width="0.8974%" height="15" fill="rgb(213,25,53)" fg:x="307358393" fg:w="8492432"/><text x="32.7283%" y="815.50"></text></g><g><title>runtime.gcDrainN{runner} (8,492,432 cycles, 0.90%)</title><rect x="32.4783%" y="789" width="0.8974%" height="15" fill="rgb(252,105,26)" fg:x="307358393" fg:w="8492432"/><text x="32.7283%" y="799.50"></text></g><g><title>runtime.mallocgcTinySlowPath{runner} (29,698,397 cycles, 3.14%)</title><rect x="31.1644%" y="869" width="3.1382%" height="15" fill="rgb(220,39,43)" fg:x="294923616" fg:w="29698397"/><text x="31.4144%" y="879.50">run..</text></g><g><title>runtime.gcmarknewobject{runner} (8,771,188 cycles, 0.93%)</title><rect x="33.3757%" y="853" width="0.9268%" height="15" fill="rgb(229,68,48)" fg:x="315850825" fg:w="8771188"/><text x="33.6257%" y="863.50"></text></g><g><title>runtime.(*mspan).base{inlined} (3,722,217 cycles, 0.39%)</title><rect x="33.9092%" y="837" width="0.3933%" height="15" fill="rgb(252,8,32)" fg:x="320899796" fg:w="3722217"/><text x="34.1592%" y="847.50"></text></g><g><title>runtime.mallocgcTinySC2{runner} (55,846,740 cycles, 5.90%)</title><rect x="28.6488%" y="885" width="5.9013%" height="15" fill="rgb(223,20,43)" fg:x="271117640" fg:w="55846740"/><text x="28.8988%" y="895.50">runtime...</text></g><g><title>runtime.releasem{inlined} (2,342,367 cycles, 0.25%)</title><rect x="34.3026%" y="869" width="0.2475%" height="15" fill="rgb(229,81,49)" fg:x="324622013" fg:w="2342367"/><text x="34.5526%" y="879.50"></text></g><g><title>runtime.convT64{runner} (62,021,531 cycles, 6.55%)</title><rect x="28.1310%" y="917" width="6.5538%" height="15" fill="rgb(236,28,36)" fg:x="266217084" fg:w="62021531"/><text x="28.3810%" y="927.50">runtime.c..</text></g><g><title>runtime.mallocgc{runner} (58,393,562 cycles, 6.17%)</title><rect x="28.5143%" y="901" width="6.1704%" height="15" fill="rgb(249,185,26)" fg:x="269845053" fg:w="58393562"/><text x="28.7643%" y="911.50">runtime...</text></g><g><title>gcWriteBarrier{runner} (11,327,191 cycles, 1.20%)</title><rect x="34.9443%" y="901" width="1.1969%" height="15" fill="rgb(249,174,33)" fg:x="330695529" fg:w="11327191"/><text x="35.1943%" y="911.50"></text></g><g><title>runtime.wbBufFlush{runner} (11,327,191 cycles, 1.20%)</title><rect x="34.9443%" y="885" width="1.1969%" height="15" fill="rgb(233,201,37)" fg:x="330695529" fg:w="11327191"/><text x="35.1943%" y="895.50"></text></g><g><title>runtime.systemstack.abi0{runner} (11,327,191 cycles, 1.20%)</title><rect x="34.9443%" y="869" width="1.1969%" height="15" fill="rgb(221,78,26)" fg:x="330695529" fg:w="11327191"/><text x="35.1943%" y="879.50"></text></g><g><title>runtime.wbBufFlush.func1{runner} (11,327,191 cycles, 1.20%)</title><rect x="34.9443%" y="853" width="1.1969%" height="15" fill="rgb(250,127,30)" fg:x="330695529" fg:w="11327191"/><text x="35.1943%" y="863.50"></text></g><g><title>runtime.wbBufFlush1{runner} (10,035,459 cycles, 1.06%)</title><rect x="35.0808%" y="837" width="1.0604%" height="15" fill="rgb(230,49,44)" fg:x="331987261" fg:w="10035459"/><text x="35.3308%" y="847.50"></text></g><g><title>runtime.tryDeferToSpanScan{runner} (6,352,423 cycles, 0.67%)</title><rect x="35.4700%" y="821" width="0.6713%" height="15" fill="rgb(229,67,23)" fg:x="335670297" fg:w="6352423"/><text x="35.7200%" y="831.50"></text></g><g><title>runtime.(*mheap).freeSpan{inlined} (3,661,519 cycles, 0.39%)</title><rect x="39.8469%" y="741" width="0.3869%" height="15" fill="rgb(249,83,47)" fg:x="377091027" fg:w="3661519"/><text x="40.0969%" y="751.50"></text></g><g><title>runtime.systemstack.abi0{runner} (3,661,519 cycles, 0.39%)</title><rect x="39.8469%" y="725" width="0.3869%" height="15" fill="rgb(215,43,3)" fg:x="377091027" fg:w="3661519"/><text x="40.0969%" y="735.50"></text></g><g><title>runtime.(*mheap).freeSpan.func1{runner} (3,661,519 cycles, 0.39%)</title><rect x="39.8469%" y="709" width="0.3869%" height="15" fill="rgb(238,154,13)" fg:x="377091027" fg:w="3661519"/><text x="40.0969%" y="719.50"></text></g><g><title>runtime.(*mheap).freeSpanLocked{runner} (2,435,612 cycles, 0.26%)</title><rect x="39.9765%" y="693" width="0.2574%" height="15" fill="rgb(219,56,2)" fg:x="378316934" fg:w="2435612"/><text x="40.2265%" y="703.50"></text></g><g><title>runtime.(*pageAlloc).free{runner} (2,435,612 cycles, 0.26%)</title><rect x="39.9765%" y="677" width="0.2574%" height="15" fill="rgb(233,0,4)" fg:x="378316934" fg:w="2435612"/><text x="40.2265%" y="687.50"></text></g><g><title>runtime.(*mcache).nextFree{runner} (9,942,953 cycles, 1.05%)</title><rect x="39.4533%" y="869" width="1.0507%" height="15" fill="rgb(235,30,7)" fg:x="373366093" fg:w="9942953"/><text x="39.7033%" y="879.50"></text></g><g><title>runtime.(*mcache).refill{runner} (9,942,953 cycles, 1.05%)</title><rect x="39.4533%" y="853" width="1.0507%" height="15" fill="rgb(250,79,13)" fg:x="373366093" fg:w="9942953"/><text x="39.7033%" y="863.50"></text></g><g><title>runtime.(*mcentral).cacheSpan{runner} (9,942,953 cycles, 1.05%)</title><rect x="39.4533%" y="837" width="1.0507%" height="15" fill="rgb(211,146,34)" fg:x="373366093" fg:w="9942953"/><text x="39.7033%" y="847.50"></text></g><g><title>runtime.traceAcquire{inlined} (9,942,953 cycles, 1.05%)</title><rect x="39.4533%" y="821" width="1.0507%" height="15" fill="rgb(228,22,38)" fg:x="373366093" fg:w="9942953"/><text x="39.7033%" y="831.50"></text></g><g><title>runtime.traceEnabled{inlined} (9,942,953 cycles, 1.05%)</title><rect x="39.4533%" y="805" width="1.0507%" height="15" fill="rgb(235,168,5)" fg:x="373366093" fg:w="9942953"/><text x="39.7033%" y="815.50"></text></g><g><title>runtime.deductSweepCredit{runner} (9,942,953 cycles, 1.05%)</title><rect x="39.4533%" y="789" width="1.0507%" height="15" fill="rgb(221,155,16)" fg:x="373366093" fg:w="9942953"/><text x="39.7033%" y="799.50"></text></g><g><title>runtime.sweepone{runner} (9,942,953 cycles, 1.05%)</title><rect x="39.4533%" y="773" width="1.0507%" height="15" fill="rgb(215,215,53)" fg:x="373366093" fg:w="9942953"/><text x="39.7033%" y="783.50"></text></g><g><title>runtime.(*sweepLocked).sweep{runner} (7,423,594 cycles, 0.78%)</title><rect x="39.7195%" y="757" width="0.7844%" height="15" fill="rgb(223,4,10)" fg:x="375885452" fg:w="7423594"/><text x="39.9695%" y="767.50"></text></g><g><title>runtime.acquirem{inlined} (2,455,311 cycles, 0.26%)</title><rect x="40.5040%" y="869" width="0.2595%" height="15" fill="rgb(234,103,6)" fg:x="383309046" fg:w="2455311"/><text x="40.7540%" y="879.50"></text></g><g><title>runtime.(*mcentral).cacheSpan{runner} (3,825,403 cycles, 0.40%)</title><rect x="42.0784%" y="821" width="0.4042%" height="15" fill="rgb(227,97,0)" fg:x="398208895" fg:w="3825403"/><text x="42.3284%" y="831.50"></text></g><g><title>runtime.(*mcentral).grow{runner} (3,825,403 cycles, 0.40%)</title><rect x="42.0784%" y="805" width="0.4042%" height="15" fill="rgb(234,150,53)" fg:x="398208895" fg:w="3825403"/><text x="42.3284%" y="815.50"></text></g><g><title>runtime.(*mheap).alloc{runner} (3,825,403 cycles, 0.40%)</title><rect x="42.0784%" y="789" width="0.4042%" height="15" fill="rgb(228,201,54)" fg:x="398208895" fg:w="3825403"/><text x="42.3284%" y="799.50"></text></g><g><title>runtime.systemstack.abi0{runner} (3,825,403 cycles, 0.40%)</title><rect x="42.0784%" y="773" width="0.4042%" height="15" fill="rgb(222,22,37)" fg:x="398208895" fg:w="3825403"/><text x="42.3284%" y="783.50"></text></g><g><title>runtime.(*mheap).alloc.func1{runner} (3,825,403 cycles, 0.40%)</title><rect x="42.0784%" y="757" width="0.4042%" height="15" fill="rgb(237,53,32)" fg:x="398208895" fg:w="3825403"/><text x="42.3284%" y="767.50"></text></g><g><title>runtime.(*mheap).allocSpan{runner} (3,825,403 cycles, 0.40%)</title><rect x="42.0784%" y="741" width="0.4042%" height="15" fill="rgb(233,25,53)" fg:x="398208895" fg:w="3825403"/><text x="42.3284%" y="751.50"></text></g><g><title>runtime.(*mcache).refill{runner} (7,515,328 cycles, 0.79%)</title><rect x="41.9430%" y="837" width="0.7941%" height="15" fill="rgb(210,40,34)" fg:x="396926911" fg:w="7515328"/><text x="42.1930%" y="847.50"></text></g><g><title>runtime.(*mcentral).uncacheSpan{runner} (2,407,941 cycles, 0.25%)</title><rect x="42.4827%" y="821" width="0.2544%" height="15" fill="rgb(241,220,44)" fg:x="402034298" fg:w="2407941"/><text x="42.7327%" y="831.50"></text></g><g><title>runtime.(*mcache).nextFree{runner} (8,801,222 cycles, 0.93%)</title><rect x="41.9430%" y="853" width="0.9300%" height="15" fill="rgb(235,28,35)" fg:x="396926911" fg:w="8801222"/><text x="42.1930%" y="863.50"></text></g><g><title>runtime.markroot{runner} (3,678,677 cycles, 0.39%)</title><rect x="43.0074%" y="773" width="0.3887%" height="15" fill="rgb(210,56,17)" fg:x="407000443" fg:w="3678677"/><text x="43.2574%" y="783.50"></text></g><g><title>runtime.markrootBlock{runner} (2,396,938 cycles, 0.25%)</title><rect x="43.1429%" y="757" width="0.2533%" height="15" fill="rgb(224,130,29)" fg:x="408282182" fg:w="2396938"/><text x="43.3929%" y="767.50"></text></g><g><title>runtime.scanblock{runner} (2,396,938 cycles, 0.25%)</title><rect x="43.1429%" y="741" width="0.2533%" height="15" fill="rgb(235,212,8)" fg:x="408282182" fg:w="2396938"/><text x="43.3929%" y="751.50"></text></g><g><title>runtime.scanObject{runner} (4,990,284 cycles, 0.53%)</title><rect x="43.3962%" y="773" width="0.5273%" height="15" fill="rgb(223,33,50)" fg:x="410679120" fg:w="4990284"/><text x="43.6462%" y="783.50"></text></g><g><title>internal/runtime/gc/scan.ScanSpanPackedAVX512{runner} (2,564,697 cycles, 0.27%)</title><rect x="43.9235%" y="757" width="0.2710%" height="15" fill="rgb(219,149,13)" fg:x="415669404" fg:w="2564697"/><text x="44.1735%" y="767.50"></text></g><g><title>internal/runtime/gc/scan.scanSpanPackedAVX512.abi0{runner} (2,564,697 cycles, 0.27%)</title><rect x="43.9235%" y="741" width="0.2710%" height="15" fill="rgb(250,156,29)" fg:x="415669404" fg:w="2564697"/><text x="44.1735%" y="751.50"></text></g><g><title>runtime.gcAssistAlloc{runner} (12,516,464 cycles, 1.32%)</title><rect x="43.0074%" y="853" width="1.3226%" height="15" fill="rgb(216,193,19)" fg:x="407000443" fg:w="12516464"/><text x="43.2574%" y="863.50"></text></g><g><title>runtime.systemstack.abi0{runner} (12,516,464 cycles, 1.32%)</title><rect x="43.0074%" y="837" width="1.3226%" height="15" fill="rgb(216,135,14)" fg:x="407000443" fg:w="12516464"/><text x="43.2574%" y="847.50"></text></g><g><title>runtime.gcAssistAlloc.func2{runner} (12,516,464 cycles, 1.32%)</title><rect x="43.0074%" y="821" width="1.3226%" height="15" fill="rgb(241,47,5)" fg:x="407000443" fg:w="12516464"/><text x="43.2574%" y="831.50"></text></g><g><title>runtime.gcAssistAlloc1{runner} (12,516,464 cycles, 1.32%)</title><rect x="43.0074%" y="805" width="1.3226%" height="15" fill="rgb(233,42,35)" fg:x="407000443" fg:w="12516464"/><text x="43.2574%" y="815.50"></text></g><g><title>runtime.gcDrainN{runner} (12,516,464 cycles, 1.32%)</title><rect x="43.0074%" y="789" width="1.3226%" height="15" fill="rgb(231,13,6)" fg:x="407000443" fg:w="12516464"/><text x="43.2574%" y="799.50"></text></g><g><title>runtime.scanSpan{runner} (3,847,503 cycles, 0.41%)</title><rect x="43.9235%" y="773" width="0.4066%" height="15" fill="rgb(207,181,40)" fg:x="415669404" fg:w="3847503"/><text x="44.1735%" y="783.50"></text></g><g><title>runtime.gcmarknewobject{runner} (31,178,836 cycles, 3.29%)</title><rect x="44.3300%" y="853" width="3.2946%" height="15" fill="rgb(254,173,49)" fg:x="419516907" fg:w="31178836"/><text x="44.5800%" y="863.50">run..</text></g><g><title>runtime.convTslice{runner} (126,311,687 cycles, 13.35%)</title><rect x="34.6847%" y="917" width="13.3473%" height="15" fill="rgb(221,1,38)" fg:x="328238615" fg:w="126311687"/><text x="34.9347%" y="927.50">runtime.convTslice{r..</text></g><g><title>runtime.mallocgc{runner} (112,527,582 cycles, 11.89%)</title><rect x="36.1413%" y="901" width="11.8907%" height="15" fill="rgb(206,124,46)" fg:x="342022720" fg:w="112527582"/><text x="36.3913%" y="911.50">runtime.mallocgc{r..</text></g><g><title>runtime.mallocgcSmallScanNoHeaderSC3{runner} (105,018,259 cycles, 11.10%)</title><rect x="36.9348%" y="885" width="11.0972%" height="15" fill="rgb(249,21,11)" fg:x="349532043" fg:w="105018259"/><text x="37.1848%" y="895.50">runtime.mallocgc..</text></g><g><title>runtime.mallocgcSmallScanSlowPath{runner} (66,249,933 cycles, 7.00%)</title><rect x="41.0314%" y="869" width="7.0006%" height="15" fill="rgb(222,201,40)" fg:x="388300369" fg:w="66249933"/><text x="41.2814%" y="879.50">runtime.m..</text></g><g><title>runtime.spanHeapBitsRange{inlined} (2,563,244 cycles, 0.27%)</title><rect x="47.7611%" y="853" width="0.2709%" height="15" fill="rgb(235,61,29)" fg:x="451987058" fg:w="2563244"/><text x="48.0111%" y="863.50"></text></g><g><title>runtime.gcUsesSpanInlineMarkBits{inlined} (2,563,244 cycles, 0.27%)</title><rect x="47.7611%" y="837" width="0.2709%" height="15" fill="rgb(219,207,3)" fg:x="451987058" fg:w="2563244"/><text x="48.0111%" y="847.50"></text></g><g><title>github.com/go-sql-driver/mysql.(*binaryRows).readRow{runner} (432,930,030 cycles, 45.75%)</title><rect x="2.5309%" y="933" width="45.7474%" height="15" fill="rgb(222,56,46)" fg:x="23951231" fg:w="432930030"/><text x="2.7809%" y="943.50">github.com/go-sql-driver/mysql.(*binaryRows).readRow{runner}</text></g><g><title>github.com/go-sql-driver/mysql.parseBinaryDateTime{runner} (3,670,887 cycles, 0.39%)</title><rect x="48.2783%" y="933" width="0.3879%" height="15" fill="rgb(239,76,54)" fg:x="456881261" fg:w="3670887"/><text x="48.5283%" y="943.50"></text></g><g><title>runtime.convT64{runner} (2,521,392 cycles, 0.27%)</title><rect x="48.6662%" y="933" width="0.2664%" height="15" fill="rgb(231,124,27)" fg:x="460552148" fg:w="2521392"/><text x="48.9162%" y="943.50"></text></g><g><title>database/sql.(*Rows).nextLocked{runner} (445,472,177 cycles, 47.07%)</title><rect x="1.9939%" y="965" width="47.0727%" height="15" fill="rgb(249,195,6)" fg:x="18868802" fg:w="445472177"/><text x="2.2439%" y="975.50">database/sql.(*Rows).nextLocked{runner}</text></g><g><title>github.com/go-sql-driver/mysql.(*binaryRows).Next{runner} (440,389,748 cycles, 46.54%)</title><rect x="2.5309%" y="949" width="46.5357%" height="15" fill="rgb(237,174,47)" fg:x="23951231" fg:w="440389748"/><text x="2.7809%" y="959.50">github.com/go-sql-driver/mysql.(*binaryRows).Next{runner}</text></g><g><title>database/sql.(*closingMutex).RLock{runner} (2,374,773 cycles, 0.25%)</title><rect x="49.0666%" y="965" width="0.2509%" height="15" fill="rgb(206,201,31)" fg:x="464340979" fg:w="2374773"/><text x="49.3166%" y="975.50"></text></g><g><title>database/sql.(*closingMutex).TryRLock{inlined} (2,374,773 cycles, 0.25%)</title><rect x="49.0666%" y="949" width="0.2509%" height="15" fill="rgb(231,57,52)" fg:x="464340979" fg:w="2374773"/><text x="49.3166%" y="959.50"></text></g><g><title>sync/atomic.(*Int64).CompareAndSwap{inlined} (2,374,773 cycles, 0.25%)</title><rect x="49.0666%" y="933" width="0.2509%" height="15" fill="rgb(248,177,22)" fg:x="464340979" fg:w="2374773"/><text x="49.3166%" y="943.50"></text></g><g><title>database/sql.(*Rows).Next{runner} (452,719,302 cycles, 47.84%)</title><rect x="1.6151%" y="997" width="47.8385%" height="15" fill="rgb(215,211,37)" fg:x="15284916" fg:w="452719302"/><text x="1.8651%" y="1007.50">database/sql.(*Rows).Next{runner}</text></g><g><title>database/sql.(*Rows).Next.func1{runner} (452,719,302 cycles, 47.84%)</title><rect x="1.6151%" y="981" width="47.8385%" height="15" fill="rgb(241,128,51)" fg:x="15284916" fg:w="452719302"/><text x="1.8651%" y="991.50">database/sql.(*Rows).Next.func1{runner}</text></g><g><title>reflect.Indirect{inlined} (2,544,347 cycles, 0.27%)</title><rect x="64.1857%" y="917" width="0.2689%" height="15" fill="rgb(227,165,31)" fg:x="607420705" fg:w="2544347"/><text x="64.4357%" y="927.50"></text></g><g><title>reflect.Value.Elem{runner} (2,544,347 cycles, 0.27%)</title><rect x="64.1857%" y="901" width="0.2689%" height="15" fill="rgb(228,167,24)" fg:x="607420705" fg:w="2544347"/><text x="64.4357%" y="911.50"></text></g><g><title>reflect.Value.assignTo{runner} (2,459,209 cycles, 0.26%)</title><rect x="64.5807%" y="901" width="0.2599%" height="15" fill="rgb(228,143,12)" fg:x="611158725" fg:w="2459209"/><text x="64.8307%" y="911.50"></text></g><g><title>runtime.memmove{runner} (2,576,860 cycles, 0.27%)</title><rect x="65.3677%" y="885" width="0.2723%" height="15" fill="rgb(249,149,8)" fg:x="618606541" fg:w="2576860"/><text x="65.6177%" y="895.50"></text></g><g><title>database/sql.convertAssignRows{runner} (24,845,653 cycles, 2.63%)</title><rect x="63.1422%" y="933" width="2.6254%" height="15" fill="rgb(243,35,44)" fg:x="597545746" fg:w="24845653"/><text x="63.3922%" y="943.50">da..</text></g><g><title>reflect.Value.Set{runner} (12,426,347 cycles, 1.31%)</title><rect x="64.4545%" y="917" width="1.3131%" height="15" fill="rgb(246,89,9)" fg:x="609965052" fg:w="12426347"/><text x="64.7045%" y="927.50"></text></g><g><title>reflect.typedmemmove{runner} (7,484,182 cycles, 0.79%)</title><rect x="64.9768%" y="901" width="0.7908%" height="15" fill="rgb(233,213,13)" fg:x="614907217" fg:w="7484182"/><text x="65.2268%" y="911.50"></text></g><g><title>database/sql.(*NullFloat64).Scan{runner} (28,719,131 cycles, 3.03%)</title><rect x="62.8693%" y="949" width="3.0347%" height="15" fill="rgb(233,141,41)" fg:x="594962827" fg:w="28719131"/><text x="63.1193%" y="959.50">dat..</text></g><g><title>reflect.Indirect{inlined} (5,749,232 cycles, 0.61%)</title><rect x="69.1534%" y="917" width="0.6075%" height="15" fill="rgb(239,167,4)" fg:x="654432751" fg:w="5749232"/><text x="69.4034%" y="927.50"></text></g><g><title>reflect.Value.Elem{runner} (5,749,232 cycles, 0.61%)</title><rect x="69.1534%" y="901" width="0.6075%" height="15" fill="rgb(209,217,16)" fg:x="654432751" fg:w="5749232"/><text x="69.4034%" y="911.50"></text></g><g><title>reflect.flag.kind{inlined} (4,459,545 cycles, 0.47%)</title><rect x="69.2897%" y="885" width="0.4712%" height="15" fill="rgb(219,88,35)" fg:x="655722438" fg:w="4459545"/><text x="69.5397%" y="895.50"></text></g><g><title>reflect.Value.IsValid{inlined} (4,985,248 cycles, 0.53%)</title><rect x="69.7609%" y="917" width="0.5268%" height="15" fill="rgb(220,193,23)" fg:x="660181983" fg:w="4985248"/><text x="70.0109%" y="927.50"></text></g><g><title>reflect.(*rtype).common{inlined} (3,761,303 cycles, 0.40%)</title><rect x="71.7947%" y="869" width="0.3975%" height="15" fill="rgb(230,90,52)" fg:x="679428978" fg:w="3761303"/><text x="72.0447%" y="879.50"></text></g><g><title>reflect.(*rtype).AssignableTo{runner} (19,251,243 cycles, 2.03%)</title><rect x="70.2877%" y="885" width="2.0343%" height="15" fill="rgb(252,106,19)" fg:x="665167231" fg:w="19251243"/><text x="70.5377%" y="895.50">r..</text></g><g><title>reflect.Value.Kind{inlined} (20,525,412 cycles, 2.17%)</title><rect x="70.2877%" y="917" width="2.1689%" height="15" fill="rgb(206,74,20)" fg:x="665167231" fg:w="20525412"/><text x="70.5377%" y="927.50">r..</text></g><g><title>reflect.flag.kind{inlined} (20,525,412 cycles, 2.17%)</title><rect x="70.2877%" y="901" width="2.1689%" height="15" fill="rgb(230,138,44)" fg:x="665167231" fg:w="20525412"/><text x="70.5377%" y="911.50">r..</text></g><g><title>reflect.directlyAssignable{runner} (2,382,001 cycles, 0.25%)</title><rect x="74.7077%" y="885" width="0.2517%" height="15" fill="rgb(235,182,43)" fg:x="706995253" fg:w="2382001"/><text x="74.9577%" y="895.50"></text></g><g><title>reflect.Value.assignTo{runner} (12,177,567 cycles, 1.29%)</title><rect x="73.7909%" y="901" width="1.2868%" height="15" fill="rgb(242,16,51)" fg:x="698319901" fg:w="12177567"/><text x="74.0409%" y="911.50"></text></g><g><title>runtime.memmove{runner} (3,506,160 cycles, 0.37%)</title><rect x="75.7264%" y="885" width="0.3705%" height="15" fill="rgb(248,9,4)" fg:x="716635787" fg:w="3506160"/><text x="75.9764%" y="895.50"></text></g><g><title>reflect.Value.Set{runner} (37,053,425 cycles, 3.92%)</title><rect x="72.4566%" y="917" width="3.9154%" height="15" fill="rgb(210,31,22)" fg:x="685692643" fg:w="37053425"/><text x="72.7066%" y="927.50">refl..</text></g><g><title>reflect.typedmemmove{runner} (9,865,912 cycles, 1.04%)</title><rect x="75.3295%" y="901" width="1.0425%" height="15" fill="rgb(239,54,39)" fg:x="712880156" fg:w="9865912"/><text x="75.5795%" y="911.50"></text></g><g><title>runtime.typedmemmove{runner} (2,604,121 cycles, 0.28%)</title><rect x="76.0969%" y="885" width="0.2752%" height="15" fill="rgb(230,99,41)" fg:x="720141947" fg:w="2604121"/><text x="76.3469%" y="895.50"></text></g><g><title>database/sql.convertAssignRows{runner} (99,190,845 cycles, 10.48%)</title><rect x="66.4252%" y="933" width="10.4814%" height="15" fill="rgb(253,106,12)" fg:x="628614058" fg:w="99190845"/><text x="66.6752%" y="943.50">database/sql.co..</text></g><g><title>reflect.ValueOf{inlined} (3,777,834 cycles, 0.40%)</title><rect x="76.5074%" y="917" width="0.3992%" height="15" fill="rgb(213,46,41)" fg:x="724027069" fg:w="3777834"/><text x="76.7574%" y="927.50"></text></g><g><title>database/sql.convertAssign{inlined} (2,328,613 cycles, 0.25%)</title><rect x="76.9066%" y="933" width="0.2461%" height="15" fill="rgb(215,133,35)" fg:x="727804903" fg:w="2328613"/><text x="77.1566%" y="943.50"></text></g><g><title>reflect.(*rtype).AssignableTo{runner} (3,844,301 cycles, 0.41%)</title><rect x="77.1527%" y="933" width="0.4062%" height="15" fill="rgb(213,28,5)" fg:x="730133516" fg:w="3844301"/><text x="77.4027%" y="943.50"></text></g><g><title>database/sql.(*NullInt64).Scan{runner} (114,123,095 cycles, 12.06%)</title><rect x="65.9040%" y="949" width="12.0593%" height="15" fill="rgb(215,77,49)" fg:x="623681958" fg:w="114123095"/><text x="66.1540%" y="959.50">database/sql.(*Nul..</text></g><g><title>reflect.Value.Set{runner} (3,827,236 cycles, 0.40%)</title><rect x="77.5589%" y="933" width="0.4044%" height="15" fill="rgb(248,100,22)" fg:x="733977817" fg:w="3827236"/><text x="77.8089%" y="943.50"></text></g><g><title>gcWriteBarrier{runner} (7,462,075 cycles, 0.79%)</title><rect x="79.9125%" y="917" width="0.7885%" height="15" fill="rgb(208,67,9)" fg:x="756251108" fg:w="7462075"/><text x="80.1625%" y="927.50"></text></g><g><title>runtime.wbBufFlush{runner} (6,269,781 cycles, 0.66%)</title><rect x="80.0385%" y="901" width="0.6625%" height="15" fill="rgb(219,133,21)" fg:x="757443402" fg:w="6269781"/><text x="80.2885%" y="911.50"></text></g><g><title>runtime.systemstack.abi0{runner} (6,269,781 cycles, 0.66%)</title><rect x="80.0385%" y="885" width="0.6625%" height="15" fill="rgb(246,46,29)" fg:x="757443402" fg:w="6269781"/><text x="80.2885%" y="895.50"></text></g><g><title>runtime.wbBufFlush.func1{runner} (6,269,781 cycles, 0.66%)</title><rect x="80.0385%" y="869" width="0.6625%" height="15" fill="rgb(246,185,52)" fg:x="757443402" fg:w="6269781"/><text x="80.2885%" y="879.50"></text></g><g><title>runtime.wbBufFlush1{runner} (6,269,781 cycles, 0.66%)</title><rect x="80.0385%" y="853" width="0.6625%" height="15" fill="rgb(252,136,11)" fg:x="757443402" fg:w="6269781"/><text x="80.2885%" y="863.50"></text></g><g><title>runtime.tryDeferToSpanScan{runner} (3,859,846 cycles, 0.41%)</title><rect x="80.2931%" y="837" width="0.4079%" height="15" fill="rgb(219,138,53)" fg:x="759853337" fg:w="3859846"/><text x="80.5431%" y="847.50"></text></g><g><title>runtime.mallocgc{runner} (2,459,983 cycles, 0.26%)</title><rect x="80.7010%" y="917" width="0.2599%" height="15" fill="rgb(211,51,23)" fg:x="763713183" fg:w="2459983"/><text x="80.9510%" y="927.50"></text></g><g><title>runtime.memmove{runner} (12,521,006 cycles, 1.32%)</title><rect x="80.9609%" y="917" width="1.3231%" height="15" fill="rgb(247,221,28)" fg:x="766173166" fg:w="12521006"/><text x="81.2109%" y="927.50"></text></g><g><title>runtime.tryDeferToSpanScan{runner} (3,726,183 cycles, 0.39%)</title><rect x="83.8828%" y="773" width="0.3937%" height="15" fill="rgb(251,222,45)" fg:x="793823986" fg:w="3726183"/><text x="84.1328%" y="783.50"></text></g><g><title>runtime.heapArenaOf{inlined} (2,585,243 cycles, 0.27%)</title><rect x="84.0033%" y="757" width="0.2732%" height="15" fill="rgb(217,162,53)" fg:x="794964926" fg:w="2585243"/><text x="84.2533%" y="767.50"></text></g><g><title>runtime.scanObject{runner} (7,561,320 cycles, 0.80%)</title><rect x="83.8828%" y="789" width="0.7990%" height="15" fill="rgb(229,93,14)" fg:x="793823986" fg:w="7561320"/><text x="84.1328%" y="799.50"></text></g><g><title>runtime.typePointers.next{runner} (3,835,137 cycles, 0.41%)</title><rect x="84.2765%" y="773" width="0.4053%" height="15" fill="rgb(209,67,49)" fg:x="797550169" fg:w="3835137"/><text x="84.5265%" y="783.50"></text></g><g><title>runtime.deductAssistCredit{runner} (10,142,624 cycles, 1.07%)</title><rect x="83.8828%" y="885" width="1.0718%" height="15" fill="rgb(213,87,29)" fg:x="793823986" fg:w="10142624"/><text x="84.1328%" y="895.50"></text></g><g><title>runtime.gcAssistAlloc{runner} (10,142,624 cycles, 1.07%)</title><rect x="83.8828%" y="869" width="1.0718%" height="15" fill="rgb(205,151,52)" fg:x="793823986" fg:w="10142624"/><text x="84.1328%" y="879.50"></text></g><g><title>runtime.systemstack.abi0{runner} (10,142,624 cycles, 1.07%)</title><rect x="83.8828%" y="853" width="1.0718%" height="15" fill="rgb(253,215,39)" fg:x="793823986" fg:w="10142624"/><text x="84.1328%" y="863.50"></text></g><g><title>runtime.gcAssistAlloc.func2{runner} (10,142,624 cycles, 1.07%)</title><rect x="83.8828%" y="837" width="1.0718%" height="15" fill="rgb(221,220,41)" fg:x="793823986" fg:w="10142624"/><text x="84.1328%" y="847.50"></text></g><g><title>runtime.gcAssistAlloc1{runner} (10,142,624 cycles, 1.07%)</title><rect x="83.8828%" y="821" width="1.0718%" height="15" fill="rgb(218,133,21)" fg:x="793823986" fg:w="10142624"/><text x="84.1328%" y="831.50"></text></g><g><title>runtime.gcDrainN{runner} (10,142,624 cycles, 1.07%)</title><rect x="83.8828%" y="805" width="1.0718%" height="15" fill="rgb(221,193,43)" fg:x="793823986" fg:w="10142624"/><text x="84.1328%" y="815.50"></text></g><g><title>runtime.mallocgcSmallNoScanSC4{runner} (2,278,487 cycles, 0.24%)</title><rect x="84.9545%" y="885" width="0.2408%" height="15" fill="rgb(240,128,52)" fg:x="803966610" fg:w="2278487"/><text x="85.2045%" y="895.50"></text></g><g><title>runtime.mallocgcSmallNoScanSC6{runner} (2,504,401 cycles, 0.26%)</title><rect x="85.3316%" y="885" width="0.2646%" height="15" fill="rgb(253,114,12)" fg:x="807534697" fg:w="2504401"/><text x="85.5816%" y="895.50"></text></g><g><title>runtime.(*mcentral).grow{runner} (2,493,716 cycles, 0.26%)</title><rect x="85.9972%" y="821" width="0.2635%" height="15" fill="rgb(215,223,47)" fg:x="813833780" fg:w="2493716"/><text x="86.2472%" y="831.50"></text></g><g><title>runtime.(*mheap).alloc{runner} (2,493,716 cycles, 0.26%)</title><rect x="85.9972%" y="805" width="0.2635%" height="15" fill="rgb(248,225,23)" fg:x="813833780" fg:w="2493716"/><text x="86.2472%" y="815.50"></text></g><g><title>runtime.systemstack.abi0{runner} (2,493,716 cycles, 0.26%)</title><rect x="85.9972%" y="789" width="0.2635%" height="15" fill="rgb(250,108,0)" fg:x="813833780" fg:w="2493716"/><text x="86.2472%" y="799.50"></text></g><g><title>runtime.(*mheap).alloc.func1{runner} (2,493,716 cycles, 0.26%)</title><rect x="85.9972%" y="773" width="0.2635%" height="15" fill="rgb(228,208,7)" fg:x="813833780" fg:w="2493716"/><text x="86.2472%" y="783.50"></text></g><g><title>runtime.(*mheap).allocSpan{runner} (2,493,716 cycles, 0.26%)</title><rect x="85.9972%" y="757" width="0.2635%" height="15" fill="rgb(244,45,10)" fg:x="813833780" fg:w="2493716"/><text x="86.2472%" y="767.50"></text></g><g><title>runtime.(*mheap).initSpan{runner} (2,493,716 cycles, 0.26%)</title><rect x="85.9972%" y="741" width="0.2635%" height="15" fill="rgb(207,125,25)" fg:x="813833780" fg:w="2493716"/><text x="86.2472%" y="751.50"></text></g><g><title>runtime.(*mcache).nextFree{runner} (3,647,649 cycles, 0.39%)</title><rect x="85.9972%" y="869" width="0.3854%" height="15" fill="rgb(210,195,18)" fg:x="813833780" fg:w="3647649"/><text x="86.2472%" y="879.50"></text></g><g><title>runtime.(*mcache).refill{runner} (3,647,649 cycles, 0.39%)</title><rect x="85.9972%" y="853" width="0.3854%" height="15" fill="rgb(249,80,12)" fg:x="813833780" fg:w="3647649"/><text x="86.2472%" y="863.50"></text></g><g><title>runtime.(*mcentral).cacheSpan{runner} (3,647,649 cycles, 0.39%)</title><rect x="85.9972%" y="837" width="0.3854%" height="15" fill="rgb(221,65,9)" fg:x="813833780" fg:w="3647649"/><text x="86.2472%" y="847.50"></text></g><g><title>runtime.acquirem{inlined} (4,478,085 cycles, 0.47%)</title><rect x="86.3826%" y="869" width="0.4732%" height="15" fill="rgb(235,49,36)" fg:x="817481429" fg:w="4478085"/><text x="86.6326%" y="879.50"></text></g><g><title>runtime.gcmarknewobject{runner} (7,579,014 cycles, 0.80%)</title><rect x="86.8558%" y="869" width="0.8009%" height="15" fill="rgb(225,32,20)" fg:x="821959514" fg:w="7579014"/><text x="87.1058%" y="879.50"></text></g><g><title>runtime.mallocgcSmallNoscan{runner} (29,375,917 cycles, 3.10%)</title><rect x="85.5962%" y="885" width="3.1041%" height="15" fill="rgb(215,141,46)" fg:x="810039098" fg:w="29375917"/><text x="85.8462%" y="895.50">run..</text></g><g><title>runtime.nextFreeFast{inlined} (7,421,596 cycles, 0.78%)</title><rect x="87.9161%" y="869" width="0.7842%" height="15" fill="rgb(250,160,47)" fg:x="831993419" fg:w="7421596"/><text x="88.1661%" y="879.50"></text></g><g><title>runtime.getMCache{inlined} (3,853,232 cycles, 0.41%)</title><rect x="90.2858%" y="869" width="0.4072%" height="15" fill="rgb(216,222,40)" fg:x="854418555" fg:w="3853232"/><text x="90.5358%" y="879.50"></text></g><g><title>runtime.scanblock{runner} (3,744,086 cycles, 0.40%)</title><rect x="91.8940%" y="741" width="0.3956%" height="15" fill="rgb(234,217,39)" fg:x="869637835" fg:w="3744086"/><text x="92.1440%" y="751.50"></text></g><g><title>runtime.tryDeferToSpanScan{runner} (2,534,095 cycles, 0.27%)</title><rect x="92.0218%" y="725" width="0.2678%" height="15" fill="rgb(207,178,40)" fg:x="870847826" fg:w="2534095"/><text x="92.2718%" y="735.50"></text></g><g><title>runtime.markroot{runner} (5,034,636 cycles, 0.53%)</title><rect x="91.8940%" y="773" width="0.5320%" height="15" fill="rgb(221,136,13)" fg:x="869637835" fg:w="5034636"/><text x="92.1440%" y="783.50"></text></g><g><title>runtime.markrootBlock{runner} (5,034,636 cycles, 0.53%)</title><rect x="91.8940%" y="757" width="0.5320%" height="15" fill="rgb(249,199,10)" fg:x="869637835" fg:w="5034636"/><text x="92.1440%" y="767.50"></text></g><g><title>runtime.scanObject{runner} (2,480,314 cycles, 0.26%)</title><rect x="92.4260%" y="773" width="0.2621%" height="15" fill="rgb(249,222,13)" fg:x="874672471" fg:w="2480314"/><text x="92.6760%" y="783.50"></text></g><g><title>runtime.gcAssistAlloc{runner} (10,063,187 cycles, 1.06%)</title><rect x="91.8940%" y="853" width="1.0634%" height="15" fill="rgb(244,185,38)" fg:x="869637835" fg:w="10063187"/><text x="92.1440%" y="863.50"></text></g><g><title>runtime.systemstack.abi0{runner} (10,063,187 cycles, 1.06%)</title><rect x="91.8940%" y="837" width="1.0634%" height="15" fill="rgb(236,202,9)" fg:x="869637835" fg:w="10063187"/><text x="92.1440%" y="847.50"></text></g><g><title>runtime.gcAssistAlloc.func2{runner} (10,063,187 cycles, 1.06%)</title><rect x="91.8940%" y="821" width="1.0634%" height="15" fill="rgb(250,229,37)" fg:x="869637835" fg:w="10063187"/><text x="92.1440%" y="831.50"></text></g><g><title>runtime.gcAssistAlloc1{runner} (10,063,187 cycles, 1.06%)</title><rect x="91.8940%" y="805" width="1.0634%" height="15" fill="rgb(206,174,23)" fg:x="869637835" fg:w="10063187"/><text x="92.1440%" y="815.50"></text></g><g><title>runtime.gcDrainN{runner} (10,063,187 cycles, 1.06%)</title><rect x="91.8940%" y="789" width="1.0634%" height="15" fill="rgb(211,33,43)" fg:x="869637835" fg:w="10063187"/><text x="92.1440%" y="799.50"></text></g><g><title>database/sql.convertAssignRows{runner} (148,359,090 cycles, 15.68%)</title><rect x="78.7309%" y="933" width="15.6770%" height="15" fill="rgb(245,58,50)" fg:x="745068806" fg:w="148359090"/><text x="78.9809%" y="943.50">database/sql.convertAssi..</text></g><g><title>runtime.slicebytetostring{runner} (114,733,724 cycles, 12.12%)</title><rect x="82.2840%" y="917" width="12.1238%" height="15" fill="rgb(244,68,36)" fg:x="778694172" fg:w="114733724"/><text x="82.5340%" y="927.50">runtime.slicebytet..</text></g><g><title>runtime.mallocgc{runner} (105,861,262 cycles, 11.19%)</title><rect x="83.2216%" y="901" width="11.1863%" height="15" fill="rgb(232,229,15)" fg:x="787566634" fg:w="105861262"/><text x="83.4716%" y="911.50">runtime.mallocgc..</text></g><g><title>runtime.mallocgcTinySC2{runner} (54,012,881 cycles, 5.71%)</title><rect x="88.7003%" y="885" width="5.7075%" height="15" fill="rgb(254,30,23)" fg:x="839415015" fg:w="54012881"/><text x="88.9503%" y="895.50">runtime..</text></g><g><title>runtime.mallocgcTinySlowPath{runner} (35,156,109 cycles, 3.71%)</title><rect x="90.6929%" y="869" width="3.7149%" height="15" fill="rgb(235,160,14)" fg:x="858271787" fg:w="35156109"/><text x="90.9429%" y="879.50">runt..</text></g><g><title>runtime.gcmarknewobject{runner} (13,726,874 cycles, 1.45%)</title><rect x="92.9573%" y="853" width="1.4505%" height="15" fill="rgb(212,155,44)" fg:x="879701022" fg:w="13726874"/><text x="93.2073%" y="863.50"></text></g><g><title>database/sql.(*NullString).Scan{runner} (156,794,685 cycles, 16.57%)</title><rect x="77.9633%" y="949" width="16.5684%" height="15" fill="rgb(226,2,50)" fg:x="737805053" fg:w="156794685"/><text x="78.2133%" y="959.50">database/sql.(*NullString)..</text></g><g><title>database/sql.(*NullTime).Scan{runner} (17,806,848 cycles, 1.88%)</title><rect x="94.5317%" y="949" width="1.8816%" height="15" fill="rgb(234,177,6)" fg:x="894599738" fg:w="17806848"/><text x="94.7817%" y="959.50">d..</text></g><g><title>database/sql.convertAssignRows{runner} (13,599,432 cycles, 1.44%)</title><rect x="94.9763%" y="933" width="1.4370%" height="15" fill="rgb(217,24,9)" fg:x="898807154" fg:w="13599432"/><text x="95.2263%" y="943.50"></text></g><g><title>gcWriteBarrier{runner} (7,512,876 cycles, 0.79%)</title><rect x="95.6194%" y="917" width="0.7939%" height="15" fill="rgb(220,13,46)" fg:x="904893710" fg:w="7512876"/><text x="95.8694%" y="927.50"></text></g><g><title>runtime.wbBufFlush{runner} (6,320,049 cycles, 0.67%)</title><rect x="95.7455%" y="901" width="0.6678%" height="15" fill="rgb(239,221,27)" fg:x="906086537" fg:w="6320049"/><text x="95.9955%" y="911.50"></text></g><g><title>runtime.systemstack.abi0{runner} (6,320,049 cycles, 0.67%)</title><rect x="95.7455%" y="885" width="0.6678%" height="15" fill="rgb(222,198,25)" fg:x="906086537" fg:w="6320049"/><text x="95.9955%" y="895.50"></text></g><g><title>runtime.wbBufFlush.func1{runner} (6,320,049 cycles, 0.67%)</title><rect x="95.7455%" y="869" width="0.6678%" height="15" fill="rgb(211,99,13)" fg:x="906086537" fg:w="6320049"/><text x="95.9955%" y="879.50"></text></g><g><title>runtime.wbBufFlush1{runner} (5,029,134 cycles, 0.53%)</title><rect x="95.8819%" y="853" width="0.5314%" height="15" fill="rgb(232,111,31)" fg:x="907377452" fg:w="5029134"/><text x="96.1319%" y="863.50"></text></g><g><title>runtime.tryDeferToSpanScan{runner} (2,536,964 cycles, 0.27%)</title><rect x="96.1452%" y="837" width="0.2681%" height="15" fill="rgb(245,82,37)" fg:x="909869622" fg:w="2536964"/><text x="96.3952%" y="847.50"></text></g><g><title>database/sql.convertAssignRows{runner} (8,855,164 cycles, 0.94%)</title><rect x="96.4133%" y="949" width="0.9357%" height="15" fill="rgb(227,149,46)" fg:x="912406586" fg:w="8855164"/><text x="96.6633%" y="959.50"></text></g><g><title>database/sql.(*Rows).scanLocked{runner} (455,729,726 cycles, 48.16%)</title><rect x="49.4537%" y="981" width="48.1566%" height="15" fill="rgb(218,36,50)" fg:x="468004218" fg:w="455729726"/><text x="49.7037%" y="991.50">database/sql.(*Rows).scanLocked{runner}</text></g><g><title>database/sql.convertAssignRows{runner} (432,937,839 cycles, 45.75%)</title><rect x="51.8621%" y="965" width="45.7482%" height="15" fill="rgb(226,80,48)" fg:x="490796105" fg:w="432937839"/><text x="52.1121%" y="975.50">database/sql.convertAssignRows{runner}</text></g><g><title>reflect.ValueOf{inlined} (2,472,194 cycles, 0.26%)</title><rect x="97.3490%" y="949" width="0.2612%" height="15" fill="rgb(238,224,15)" fg:x="921261750" fg:w="2472194"/><text x="97.5990%" y="959.50"></text></g><g><title>database/sql.(*closingMutex).RLock{runner} (5,013,869 cycles, 0.53%)</title><rect x="97.6103%" y="981" width="0.5298%" height="15" fill="rgb(241,136,10)" fg:x="923733944" fg:w="5013869"/><text x="97.8603%" y="991.50"></text></g><g><title>database/sql.(*closingMutex).TryRLock{inlined} (5,013,869 cycles, 0.53%)</title><rect x="97.6103%" y="965" width="0.5298%" height="15" fill="rgb(208,32,45)" fg:x="923733944" fg:w="5013869"/><text x="97.8603%" y="975.50"></text></g><g><title>sync/atomic.(*Int64).CompareAndSwap{inlined} (5,013,869 cycles, 0.53%)</title><rect x="97.6103%" y="949" width="0.5298%" height="15" fill="rgb(207,135,9)" fg:x="923733944" fg:w="5013869"/><text x="97.8603%" y="959.50"></text></g><g><title>database/sql.(*closingMutex).RUnlock{runner} (2,539,232 cycles, 0.27%)</title><rect x="98.1401%" y="981" width="0.2683%" height="15" fill="rgb(206,86,44)" fg:x="928747813" fg:w="2539232"/><text x="98.3901%" y="991.50"></text></g><g><title>database/sql.convertAssignRows{runner} (5,145,153 cycles, 0.54%)</title><rect x="98.4084%" y="981" width="0.5437%" height="15" fill="rgb(245,177,15)" fg:x="931287045" fg:w="5145153"/><text x="98.6584%" y="991.50"></text></g><g><title>database/sql.(*Rows).Scan{runner} (475,738,491 cycles, 50.27%)</title><rect x="49.4537%" y="997" width="50.2709%" height="15" fill="rgb(206,64,50)" fg:x="468004218" fg:w="475738491"/><text x="49.7037%" y="1007.50">database/sql.(*Rows).Scan{runner}</text></g><g><title>database/sql.scanArgsContainRawBytes{inlined} (7,310,511 cycles, 0.77%)</title><rect x="98.9521%" y="981" width="0.7725%" height="15" fill="rgb(234,36,40)" fg:x="936432198" fg:w="7310511"/><text x="99.2021%" y="991.50"></text></g><g><title>runtime.goexit.abi0{runner} (945,057,247 cycles, 99.86%)</title><rect x="0.0000%" y="1109" width="99.8635%" height="15" fill="rgb(213,64,8)" fg:x="0" fg:w="945057247"/><text x="0.2500%" y="1119.50">runtime.goexit.abi0{runner}</text></g><g><title>runtime.main{runner} (941,291,157 cycles, 99.47%)</title><rect x="0.3980%" y="1093" width="99.4655%" height="15" fill="rgb(210,75,36)" fg:x="3766090" fg:w="941291157"/><text x="0.6480%" y="1103.50">runtime.main{runner}</text></g><g><title>internal/runtime/atomic.(*Uint32).Load{inlined} (941,291,157 cycles, 99.47%)</title><rect x="0.3980%" y="1077" width="99.4655%" height="15" fill="rgb(229,88,21)" fg:x="3766090" fg:w="941291157"/><text x="0.6480%" y="1087.50">internal/runtime/atomic.(*Uint32).Load{inlined}</text></g><g><title>main.main{runner} (941,291,157 cycles, 99.47%)</title><rect x="0.3980%" y="1061" width="99.4655%" height="15" fill="rgb(252,204,47)" fg:x="3766090" fg:w="941291157"/><text x="0.6480%" y="1071.50">main.main{runner}</text></g><g><title>main.run{runner} (941,291,157 cycles, 99.47%)</title><rect x="0.3980%" y="1045" width="99.4655%" height="15" fill="rgb(208,77,27)" fg:x="3766090" fg:w="941291157"/><text x="0.6480%" y="1055.50">main.run{runner}</text></g><g><title>main.run.func1{runner} (941,291,157 cycles, 99.47%)</title><rect x="0.3980%" y="1029" width="99.4655%" height="15" fill="rgb(221,76,26)" fg:x="3766090" fg:w="941291157"/><text x="0.6480%" y="1039.50">main.run.func1{runner}</text></g><g><title>main.(*SQLDriver).T4{runner} (941,291,157 cycles, 99.47%)</title><rect x="0.3980%" y="1013" width="99.4655%" height="15" fill="rgb(225,139,18)" fg:x="3766090" fg:w="941291157"/><text x="0.6480%" y="1023.50">main.(*SQLDriver).T4{runner}</text></g><g><title>all (946,349,178 cycles, 100%)</title><rect x="0.0000%" y="1141" width="100.0000%" height="15" fill="rgb(230,137,11)" fg:x="0" fg:w="946349178"/><text x="0.2500%" y="1151.50"></text></g><g><title>runner (946,349,178 cycles, 100.00%)</title><rect x="0.0000%" y="1125" width="100.0000%" height="15" fill="rgb(212,28,1)" fg:x="0" fg:w="946349178"/><text x="0.2500%" y="1135.50">runner</text></g></svg></svg>

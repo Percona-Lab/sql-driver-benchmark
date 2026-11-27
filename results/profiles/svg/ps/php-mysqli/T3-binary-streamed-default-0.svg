@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="486" onload="init(evt)" viewBox="0 0 1200 486" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="486" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">php-mysqli/T3-binary-streamed-default-0.folded (Percona, default; sampled CPU cycles)</text><text id="details" fill="rgb(0,0,0)" x="10" y="469.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="469.00"> </text><svg id="frames" x="10" width="1180" total_samples="2010451631"><g><title>ZEND_CAST_SPEC_TMP_HANDLER{php8.5} (5,166,982 cycles, 0.26%)</title><rect x="0.1252%" y="229" width="0.2570%" height="15" fill="rgb(227,0,7)" fg:x="2517266" fg:w="5166982"/><text x="0.3752%" y="239.50"></text></g><g><title>ZEND_FETCH_DIM_R_SPEC_CV_CONST_HANDLER{php8.5} (10,307,395 cycles, 0.51%)</title><rect x="0.3822%" y="229" width="0.5127%" height="15" fill="rgb(217,0,24)" fg:x="7684248" fg:w="10307395"/><text x="0.6322%" y="239.50"></text></g><g><title>ZEND_ASSIGN_OP_SPEC_CV_TMPVAR_HANDLER{php8.5} (26,651,354 cycles, 1.33%)</title><rect x="1.0870%" y="213" width="1.3256%" height="15" fill="rgb(221,193,54)" fg:x="21852784" fg:w="26651354"/><text x="1.3370%" y="223.50"></text></g><g><title>zval_ptr_dtor_nogc{inlined} (16,641,337 cycles, 0.83%)</title><rect x="1.5849%" y="197" width="0.8277%" height="15" fill="rgb(248,212,6)" fg:x="31862801" fg:w="16641337"/><text x="1.8349%" y="207.50"></text></g><g><title>ZEND_CAST_SPEC_TMP_HANDLER{php8.5} (17,783,738 cycles, 0.88%)</title><rect x="2.4126%" y="213" width="0.8846%" height="15" fill="rgb(208,68,35)" fg:x="48504138" fg:w="17783738"/><text x="2.6626%" y="223.50"></text></g><g><title>ZEND_FETCH_DIM_R_SPEC_CV_CONST_HANDLER{php8.5} (50,852,204 cycles, 2.53%)</title><rect x="3.2984%" y="213" width="2.5294%" height="15" fill="rgb(232,128,0)" fg:x="66312530" fg:w="50852204"/><text x="3.5484%" y="223.50">ZE..</text></g><g><title>zend_fetch_dimension_address_inner{inlined} (8,913,257 cycles, 0.44%)</title><rect x="5.3844%" y="197" width="0.4433%" height="15" fill="rgb(207,160,47)" fg:x="108251477" fg:w="8913257"/><text x="5.6344%" y="207.50"></text></g><g><title>ZEND_FE_FETCH_R_SPEC_VAR_HANDLER{inlined} (17,935,119 cycles, 0.89%)</title><rect x="5.8278%" y="213" width="0.8921%" height="15" fill="rgb(228,23,34)" fg:x="117164734" fg:w="17935119"/><text x="6.0778%" y="223.50"></text></g><g><title>ZEND_JMP_SPEC_HANDLER{inlined} (5,134,214 cycles, 0.26%)</title><rect x="6.7199%" y="213" width="0.2554%" height="15" fill="rgb(218,30,26)" fg:x="135099853" fg:w="5134214"/><text x="6.9699%" y="223.50"></text></g><g><title>add_function{php8.5} (35,269,078 cycles, 1.75%)</title><rect x="6.9753%" y="213" width="1.7543%" height="15" fill="rgb(220,122,19)" fg:x="140234067" fg:w="35269078"/><text x="7.2253%" y="223.50"></text></g><g><title>add_function_fast{inlined} (22,710,958 cycles, 1.13%)</title><rect x="7.5999%" y="197" width="1.1296%" height="15" fill="rgb(250,228,42)" fg:x="152792187" fg:w="22710958"/><text x="7.8499%" y="207.50"></text></g><g><title>fast_long_add_function{inlined} (5,145,172 cycles, 0.26%)</title><rect x="8.4736%" y="181" width="0.2559%" height="15" fill="rgb(240,193,28)" fg:x="170357973" fg:w="5145172"/><text x="8.7236%" y="191.50"></text></g><g><title>execute_ex{php8.5} (15,189,073 cycles, 0.76%)</title><rect x="10.1929%" y="197" width="0.7555%" height="15" fill="rgb(216,20,37)" fg:x="204923456" fg:w="15189073"/><text x="10.4429%" y="207.50"></text></g><g><title>zend_assign_to_variable{inlined} (11,555,146 cycles, 0.57%)</title><rect x="10.9484%" y="197" width="0.5748%" height="15" fill="rgb(206,188,39)" fg:x="220112529" fg:w="11555146"/><text x="11.1984%" y="207.50"></text></g><g><title>zend_generator_iterator_valid{php8.5} (5,095,507 cycles, 0.25%)</title><rect x="11.5232%" y="197" width="0.2535%" height="15" fill="rgb(217,207,13)" fg:x="231667675" fg:w="5095507"/><text x="11.7732%" y="207.50"></text></g><g><title>mysqlnd_mysqlnd_error_info_reset_pub{mysqlnd.so} (40,996,562 cycles, 2.04%)</title><rect x="24.7884%" y="133" width="2.0392%" height="15" fill="rgb(231,73,38)" fg:x="498358908" fg:w="40996562"/><text x="25.0384%" y="143.50">m..</text></g><g><title>mysqlnd_mempool_save_state{mysqlnd.so} (5,144,924 cycles, 0.26%)</title><rect x="28.2304%" y="117" width="0.2559%" height="15" fill="rgb(225,20,46)" fg:x="567557819" fg:w="5144924"/><text x="28.4804%" y="127.50"></text></g><g><title>mysqlnd_mysqlnd_connection_state_get_pub{mysqlnd.so} (10,229,291 cycles, 0.51%)</title><rect x="28.4863%" y="117" width="0.5088%" height="15" fill="rgb(210,31,41)" fg:x="572702743" fg:w="10229291"/><text x="28.7363%" y="127.50"></text></g><g><title>mysqlnd_mempool_get_chunk{mysqlnd.so} (20,383,736 cycles, 1.01%)</title><rect x="44.4483%" y="101" width="1.0139%" height="15" fill="rgb(221,200,47)" fg:x="893612001" fg:w="20383736"/><text x="44.6983%" y="111.50"></text></g><g><title>zend_arena_alloc{inlined} (6,450,008 cycles, 0.32%)</title><rect x="45.1414%" y="85" width="0.3208%" height="15" fill="rgb(226,26,5)" fg:x="907545729" fg:w="6450008"/><text x="45.3914%" y="95.50"></text></g><g><title>mysqlnd_mysqlnd_pfc_receive_pub{mysqlnd.so} (41,771,061 cycles, 2.08%)</title><rect x="45.4622%" y="101" width="2.0777%" height="15" fill="rgb(249,33,26)" fg:x="913995737" fg:w="41771061"/><text x="45.7122%" y="111.50">m..</text></g><g><title>php_mysqlnd_rowp_read_binary_protocol{mysqlnd.so} (7,748,272 cycles, 0.39%)</title><rect x="47.6683%" y="101" width="0.3854%" height="15" fill="rgb(235,183,28)" fg:x="958347184" fg:w="7748272"/><text x="47.9183%" y="111.50"></text></g><g><title>_php_stream_read{php8.5} (11,475,376 cycles, 0.57%)</title><rect x="58.5367%" y="69" width="0.5708%" height="15" fill="rgb(221,5,38)" fg:x="1176853031" fg:w="11475376"/><text x="58.7867%" y="79.50"></text></g><g><title>mysqlnd_mysqlnd_pfc_receive_pub{mysqlnd.so} (16,544,385 cycles, 0.82%)</title><rect x="59.1075%" y="69" width="0.8229%" height="15" fill="rgb(247,18,42)" fg:x="1188328407" fg:w="16544385"/><text x="59.3575%" y="79.50"></text></g><g><title>mysqlnd_mysqlnd_vio_get_stream_pub{mysqlnd.so} (12,646,174 cycles, 0.63%)</title><rect x="59.9305%" y="69" width="0.6290%" height="15" fill="rgb(241,131,45)" fg:x="1204872792" fg:w="12646174"/><text x="60.1805%" y="79.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (8,954,269 cycles, 0.45%)</title><rect x="63.0785%" y="53" width="0.4454%" height="15" fill="rgb(249,31,29)" fg:x="1268163456" fg:w="8954269"/><text x="63.3285%" y="63.50"></text></g><g><title>_php_stream_read{php8.5} (21,720,517 cycles, 1.08%)</title><rect x="63.5239%" y="53" width="1.0804%" height="15" fill="rgb(225,111,53)" fg:x="1277117725" fg:w="21720517"/><text x="63.7739%" y="63.50"></text></g><g><title>mysqlnd_mysqlnd_vio_network_read_pub{mysqlnd.so} (86,350,040 cycles, 4.30%)</title><rect x="60.5595%" y="69" width="4.2951%" height="15" fill="rgb(238,160,17)" fg:x="1217518966" fg:w="86350040"/><text x="60.8095%" y="79.50">mysql..</text></g><g><title>memcpy@plt{php8.5} (5,030,764 cycles, 0.25%)</title><rect x="64.6043%" y="53" width="0.2502%" height="15" fill="rgb(214,148,48)" fg:x="1298838242" fg:w="5030764"/><text x="64.8543%" y="63.50"></text></g><g><title>_php_stream_read{php8.5} (36,431,231 cycles, 1.81%)</title><rect x="71.0167%" y="53" width="1.8121%" height="15" fill="rgb(232,36,49)" fg:x="1427756127" fg:w="36431231"/><text x="71.2667%" y="63.50">_..</text></g><g><title>mysqlnd_mysqlnd_pfc_receive_pub{mysqlnd.so} (29,334,740 cycles, 1.46%)</title><rect x="72.8288%" y="53" width="1.4591%" height="15" fill="rgb(209,103,24)" fg:x="1464187358" fg:w="29334740"/><text x="73.0788%" y="63.50"></text></g><g><title>php_mysqlnd_rowp_read{mysqlnd.so} (562,130,407 cycles, 27.96%)</title><rect x="48.0537%" y="101" width="27.9604%" height="15" fill="rgb(229,88,8)" fg:x="966095456" fg:w="562130407"/><text x="48.3037%" y="111.50">php_mysqlnd_rowp_read{mysqlnd.so}</text></g><g><title>php_mysqlnd_read_row_ex{inlined} (453,581,502 cycles, 22.56%)</title><rect x="53.4529%" y="85" width="22.5612%" height="15" fill="rgb(213,181,19)" fg:x="1074644361" fg:w="453581502"/><text x="53.7029%" y="95.50">php_mysqlnd_read_row_ex{inlined}</text></g><g><title>mysqlnd_read_header{mysqlnd.so} (224,356,857 cycles, 11.16%)</title><rect x="64.8545%" y="69" width="11.1595%" height="15" fill="rgb(254,191,54)" fg:x="1303869006" fg:w="224356857"/><text x="65.1045%" y="79.50">mysqlnd_read_hea..</text></g><g><title>mysqlnd_mysqlnd_vio_network_read_pub{mysqlnd.so} (33,424,064 cycles, 1.66%)</title><rect x="74.3515%" y="53" width="1.6625%" height="15" fill="rgb(241,83,37)" fg:x="1494801799" fg:w="33424064"/><text x="74.6015%" y="63.50"></text></g><g><title>_php_stream_read{php8.5} (7,752,950 cycles, 0.39%)</title><rect x="75.6284%" y="37" width="0.3856%" height="15" fill="rgb(233,36,39)" fg:x="1520472913" fg:w="7752950"/><text x="75.8784%" y="47.50"></text></g><g><title>mysqlnd_mysqlnd_result_unbuffered_fetch_row_pub{mysqlnd.so} (946,514,939 cycles, 47.08%)</title><rect x="28.9951%" y="117" width="47.0797%" height="15" fill="rgb(226,3,54)" fg:x="582932034" fg:w="946514939"/><text x="29.2451%" y="127.50">mysqlnd_mysqlnd_result_unbuffered_fetch_row_pub{mysqlnd.so}</text></g><g><title>php_mysqlnd_rowp_read{mysqlnd.so} (10,193,046 cycles, 0.51%)</title><rect x="76.0748%" y="117" width="0.5070%" height="15" fill="rgb(245,192,40)" fg:x="1529446973" fg:w="10193046"/><text x="76.3248%" y="127.50"></text></g><g><title>mysqlnd_mysqlnd_stmt_fetch_pub{mysqlnd.so} (1,016,617,884 cycles, 50.57%)</title><rect x="27.0201%" y="133" width="50.5666%" height="15" fill="rgb(238,167,29)" fg:x="543226310" fg:w="1016617884"/><text x="27.2701%" y="143.50">mysqlnd_mysqlnd_stmt_fetch_pub{mysqlnd.so}</text></g><g><title>zend_llist_destroy{php8.5} (20,204,175 cycles, 1.00%)</title><rect x="76.5818%" y="117" width="1.0050%" height="15" fill="rgb(232,182,51)" fg:x="1539640019" fg:w="20204175"/><text x="76.8318%" y="127.50"></text></g><g><title>zend_llist_clean@plt{mysqlnd.so} (7,620,957 cycles, 0.38%)</title><rect x="77.5868%" y="133" width="0.3791%" height="15" fill="rgb(231,60,39)" fg:x="1559844194" fg:w="7620957"/><text x="77.8368%" y="143.50"></text></g><g><title>zend_llist_destroy{php8.5} (6,292,535 cycles, 0.31%)</title><rect x="78.0943%" y="133" width="0.3130%" height="15" fill="rgb(208,69,12)" fg:x="1570048245" fg:w="6292535"/><text x="78.3443%" y="143.50"></text></g><g><title>mysqli_stmt_fetch_mysqlnd{mysqli.so} (1,154,858,818 cycles, 57.44%)</title><rect x="22.3557%" y="149" width="57.4428%" height="15" fill="rgb(235,93,37)" fg:x="449450138" fg:w="1154858818"/><text x="22.6057%" y="159.50">mysqli_stmt_fetch_mysqlnd{mysqli.so}</text></g><g><title>zend_parse_method_parameters{php8.5} (27,968,176 cycles, 1.39%)</title><rect x="78.4073%" y="133" width="1.3911%" height="15" fill="rgb(213,116,39)" fg:x="1576340780" fg:w="27968176"/><text x="78.6573%" y="143.50"></text></g><g><title>zend_parse_va_args{php8.5} (8,841,901 cycles, 0.44%)</title><rect x="79.3586%" y="117" width="0.4398%" height="15" fill="rgb(222,207,29)" fg:x="1595467055" fg:w="8841901"/><text x="79.6086%" y="127.50"></text></g><g><title>mysqlnd_mysqlnd_stmt_fetch_pub{mysqlnd.so} (33,261,580 cycles, 1.65%)</title><rect x="79.7984%" y="149" width="1.6544%" height="15" fill="rgb(206,96,30)" fg:x="1604308956" fg:w="33261580"/><text x="80.0484%" y="159.50"></text></g><g><title>ZEND_DO_FCALL_SPEC_RETVAL_USED_HANDLER{inlined} (1,254,277,502 cycles, 62.39%)</title><rect x="19.3802%" y="165" width="62.3878%" height="15" fill="rgb(218,138,4)" fg:x="389629145" fg:w="1254277502"/><text x="19.6302%" y="175.50">ZEND_DO_FCALL_SPEC_RETVAL_USED_HANDLER{inlined}</text></g><g><title>zend_parse_method_parameters@plt{mysqli.so} (6,336,111 cycles, 0.32%)</title><rect x="81.4529%" y="149" width="0.3152%" height="15" fill="rgb(250,191,14)" fg:x="1637570536" fg:w="6336111"/><text x="81.7029%" y="159.50"></text></g><g><title>zend_atomic_bool_load_ex{inlined} (29,432,632 cycles, 1.46%)</title><rect x="82.2656%" y="149" width="1.4640%" height="15" fill="rgb(239,60,40)" fg:x="1653909267" fg:w="29432632"/><text x="82.5156%" y="159.50"></text></g><g><title>zif_array_values{php8.5} (28,159,421 cycles, 1.40%)</title><rect x="82.3289%" y="133" width="1.4007%" height="15" fill="rgb(206,27,48)" fg:x="1655182478" fg:w="28159421"/><text x="82.5789%" y="143.50"></text></g><g><title>zend_parse_arg_array{inlined} (8,943,088 cycles, 0.44%)</title><rect x="83.2847%" y="117" width="0.4448%" height="15" fill="rgb(225,35,8)" fg:x="1674398811" fg:w="8943088"/><text x="83.5347%" y="127.50"></text></g><g><title>ZEND_DO_ICALL_SPEC_RETVAL_USED_HANDLER{inlined} (71,338,595 cycles, 3.55%)</title><rect x="81.7680%" y="165" width="3.5484%" height="15" fill="rgb(250,213,24)" fg:x="1643906647" fg:w="71338595"/><text x="82.0180%" y="175.50">ZEND..</text></g><g><title>zend_vm_stack_free_args{inlined} (31,903,343 cycles, 1.59%)</title><rect x="83.7295%" y="149" width="1.5869%" height="15" fill="rgb(247,123,22)" fg:x="1683341899" fg:w="31903343"/><text x="83.9795%" y="159.50"></text></g><g><title>zval_ptr_dtor_nogc{inlined} (29,389,927 cycles, 1.46%)</title><rect x="83.8546%" y="133" width="1.4619%" height="15" fill="rgb(231,138,38)" fg:x="1685855315" fg:w="29389927"/><text x="84.1046%" y="143.50"></text></g><g><title>ZEND_INIT_FCALL_SPEC_CONST_HANDLER{inlined} (13,907,533 cycles, 0.69%)</title><rect x="85.3164%" y="165" width="0.6918%" height="15" fill="rgb(231,145,46)" fg:x="1715245242" fg:w="13907533"/><text x="85.5664%" y="175.50"></text></g><g><title>_zend_vm_stack_push_call_frame_ex{inlined} (5,096,131 cycles, 0.25%)</title><rect x="85.7547%" y="149" width="0.2535%" height="15" fill="rgb(251,118,11)" fg:x="1724056644" fg:w="5096131"/><text x="86.0047%" y="159.50"></text></g><g><title>zend_vm_calc_used_stack{inlined} (17,923,852 cycles, 0.89%)</title><rect x="87.9604%" y="133" width="0.8915%" height="15" fill="rgb(217,147,25)" fg:x="1768401284" fg:w="17923852"/><text x="88.2104%" y="143.50"></text></g><g><title>zend_vm_stack_push_call_frame{inlined} (29,624,168 cycles, 1.47%)</title><rect x="87.9604%" y="149" width="1.4735%" height="15" fill="rgb(247,81,37)" fg:x="1768401284" fg:w="29624168"/><text x="88.2104%" y="159.50"></text></g><g><title>zend_vm_stack_push_call_frame_ex{inlined} (11,700,316 cycles, 0.58%)</title><rect x="88.8519%" y="133" width="0.5820%" height="15" fill="rgb(209,12,38)" fg:x="1786325136" fg:w="11700316"/><text x="89.1019%" y="143.50"></text></g><g><title>zend_vm_init_call_frame{inlined} (5,311,433 cycles, 0.26%)</title><rect x="89.1697%" y="117" width="0.2642%" height="15" fill="rgb(227,1,9)" fg:x="1792714019" fg:w="5311433"/><text x="89.4197%" y="127.50"></text></g><g><title>ZEND_INIT_METHOD_CALL_SPEC_CV_CONST_HANDLER{inlined} (71,355,225 cycles, 3.55%)</title><rect x="86.0082%" y="165" width="3.5492%" height="15" fill="rgb(248,47,43)" fg:x="1729152775" fg:w="71355225"/><text x="86.2582%" y="175.50">ZEND..</text></g><g><title>ZEND_SEND_VAR_SPEC_CV_UNUSED_HANDLER{inlined} (26,791,045 cycles, 1.33%)</title><rect x="89.7466%" y="165" width="1.3326%" height="15" fill="rgb(221,10,30)" fg:x="1804311238" fg:w="26791045"/><text x="89.9966%" y="175.50"></text></g><g><title>zval_addref_p{inlined} (7,723,319 cycles, 0.38%)</title><rect x="90.6950%" y="149" width="0.3842%" height="15" fill="rgb(210,229,1)" fg:x="1823378964" fg:w="7723319"/><text x="90.9450%" y="159.50"></text></g><g><title>ZEND_YIELD_SPEC_VAR_UNUSED_HANDLER{php8.5} (36,837,601 cycles, 1.83%)</title><rect x="91.0792%" y="165" width="1.8323%" height="15" fill="rgb(222,148,37)" fg:x="1831102283" fg:w="36837601"/><text x="91.3292%" y="175.50">Z..</text></g><g><title>execute_ex{php8.5} (1,600,563,584 cycles, 79.61%)</title><rect x="16.8471%" y="181" width="79.6121%" height="15" fill="rgb(234,67,33)" fg:x="338701908" fg:w="1600563584"/><text x="17.0971%" y="191.50">execute_ex{php8.5}</text></g><g><title>zval_ptr_dtor{php8.5} (68,785,159 cycles, 3.42%)</title><rect x="93.0378%" y="165" width="3.4214%" height="15" fill="rgb(247,98,35)" fg:x="1870480333" fg:w="68785159"/><text x="93.2878%" y="175.50">zva..</text></g><g><title>i_zval_ptr_dtor{inlined} (61,080,607 cycles, 3.04%)</title><rect x="93.4210%" y="149" width="3.0382%" height="15" fill="rgb(247,138,52)" fg:x="1878184885" fg:w="61080607"/><text x="93.6710%" y="159.50">i_z..</text></g><g><title>zif_array_values{php8.5} (11,350,266 cycles, 0.56%)</title><rect x="96.7808%" y="181" width="0.5646%" height="15" fill="rgb(213,79,30)" fg:x="1945731296" fg:w="11350266"/><text x="97.0308%" y="191.50"></text></g><g><title>zend_fe_fetch_object_helper_SPEC{php8.5} (1,793,089,108 cycles, 89.19%)</title><rect x="8.7295%" y="213" width="89.1884%" height="15" fill="rgb(246,177,23)" fg:x="175503145" fg:w="1793089108"/><text x="8.9795%" y="223.50">zend_fe_fetch_object_helper_SPEC{php8.5}</text></g><g><title>zend_generator_resume{php8.5} (1,731,829,071 cycles, 86.14%)</title><rect x="11.7766%" y="197" width="86.1413%" height="15" fill="rgb(230,62,27)" fg:x="236763182" fg:w="1731829071"/><text x="12.0266%" y="207.50">zend_generator_resume{php8.5}</text></g><g><title>zif_mysqli_stmt_fetch{mysqli.so} (11,510,691 cycles, 0.57%)</title><rect x="97.3454%" y="181" width="0.5725%" height="15" fill="rgb(216,154,8)" fg:x="1957081562" fg:w="11510691"/><text x="97.5954%" y="191.50"></text></g><g><title>zend_generator_iterator_get_data{php8.5} (7,614,330 cycles, 0.38%)</title><rect x="97.9179%" y="213" width="0.3787%" height="15" fill="rgb(244,35,45)" fg:x="1968592253" fg:w="7614330"/><text x="98.1679%" y="223.50"></text></g><g><title>zend_generator_iterator_move_forward{php8.5} (21,539,156 cycles, 1.07%)</title><rect x="98.2966%" y="213" width="1.0714%" height="15" fill="rgb(251,115,12)" fg:x="1976206583" fg:w="21539156"/><text x="98.5466%" y="223.50"></text></g><g><title>all (2,010,451,631 cycles, 100%)</title><rect x="0.0000%" y="437" width="100.0000%" height="15" fill="rgb(240,54,50)" fg:x="0" fg:w="2010451631"/><text x="0.2500%" y="447.50"></text></g><g><title>php (2,010,451,631 cycles, 100.00%)</title><rect x="0.0000%" y="421" width="100.0000%" height="15" fill="rgb(233,84,52)" fg:x="0" fg:w="2010451631"/><text x="0.2500%" y="431.50">php</text></g><g><title>_start{php8.5} (2,010,451,631 cycles, 100.00%)</title><rect x="0.0000%" y="405" width="100.0000%" height="15" fill="rgb(207,117,47)" fg:x="0" fg:w="2010451631"/><text x="0.2500%" y="415.50">_start{php8.5}</text></g><g><title>__libc_start_main@@GLIBC_2.34{libc.so.6} (2,010,451,631 cycles, 100.00%)</title><rect x="0.0000%" y="389" width="100.0000%" height="15" fill="rgb(249,43,39)" fg:x="0" fg:w="2010451631"/><text x="0.2500%" y="399.50">__libc_start_main@@GLIBC_2.34{libc.so.6}</text></g><g><title>call_init{inlined} (2,010,451,631 cycles, 100.00%)</title><rect x="0.0000%" y="373" width="100.0000%" height="15" fill="rgb(209,38,44)" fg:x="0" fg:w="2010451631"/><text x="0.2500%" y="383.50">call_init{inlined}</text></g><g><title>__libc_start_call_main{libc.so.6} (2,010,451,631 cycles, 100.00%)</title><rect x="0.0000%" y="357" width="100.0000%" height="15" fill="rgb(236,212,23)" fg:x="0" fg:w="2010451631"/><text x="0.2500%" y="367.50">__libc_start_call_main{libc.so.6}</text></g><g><title>main{php8.5} (2,010,451,631 cycles, 100.00%)</title><rect x="0.0000%" y="341" width="100.0000%" height="15" fill="rgb(242,79,21)" fg:x="0" fg:w="2010451631"/><text x="0.2500%" y="351.50">main{php8.5}</text></g><g><title>do_cli{php8.5} (2,010,451,631 cycles, 100.00%)</title><rect x="0.0000%" y="325" width="100.0000%" height="15" fill="rgb(211,96,35)" fg:x="0" fg:w="2010451631"/><text x="0.2500%" y="335.50">do_cli{php8.5}</text></g><g><title>php_execute_script_ex{php8.5} (2,010,451,631 cycles, 100.00%)</title><rect x="0.0000%" y="309" width="100.0000%" height="15" fill="rgb(253,215,40)" fg:x="0" fg:w="2010451631"/><text x="0.2500%" y="319.50">php_execute_script_ex{php8.5}</text></g><g><title>zend_execute_script{php8.5} (2,010,451,631 cycles, 100.00%)</title><rect x="0.0000%" y="293" width="100.0000%" height="15" fill="rgb(211,81,21)" fg:x="0" fg:w="2010451631"/><text x="0.2500%" y="303.50">zend_execute_script{php8.5}</text></g><g><title>zend_execute{php8.5} (2,010,451,631 cycles, 100.00%)</title><rect x="0.0000%" y="277" width="100.0000%" height="15" fill="rgb(208,190,38)" fg:x="0" fg:w="2010451631"/><text x="0.2500%" y="287.50">zend_execute{php8.5}</text></g><g><title>zend_vm_stack_free_call_frame{inlined} (2,010,451,631 cycles, 100.00%)</title><rect x="0.0000%" y="261" width="100.0000%" height="15" fill="rgb(235,213,38)" fg:x="0" fg:w="2010451631"/><text x="0.2500%" y="271.50">zend_vm_stack_free_call_frame{inlined}</text></g><g><title>zend_vm_stack_free_call_frame_ex{inlined} (2,010,451,631 cycles, 100.00%)</title><rect x="0.0000%" y="245" width="100.0000%" height="15" fill="rgb(237,122,38)" fg:x="0" fg:w="2010451631"/><text x="0.2500%" y="255.50">zend_vm_stack_free_call_frame_ex{inlined}</text></g><g><title>execute_ex{php8.5} (1,992,459,988 cycles, 99.11%)</title><rect x="0.8949%" y="229" width="99.1051%" height="15" fill="rgb(244,218,35)" fg:x="17991643" fg:w="1992459988"/><text x="1.1449%" y="239.50">execute_ex{php8.5}</text></g><g><title>zend_generator_iterator_valid{php8.5} (12,705,892 cycles, 0.63%)</title><rect x="99.3680%" y="213" width="0.6320%" height="15" fill="rgb(240,68,47)" fg:x="1997745739" fg:w="12705892"/><text x="99.6180%" y="223.50"></text></g></svg></svg>

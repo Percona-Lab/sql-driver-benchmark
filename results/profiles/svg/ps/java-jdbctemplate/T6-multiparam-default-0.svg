@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="1046" onload="init(evt)" viewBox="0 0 1200 1046" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="1046" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">java-jdbctemplate/T6-multiparam-default-0.folded (Percona, default; sampled CPU cycles)</text><text id="details" fill="rgb(0,0,0)" x="10" y="1029.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="1029.00"> </text><svg id="frames" x="10" width="1180" total_samples="15903028492"><g><title>Matcher::match(){libjvm.so} (44,657,990 cycles, 0.28%)</title><rect x="0.1150%" y="805" width="0.2808%" height="15" fill="rgb(227,0,7)" fg:x="18294700" fg:w="44657990"/><text x="0.3650%" y="815.50"></text></g><g><title>PhaseCFG::do_global_code_motion(){libjvm.so} (49,834,718 cycles, 0.31%)</title><rect x="0.4038%" y="805" width="0.3134%" height="15" fill="rgb(217,0,24)" fg:x="64216141" fg:w="49834718"/><text x="0.6538%" y="815.50"></text></g><g><title>PhaseCFG::global_code_motion(){libjvm.so} (48,639,585 cycles, 0.31%)</title><rect x="0.4113%" y="789" width="0.3059%" height="15" fill="rgb(221,193,54)" fg:x="65411274" fg:w="48639585"/><text x="0.6613%" y="799.50"></text></g><g><title>PhaseChaitin::build_ifg_physical(ResourceArea*){libjvm.so} (33,982,490 cycles, 0.21%)</title><rect x="0.9559%" y="789" width="0.2137%" height="15" fill="rgb(248,212,6)" fg:x="152015000" fg:w="33982490"/><text x="1.2059%" y="799.50"></text></g><g><title>PhaseChaitin::Register_Allocate(){libjvm.so} (147,438,283 cycles, 0.93%)</title><rect x="0.7172%" y="805" width="0.9271%" height="15" fill="rgb(208,68,35)" fg:x="114050859" fg:w="147438283"/><text x="0.9672%" y="815.50"></text></g><g><title>Compile::Code_Gen(){libjvm.so} (266,009,826 cycles, 1.67%)</title><rect x="0.1070%" y="821" width="1.6727%" height="15" fill="rgb(232,128,0)" fg:x="17009495" fg:w="266009826"/><text x="0.3570%" y="831.50"></text></g><g><title>PhaseIdealLoop::build_and_optimize(){libjvm.so} (33,325,858 cycles, 0.21%)</title><rect x="1.8475%" y="789" width="0.2096%" height="15" fill="rgb(207,160,47)" fg:x="293805828" fg:w="33325858"/><text x="2.0975%" y="799.50"></text></g><g><title>Compile::optimize_loops(PhaseIterGVN&amp;, LoopOptsMode){libjvm.so} (36,863,307 cycles, 0.23%)</title><rect x="1.8475%" y="805" width="0.2318%" height="15" fill="rgb(228,23,34)" fg:x="293805828" fg:w="36863307"/><text x="2.0975%" y="815.50"></text></g><g><title>PhaseIdealLoop::build_and_optimize(){libjvm.so} (58,946,979 cycles, 0.37%)</title><rect x="2.3021%" y="789" width="0.3707%" height="15" fill="rgb(218,30,26)" fg:x="366096501" fg:w="58946979"/><text x="2.5521%" y="799.50"></text></g><g><title>PhaseIdealLoop::optimize(PhaseIterGVN&amp;, LoopOptsMode){libjvm.so} (65,553,973 cycles, 0.41%)</title><rect x="2.2946%" y="805" width="0.4122%" height="15" fill="rgb(220,122,19)" fg:x="364912745" fg:w="65553973"/><text x="2.5446%" y="815.50"></text></g><g><title>PhaseIterGVN::optimize(){libjvm.so} (38,251,589 cycles, 0.24%)</title><rect x="2.7136%" y="805" width="0.2405%" height="15" fill="rgb(250,228,42)" fg:x="431544208" fg:w="38251589"/><text x="2.9636%" y="815.50"></text></g><g><title>PhaseIterGVN::transform_old(Node*){libjvm.so} (33,717,083 cycles, 0.21%)</title><rect x="2.7421%" y="789" width="0.2120%" height="15" fill="rgb(240,193,28)" fg:x="436078714" fg:w="33717083"/><text x="2.9921%" y="799.50"></text></g><g><title>Compile::Optimize(){libjvm.so} (191,716,308 cycles, 1.21%)</title><rect x="1.7797%" y="821" width="1.2055%" height="15" fill="rgb(216,20,37)" fg:x="283019321" fg:w="191716308"/><text x="2.0297%" y="831.50"></text></g><g><title>ParseGenerator::generate(JVMState*){libjvm.so} (33,804,762 cycles, 0.21%)</title><rect x="3.1842%" y="725" width="0.2126%" height="15" fill="rgb(206,188,39)" fg:x="506381914" fg:w="33804762"/><text x="3.4342%" y="735.50"></text></g><g><title>Parse::Parse(JVMState*, ciMethod*, float){libjvm.so} (33,804,762 cycles, 0.21%)</title><rect x="3.1842%" y="709" width="0.2126%" height="15" fill="rgb(217,207,13)" fg:x="506381914" fg:w="33804762"/><text x="3.4342%" y="719.50"></text></g><g><title>Parse::do_all_blocks(){libjvm.so} (33,804,762 cycles, 0.21%)</title><rect x="3.1842%" y="693" width="0.2126%" height="15" fill="rgb(231,73,38)" fg:x="506381914" fg:w="33804762"/><text x="3.4342%" y="703.50"></text></g><g><title>Parse::do_one_block(){libjvm.so} (33,804,762 cycles, 0.21%)</title><rect x="3.1842%" y="677" width="0.2126%" height="15" fill="rgb(225,20,46)" fg:x="506381914" fg:w="33804762"/><text x="3.4342%" y="687.50"></text></g><g><title>Parse::do_call(){libjvm.so} (63,093,222 cycles, 0.40%)</title><rect x="3.0628%" y="757" width="0.3967%" height="15" fill="rgb(210,31,41)" fg:x="487073444" fg:w="63093222"/><text x="3.3128%" y="767.50"></text></g><g><title>PredictedCallGenerator::generate(JVMState*){libjvm.so} (46,635,556 cycles, 0.29%)</title><rect x="3.1663%" y="741" width="0.2932%" height="15" fill="rgb(221,200,47)" fg:x="503531110" fg:w="46635556"/><text x="3.4163%" y="751.50"></text></g><g><title>Parse::do_one_block(){libjvm.so} (65,519,396 cycles, 0.41%)</title><rect x="3.0555%" y="773" width="0.4120%" height="15" fill="rgb(226,26,5)" fg:x="485919000" fg:w="65519396"/><text x="3.3055%" y="783.50"></text></g><g><title>Parse::do_all_blocks(){libjvm.so} (66,824,842 cycles, 0.42%)</title><rect x="3.0555%" y="789" width="0.4202%" height="15" fill="rgb(249,33,26)" fg:x="485919000" fg:w="66824842"/><text x="3.3055%" y="799.50"></text></g><g><title>ParseGenerator::generate(JVMState*){libjvm.so} (68,160,192 cycles, 0.43%)</title><rect x="3.0555%" y="821" width="0.4286%" height="15" fill="rgb(235,183,28)" fg:x="485919000" fg:w="68160192"/><text x="3.3055%" y="831.50"></text></g><g><title>Parse::Parse(JVMState*, ciMethod*, float){libjvm.so} (68,160,192 cycles, 0.43%)</title><rect x="3.0555%" y="805" width="0.4286%" height="15" fill="rgb(221,5,38)" fg:x="485919000" fg:w="68160192"/><text x="3.3055%" y="815.50"></text></g><g><title>C2Compiler::compile_method(ciEnv*, ciMethod*, int, bool, DirectiveSet*){libjvm.so} (546,279,952 cycles, 3.44%)</title><rect x="0.0921%" y="853" width="3.4351%" height="15" fill="rgb(247,18,42)" fg:x="14638867" fg:w="546279952"/><text x="0.3421%" y="863.50">C2C..</text></g><g><title>Compile::Compile(ciEnv*, ciMethod*, int, Options, DirectiveSet*){libjvm.so} (546,279,952 cycles, 3.44%)</title><rect x="0.0921%" y="837" width="3.4351%" height="15" fill="rgb(241,131,45)" fg:x="14638867" fg:w="546279952"/><text x="0.3421%" y="847.50">Com..</text></g><g><title>C2_CompilerThre (548,736,208 cycles, 3.45%)</title><rect x="0.0921%" y="981" width="3.4505%" height="15" fill="rgb(249,31,29)" fg:x="14638867" fg:w="548736208"/><text x="0.3421%" y="991.50">C2_..</text></g><g><title>__GI___clone3{libc.so.6} (548,736,208 cycles, 3.45%)</title><rect x="0.0921%" y="965" width="3.4505%" height="15" fill="rgb(225,111,53)" fg:x="14638867" fg:w="548736208"/><text x="0.3421%" y="975.50">__G..</text></g><g><title>start_thread{libc.so.6} (548,736,208 cycles, 3.45%)</title><rect x="0.0921%" y="949" width="3.4505%" height="15" fill="rgb(238,160,17)" fg:x="14638867" fg:w="548736208"/><text x="0.3421%" y="959.50">sta..</text></g><g><title>thread_native_entry(Thread*){libjvm.so} (548,736,208 cycles, 3.45%)</title><rect x="0.0921%" y="933" width="3.4505%" height="15" fill="rgb(214,148,48)" fg:x="14638867" fg:w="548736208"/><text x="0.3421%" y="943.50">thr..</text></g><g><title>Thread::call_run(){libjvm.so} (548,736,208 cycles, 3.45%)</title><rect x="0.0921%" y="917" width="3.4505%" height="15" fill="rgb(232,36,49)" fg:x="14638867" fg:w="548736208"/><text x="0.3421%" y="927.50">Thr..</text></g><g><title>JavaThread::thread_main_inner(){libjvm.so} (548,736,208 cycles, 3.45%)</title><rect x="0.0921%" y="901" width="3.4505%" height="15" fill="rgb(209,103,24)" fg:x="14638867" fg:w="548736208"/><text x="0.3421%" y="911.50">Jav..</text></g><g><title>CompileBroker::compiler_thread_loop(){libjvm.so} (548,736,208 cycles, 3.45%)</title><rect x="0.0921%" y="885" width="3.4505%" height="15" fill="rgb(229,88,8)" fg:x="14638867" fg:w="548736208"/><text x="0.3421%" y="895.50">Com..</text></g><g><title>CompileBroker::invoke_compiler_on_method(CompileTask*){libjvm.so} (548,736,208 cycles, 3.45%)</title><rect x="0.0921%" y="869" width="3.4505%" height="15" fill="rgb(213,181,19)" fg:x="14638867" fg:w="548736208"/><text x="0.3421%" y="879.50">Com..</text></g><g><title>SerialHeap::process_roots(SerialHeap::ScanningOption, OopClosure*, CLDClosure*, CLDClosure*, NMethodToOopClosure*){libjvm.so} (41,944,068 cycles, 0.26%)</title><rect x="3.8879%" y="773" width="0.2637%" height="15" fill="rgb(254,191,54)" fg:x="618293928" fg:w="41944068"/><text x="4.1379%" y="783.50"></text></g><g><title>void OopOopIterateDispatch&lt;YoungGenScanClosure&gt;::Table::oop_oop_iterate&lt;InstanceKlass, narrowOop&gt;(YoungGenScanClosure*, oopDesc*, Klass*){libjvm.so} (45,251,660 cycles, 0.28%)</title><rect x="4.3795%" y="757" width="0.2845%" height="15" fill="rgb(241,83,37)" fg:x="696472963" fg:w="45251660"/><text x="4.6295%" y="767.50"></text></g><g><title>DefNewGeneration::copy_to_survivor_space(oopDesc*){libjvm.so} (50,210,234 cycles, 0.32%)</title><rect x="4.8268%" y="741" width="0.3157%" height="15" fill="rgb(233,36,39)" fg:x="767607211" fg:w="50210234"/><text x="5.0768%" y="751.50"></text></g><g><title>SerialHeap::scan_evacuated_objs(YoungGenScanClosure*, OldGenScanClosure*){libjvm.so} (162,695,172 cycles, 1.02%)</title><rect x="4.1516%" y="773" width="1.0230%" height="15" fill="rgb(226,3,54)" fg:x="660237996" fg:w="162695172"/><text x="4.4016%" y="783.50"></text></g><g><title>void OopOopIterateDispatch&lt;YoungGenScanClosure&gt;::Table::oop_oop_iterate&lt;ObjArrayKlass, narrowOop&gt;(YoungGenScanClosure*, oopDesc*, Klass*){libjvm.so} (81,208,545 cycles, 0.51%)</title><rect x="4.6640%" y="757" width="0.5106%" height="15" fill="rgb(245,192,40)" fg:x="741724623" fg:w="81208545"/><text x="4.9140%" y="767.50"></text></g><g><title>DefNewGeneration::collect(bool){libjvm.so} (268,659,128 cycles, 1.69%)</title><rect x="3.6224%" y="789" width="1.6894%" height="15" fill="rgb(238,167,29)" fg:x="576064646" fg:w="268659128"/><text x="3.8724%" y="799.50"></text></g><g><title>VMThread::evaluate_operation(VM_Operation*){libjvm.so} (286,826,417 cycles, 1.80%)</title><rect x="3.5740%" y="869" width="1.8036%" height="15" fill="rgb(232,182,51)" fg:x="568369502" fg:w="286826417"/><text x="3.8240%" y="879.50">V..</text></g><g><title>VM_Operation::evaluate(){libjvm.so} (286,826,417 cycles, 1.80%)</title><rect x="3.5740%" y="853" width="1.8036%" height="15" fill="rgb(231,60,39)" fg:x="568369502" fg:w="286826417"/><text x="3.8240%" y="863.50">V..</text></g><g><title>VM_SerialCollectForAllocation::doit(){libjvm.so} (286,826,417 cycles, 1.80%)</title><rect x="3.5740%" y="837" width="1.8036%" height="15" fill="rgb(208,69,12)" fg:x="568369502" fg:w="286826417"/><text x="3.8240%" y="847.50">V..</text></g><g><title>SerialHeap::satisfy_failed_allocation(unsigned long, bool){libjvm.so} (285,460,725 cycles, 1.80%)</title><rect x="3.5826%" y="821" width="1.7950%" height="15" fill="rgb(235,93,37)" fg:x="569735194" fg:w="285460725"/><text x="3.8326%" y="831.50">S..</text></g><g><title>SerialHeap::do_young_collection(bool) [clone .part.0]{libjvm.so} (285,460,725 cycles, 1.80%)</title><rect x="3.5826%" y="805" width="1.7950%" height="15" fill="rgb(213,116,39)" fg:x="569735194" fg:w="285460725"/><text x="3.8326%" y="815.50">S..</text></g><g><title>VMThread::inner_execute(VM_Operation*){libjvm.so} (291,595,472 cycles, 1.83%)</title><rect x="3.5592%" y="885" width="1.8336%" height="15" fill="rgb(222,207,29)" fg:x="566021405" fg:w="291595472"/><text x="3.8092%" y="895.50">V..</text></g><g><title>VM_Thread (292,889,161 cycles, 1.84%)</title><rect x="3.5592%" y="981" width="1.8417%" height="15" fill="rgb(206,96,30)" fg:x="566021405" fg:w="292889161"/><text x="3.8092%" y="991.50">V..</text></g><g><title>__GI___clone3{libc.so.6} (292,889,161 cycles, 1.84%)</title><rect x="3.5592%" y="965" width="1.8417%" height="15" fill="rgb(218,138,4)" fg:x="566021405" fg:w="292889161"/><text x="3.8092%" y="975.50">_..</text></g><g><title>start_thread{libc.so.6} (292,889,161 cycles, 1.84%)</title><rect x="3.5592%" y="949" width="1.8417%" height="15" fill="rgb(250,191,14)" fg:x="566021405" fg:w="292889161"/><text x="3.8092%" y="959.50">s..</text></g><g><title>thread_native_entry(Thread*){libjvm.so} (292,889,161 cycles, 1.84%)</title><rect x="3.5592%" y="933" width="1.8417%" height="15" fill="rgb(239,60,40)" fg:x="566021405" fg:w="292889161"/><text x="3.8092%" y="943.50">t..</text></g><g><title>Thread::call_run(){libjvm.so} (292,889,161 cycles, 1.84%)</title><rect x="3.5592%" y="917" width="1.8417%" height="15" fill="rgb(206,27,48)" fg:x="566021405" fg:w="292889161"/><text x="3.8092%" y="927.50">T..</text></g><g><title>VMThread::run(){libjvm.so} (292,889,161 cycles, 1.84%)</title><rect x="3.5592%" y="901" width="1.8417%" height="15" fill="rgb(225,35,8)" fg:x="566021405" fg:w="292889161"/><text x="3.8092%" y="911.50">V..</text></g><g><title>boolean java.util.RegularEnumSet$EnumSetIterator.hasNext(){jit} (36,955,294 cycles, 0.23%)</title><rect x="5.4244%" y="949" width="0.2324%" height="15" fill="rgb(250,213,24)" fg:x="862639242" fg:w="36955294"/><text x="5.6744%" y="959.50"></text></g><g><title>[unknown]{unknown} (49,652,421 cycles, 0.31%)</title><rect x="5.4009%" y="965" width="0.3122%" height="15" fill="rgb(247,123,22)" fg:x="858910566" fg:w="49652421"/><text x="5.6509%" y="975.50"></text></g><g><title>StubRoutines{perf-1810033.map} (37,240,970 cycles, 0.23%)</title><rect x="7.2605%" y="741" width="0.2342%" height="15" fill="rgb(231,138,38)" fg:x="1154645414" fg:w="37240970"/><text x="7.5105%" y="751.50"></text></g><g><title>Interpreter{jit} (35,806,174 cycles, 0.23%)</title><rect x="11.1137%" y="677" width="0.2252%" height="15" fill="rgb(231,145,46)" fg:x="1767420072" fg:w="35806174"/><text x="11.3637%" y="687.50"></text></g><g><title>boolean java.util.RegularEnumSet$EnumSetIterator.hasNext(){jit} (138,562,519 cycles, 0.87%)</title><rect x="11.3389%" y="677" width="0.8713%" height="15" fill="rgb(251,118,11)" fg:x="1803226246" fg:w="138562519"/><text x="11.5889%" y="687.50"></text></g><g><title>java.lang.Object java.util.RegularEnumSet$EnumSetIterator.next(){jit} (140,297,278 cycles, 0.88%)</title><rect x="12.8652%" y="677" width="0.8822%" height="15" fill="rgb(217,147,25)" fg:x="2045954947" fg:w="140297278"/><text x="13.1152%" y="687.50"></text></g><g><title>Interpreter{jit} (214,761,505 cycles, 1.35%)</title><rect x="29.8152%" y="661" width="1.3504%" height="15" fill="rgb(247,81,37)" fg:x="4741521944" fg:w="214761505"/><text x="30.0652%" y="671.50"></text></g><g><title>boolean java.util.RegularEnumSet$EnumSetIterator.hasNext(){jit} (201,180,590 cycles, 1.27%)</title><rect x="31.2513%" y="661" width="1.2650%" height="15" fill="rgb(209,12,38)" fg:x="4969908062" fg:w="201180590"/><text x="31.5013%" y="671.50"></text></g><g><title>byte[] com.mysql.cj.util.StringUtils.getBytes(java.lang.String, int, int, java.lang.String){jit} (1,256,433,682 cycles, 7.90%)</title><rect x="32.5164%" y="661" width="7.9006%" height="15" fill="rgb(227,1,9)" fg:x="5171088652" fg:w="1256433682"/><text x="32.7664%" y="671.50">byte[] com...</text></g><g><title>StubRoutines{perf-1810033.map} (350,909,920 cycles, 2.21%)</title><rect x="38.2104%" y="645" width="2.2066%" height="15" fill="rgb(248,47,43)" fg:x="6076612414" fg:w="350909920"/><text x="38.4604%" y="655.50">S..</text></g><g><title>int com.mysql.cj.util.StringInspector.incrementPosition(){jit} (94,359,295 cycles, 0.59%)</title><rect x="40.5610%" y="661" width="0.5933%" height="15" fill="rgb(221,10,30)" fg:x="6450434011" fg:w="94359295"/><text x="40.8110%" y="671.50"></text></g><g><title>int com.mysql.cj.util.StringInspector.indexOfNextChar(){jit} (1,206,255,782 cycles, 7.59%)</title><rect x="41.1544%" y="661" width="7.5851%" height="15" fill="rgb(210,229,1)" fg:x="6544793306" fg:w="1206255782"/><text x="41.4044%" y="671.50">int com.my..</text></g><g><title>int com.mysql.cj.util.StringInspector.indexOfNextChar(java.util.Set){jit} (1,119,240,559 cycles, 7.04%)</title><rect x="41.7015%" y="645" width="7.0379%" height="15" fill="rgb(222,148,37)" fg:x="6631808529" fg:w="1119240559"/><text x="41.9515%" y="655.50">int com.m..</text></g><g><title>int com.mysql.cj.util.StringInspector.indexOfNextChar(java.util.Set){jit} (199,475,878 cycles, 1.25%)</title><rect x="48.7395%" y="661" width="1.2543%" height="15" fill="rgb(234,67,33)" fg:x="7751049088" fg:w="199475878"/><text x="48.9895%" y="671.50"></text></g><g><title>int com.mysql.cj.util.StringInspector.matchesIgnoreCase(java.lang.String[]){jit} (433,363,113 cycles, 2.73%)</title><rect x="50.0015%" y="661" width="2.7250%" height="15" fill="rgb(247,98,35)" fg:x="7951752833" fg:w="433363113"/><text x="50.2515%" y="671.50">in..</text></g><g><title>java.lang.Object java.util.RegularEnumSet$EnumSetIterator.next(){jit} (101,428,087 cycles, 0.64%)</title><rect x="52.0887%" y="645" width="0.6378%" height="15" fill="rgb(247,138,52)" fg:x="8283687859" fg:w="101428087"/><text x="52.3387%" y="655.50"></text></g><g><title>java.lang.Object java.util.RegularEnumSet$EnumSetIterator.next(){jit} (653,105,873 cycles, 4.11%)</title><rect x="52.9687%" y="661" width="4.1068%" height="15" fill="rgb(213,79,30)" fg:x="8423627600" fg:w="653105873"/><text x="53.2187%" y="671.50">java..</text></g><g><title>void com.mysql.cj.QueryInfo.&lt;init&gt;(java.lang.String, com.mysql.cj.Session, java.lang.String){jit} (6,951,765,017 cycles, 43.71%)</title><rect x="13.7474%" y="677" width="43.7135%" height="15" fill="rgb(246,177,23)" fg:x="2186252225" fg:w="6951765017"/><text x="13.9974%" y="687.50">void com.mysql.cj.QueryInfo.&lt;init&gt;(java.lang.String, com.mysql.cj.Sessio..</text></g><g><title>java.lang.Object[] java.util.ArrayList.grow(){jit} (61,283,769 cycles, 0.39%)</title><rect x="57.0755%" y="661" width="0.3854%" height="15" fill="rgb(230,62,27)" fg:x="9076733473" fg:w="61283769"/><text x="57.3255%" y="671.50"></text></g><g><title>StubRoutines{perf-1810033.map} (35,487,570 cycles, 0.22%)</title><rect x="57.2377%" y="645" width="0.2231%" height="15" fill="rgb(216,154,8)" fg:x="9102529672" fg:w="35487570"/><text x="57.4877%" y="655.50"></text></g><g><title>java.lang.Object org.springframework.jdbc.datasource.SingleConnectionDataSource$CloseSuppressingInvocationHandler.invoke(java.lang.Object, java.lang.reflect.Method, java.lang.Object[]){jit} (7,840,246,054 cycles, 49.30%)</title><rect x="8.2013%" y="725" width="49.3003%" height="15" fill="rgb(244,35,45)" fg:x="1304259489" fg:w="7840246054"/><text x="8.4513%" y="735.50">java.lang.Object org.springframework.jdbc.datasource.SingleConnectionDataSource$C..</text></g><g><title>java.lang.Object java.lang.invoke.LambdaForm$MH/0x000000002011c400.invoke(java.lang.Object, java.lang.Object, java.lang.Object){jit} (7,840,246,054 cycles, 49.30%)</title><rect x="8.2013%" y="709" width="49.3003%" height="15" fill="rgb(251,115,12)" fg:x="1304259489" fg:w="7840246054"/><text x="8.4513%" y="719.50">java.lang.Object java.lang.invoke.LambdaForm$MH/0x000000002011c400.invoke(java.la..</text></g><g><title>java.sql.PreparedStatement com.mysql.cj.jdbc.ConnectionImpl.prepareStatement(java.lang.String, int, int){jit} (7,840,246,054 cycles, 49.30%)</title><rect x="8.2013%" y="693" width="49.3003%" height="15" fill="rgb(240,54,50)" fg:x="1304259489" fg:w="7840246054"/><text x="8.4513%" y="703.50">java.sql.PreparedStatement com.mysql.cj.jdbc.ConnectionImpl.prepareStatement(java..</text></g><g><title>com.mysql.cj.protocol.a.NativePacketHeader com.mysql.cj.protocol.a.SimplePacketReader.readHeaderLocal(){jit} (36,344,930 cycles, 0.23%)</title><rect x="57.6621%" y="645" width="0.2285%" height="15" fill="rgb(233,84,52)" fg:x="9170015343" fg:w="36344930"/><text x="57.9121%" y="655.50"></text></g><g><title>void com.mysql.cj.protocol.ReadAheadInputStream.fill(int){jit} (32,518,636 cycles, 0.20%)</title><rect x="57.6861%" y="629" width="0.2045%" height="15" fill="rgb(207,117,47)" fg:x="9173841637" fg:w="32518636"/><text x="57.9361%" y="639.50"></text></g><g><title>ip_local_deliver{kernel} (40,283,931 cycles, 0.25%)</title><rect x="58.6352%" y="37" width="0.2533%" height="15" fill="rgb(249,43,39)" fg:x="9324778100" fg:w="40283931"/><text x="58.8852%" y="47.50"></text></g><g><title>__napi_poll{kernel} (42,914,107 cycles, 0.27%)</title><rect x="58.6272%" y="117" width="0.2698%" height="15" fill="rgb(209,38,44)" fg:x="9323504246" fg:w="42914107"/><text x="58.8772%" y="127.50"></text></g><g><title>process_backlog{kernel} (42,914,107 cycles, 0.27%)</title><rect x="58.6272%" y="101" width="0.2698%" height="15" fill="rgb(236,212,23)" fg:x="9323504246" fg:w="42914107"/><text x="58.8772%" y="111.50"></text></g><g><title>__netif_receive_skb{kernel} (42,914,107 cycles, 0.27%)</title><rect x="58.6272%" y="85" width="0.2698%" height="15" fill="rgb(242,79,21)" fg:x="9323504246" fg:w="42914107"/><text x="58.8772%" y="95.50"></text></g><g><title>__netif_receive_skb_one_core{kernel} (42,914,107 cycles, 0.27%)</title><rect x="58.6272%" y="69" width="0.2698%" height="15" fill="rgb(211,96,35)" fg:x="9323504246" fg:w="42914107"/><text x="58.8772%" y="79.50"></text></g><g><title>ip_rcv{kernel} (42,914,107 cycles, 0.27%)</title><rect x="58.6272%" y="53" width="0.2698%" height="15" fill="rgb(253,215,40)" fg:x="9323504246" fg:w="42914107"/><text x="58.8772%" y="63.50"></text></g><g><title>__local_bh_enable_ip{kernel} (50,372,873 cycles, 0.32%)</title><rect x="58.6109%" y="197" width="0.3168%" height="15" fill="rgb(211,81,21)" fg:x="9320912448" fg:w="50372873"/><text x="58.8609%" y="207.50"></text></g><g><title>do_softirq.part.0{kernel} (50,372,873 cycles, 0.32%)</title><rect x="58.6109%" y="181" width="0.3168%" height="15" fill="rgb(208,190,38)" fg:x="9320912448" fg:w="50372873"/><text x="58.8609%" y="191.50"></text></g><g><title>__do_softirq{kernel} (50,372,873 cycles, 0.32%)</title><rect x="58.6109%" y="165" width="0.3168%" height="15" fill="rgb(235,213,38)" fg:x="9320912448" fg:w="50372873"/><text x="58.8609%" y="175.50"></text></g><g><title>handle_softirqs{kernel} (50,372,873 cycles, 0.32%)</title><rect x="58.6109%" y="149" width="0.3168%" height="15" fill="rgb(237,122,38)" fg:x="9320912448" fg:w="50372873"/><text x="58.8609%" y="159.50"></text></g><g><title>net_rx_action{kernel} (47,781,075 cycles, 0.30%)</title><rect x="58.6272%" y="133" width="0.3005%" height="15" fill="rgb(244,218,35)" fg:x="9323504246" fg:w="47781075"/><text x="58.8772%" y="143.50"></text></g><g><title>ip_queue_xmit{kernel} (86,272,688 cycles, 0.54%)</title><rect x="58.4097%" y="341" width="0.5425%" height="15" fill="rgb(240,68,47)" fg:x="9288916437" fg:w="86272688"/><text x="58.6597%" y="351.50"></text></g><g><title>__ip_queue_xmit{kernel} (86,272,688 cycles, 0.54%)</title><rect x="58.4097%" y="325" width="0.5425%" height="15" fill="rgb(210,16,53)" fg:x="9288916437" fg:w="86272688"/><text x="58.6597%" y="335.50"></text></g><g><title>ip_local_out{kernel} (84,854,032 cycles, 0.53%)</title><rect x="58.4187%" y="309" width="0.5336%" height="15" fill="rgb(235,124,12)" fg:x="9290335093" fg:w="84854032"/><text x="58.6687%" y="319.50"></text></g><g><title>ip_output{kernel} (56,799,109 cycles, 0.36%)</title><rect x="58.5951%" y="293" width="0.3572%" height="15" fill="rgb(224,169,11)" fg:x="9318390016" fg:w="56799109"/><text x="58.8451%" y="303.50"></text></g><g><title>ip_finish_output{kernel} (54,276,677 cycles, 0.34%)</title><rect x="58.6109%" y="277" width="0.3413%" height="15" fill="rgb(250,166,2)" fg:x="9320912448" fg:w="54276677"/><text x="58.8609%" y="287.50"></text></g><g><title>__ip_finish_output{kernel} (54,276,677 cycles, 0.34%)</title><rect x="58.6109%" y="261" width="0.3413%" height="15" fill="rgb(242,216,29)" fg:x="9320912448" fg:w="54276677"/><text x="58.8609%" y="271.50"></text></g><g><title>ip_finish_output2{kernel} (54,276,677 cycles, 0.34%)</title><rect x="58.6109%" y="245" width="0.3413%" height="15" fill="rgb(230,116,27)" fg:x="9320912448" fg:w="54276677"/><text x="58.8609%" y="255.50"></text></g><g><title>neigh_hh_output{kernel} (54,276,677 cycles, 0.34%)</title><rect x="58.6109%" y="229" width="0.3413%" height="15" fill="rgb(228,99,48)" fg:x="9320912448" fg:w="54276677"/><text x="58.8609%" y="239.50"></text></g><g><title>__dev_queue_xmit{kernel} (54,276,677 cycles, 0.34%)</title><rect x="58.6109%" y="213" width="0.3413%" height="15" fill="rgb(253,11,6)" fg:x="9320912448" fg:w="54276677"/><text x="58.8609%" y="223.50"></text></g><g><title>__tcp_transmit_skb{kernel} (91,238,293 cycles, 0.57%)</title><rect x="58.4018%" y="357" width="0.5737%" height="15" fill="rgb(247,143,39)" fg:x="9287654652" fg:w="91238293"/><text x="58.6518%" y="367.50"></text></g><g><title>tcp_push{kernel} (96,242,861 cycles, 0.61%)</title><rect x="58.4018%" y="405" width="0.6052%" height="15" fill="rgb(236,97,10)" fg:x="9287654652" fg:w="96242861"/><text x="58.6518%" y="415.50"></text></g><g><title>__tcp_push_pending_frames{kernel} (96,242,861 cycles, 0.61%)</title><rect x="58.4018%" y="389" width="0.6052%" height="15" fill="rgb(233,208,19)" fg:x="9287654652" fg:w="96242861"/><text x="58.6518%" y="399.50"></text></g><g><title>tcp_write_xmit{kernel} (96,242,861 cycles, 0.61%)</title><rect x="58.4018%" y="373" width="0.6052%" height="15" fill="rgb(216,164,2)" fg:x="9287654652" fg:w="96242861"/><text x="58.6518%" y="383.50"></text></g><g><title>inet6_sendmsg{kernel} (141,243,714 cycles, 0.89%)</title><rect x="58.1507%" y="453" width="0.8882%" height="15" fill="rgb(220,129,5)" fg:x="9247722017" fg:w="141243714"/><text x="58.4007%" y="463.50"></text></g><g><title>tcp_sendmsg{kernel} (141,243,714 cycles, 0.89%)</title><rect x="58.1507%" y="437" width="0.8882%" height="15" fill="rgb(242,17,10)" fg:x="9247722017" fg:w="141243714"/><text x="58.4007%" y="447.50"></text></g><g><title>tcp_sendmsg_locked{kernel} (139,967,695 cycles, 0.88%)</title><rect x="58.1587%" y="421" width="0.8801%" height="15" fill="rgb(242,107,0)" fg:x="9248998036" fg:w="139967695"/><text x="58.4087%" y="431.50"></text></g><g><title>entry_SYSCALL_64_after_hwframe{kernel} (147,608,605 cycles, 0.93%)</title><rect x="58.1180%" y="565" width="0.9282%" height="15" fill="rgb(251,28,31)" fg:x="9242529097" fg:w="147608605"/><text x="58.3680%" y="575.50"></text></g><g><title>do_syscall_64{kernel} (147,608,605 cycles, 0.93%)</title><rect x="58.1180%" y="549" width="0.9282%" height="15" fill="rgb(233,223,10)" fg:x="9242529097" fg:w="147608605"/><text x="58.3680%" y="559.50"></text></g><g><title>x64_sys_call{kernel} (146,327,118 cycles, 0.92%)</title><rect x="58.1261%" y="533" width="0.9201%" height="15" fill="rgb(215,21,27)" fg:x="9243810584" fg:w="146327118"/><text x="58.3761%" y="543.50"></text></g><g><title>__x64_sys_write{kernel} (146,327,118 cycles, 0.92%)</title><rect x="58.1261%" y="517" width="0.9201%" height="15" fill="rgb(232,23,21)" fg:x="9243810584" fg:w="146327118"/><text x="58.3761%" y="527.50"></text></g><g><title>ksys_write{kernel} (145,023,136 cycles, 0.91%)</title><rect x="58.1343%" y="501" width="0.9119%" height="15" fill="rgb(244,5,23)" fg:x="9245114566" fg:w="145023136"/><text x="58.3843%" y="511.50"></text></g><g><title>vfs_write{kernel} (142,415,685 cycles, 0.90%)</title><rect x="58.1507%" y="485" width="0.8955%" height="15" fill="rgb(226,81,46)" fg:x="9247722017" fg:w="142415685"/><text x="58.4007%" y="495.50"></text></g><g><title>sock_write_iter{kernel} (142,415,685 cycles, 0.90%)</title><rect x="58.1507%" y="469" width="0.8955%" height="15" fill="rgb(247,70,30)" fg:x="9247722017" fg:w="142415685"/><text x="58.4007%" y="479.50"></text></g><g><title>__syscall_cancel_arch_end{libc.so.6} (148,961,337 cycles, 0.94%)</title><rect x="58.1180%" y="581" width="0.9367%" height="15" fill="rgb(212,68,19)" fg:x="9242529097" fg:w="148961337"/><text x="58.3680%" y="591.50"></text></g><g><title>com.mysql.cj.jdbc.result.ResultSetInternalMethods com.mysql.cj.jdbc.ClientPreparedStatement.executeInternal(int, com.mysql.cj.protocol.Message, boolean, boolean, com.mysql.cj.protocol.ColumnDefinition, boolean){jit} (244,497,827 cycles, 1.54%)</title><rect x="57.5254%" y="709" width="1.5374%" height="15" fill="rgb(240,187,13)" fg:x="9148282262" fg:w="244497827"/><text x="57.7754%" y="719.50"></text></g><g><title>com.mysql.cj.protocol.Resultset com.mysql.cj.NativeSession.execSQL(com.mysql.cj.Query, java.lang.String, int, com.mysql.cj.protocol.a.NativePacketPayload, boolean, com.mysql.cj.protocol.ProtocolEntityFactory, com.mysql.cj.protocol.ColumnDefinition, boolean){jit} (240,766,793 cycles, 1.51%)</title><rect x="57.5489%" y="693" width="1.5140%" height="15" fill="rgb(223,113,26)" fg:x="9152013296" fg:w="240766793"/><text x="57.7989%" y="703.50"></text></g><g><title>com.mysql.cj.protocol.Resultset com.mysql.cj.protocol.a.NativeProtocol.sendQueryPacket(com.mysql.cj.Query, com.mysql.cj.protocol.a.NativePacketPayload, int, boolean, com.mysql.cj.protocol.ColumnDefinition, com.mysql.cj.protocol.ProtocolEntityFactory){jit} (240,766,793 cycles, 1.51%)</title><rect x="57.5489%" y="677" width="1.5140%" height="15" fill="rgb(206,192,2)" fg:x="9152013296" fg:w="240766793"/><text x="57.7989%" y="687.50"></text></g><g><title>com.mysql.cj.protocol.a.NativePacketPayload com.mysql.cj.protocol.a.NativeProtocol.sendCommand(com.mysql.cj.protocol.Message, boolean, int){jit} (222,764,746 cycles, 1.40%)</title><rect x="57.6621%" y="661" width="1.4008%" height="15" fill="rgb(241,108,4)" fg:x="9170015343" fg:w="222764746"/><text x="57.9121%" y="671.50"></text></g><g><title>void java.io.BufferedOutputStream.write(byte[], int, int){jit} (170,772,522 cycles, 1.07%)</title><rect x="57.9890%" y="645" width="1.0738%" height="15" fill="rgb(247,173,49)" fg:x="9222007567" fg:w="170772522"/><text x="58.2390%" y="655.50"></text></g><g><title>int sun.nio.ch.SocketDispatcher.write0(java.io.FileDescriptor, long, int){jit} (151,543,056 cycles, 0.95%)</title><rect x="58.1099%" y="629" width="0.9529%" height="15" fill="rgb(224,114,35)" fg:x="9241237033" fg:w="151543056"/><text x="58.3599%" y="639.50"></text></g><g><title>Java_sun_nio_ch_SocketDispatcher_write0{libnio.so} (151,543,056 cycles, 0.95%)</title><rect x="58.1099%" y="613" width="0.9529%" height="15" fill="rgb(245,159,27)" fg:x="9241237033" fg:w="151543056"/><text x="58.3599%" y="623.50"></text></g><g><title>__GI___libc_write{libc.so.6} (150,250,992 cycles, 0.94%)</title><rect x="58.1180%" y="597" width="0.9448%" height="15" fill="rgb(245,172,44)" fg:x="9242529097" fg:w="150250992"/><text x="58.3680%" y="607.50"></text></g><g><title>StubRoutines{perf-1810033.map} (254,153,528 cycles, 1.60%)</title><rect x="63.9811%" y="677" width="1.5981%" height="15" fill="rgb(236,23,11)" fg:x="10174936755" fg:w="254153528"/><text x="64.2311%" y="687.50"></text></g><g><title>StubRoutines{perf-1810033.map} (185,131,520 cycles, 1.16%)</title><rect x="69.7225%" y="661" width="1.1641%" height="15" fill="rgb(205,117,38)" fg:x="11087985555" fg:w="185131520"/><text x="69.9725%" y="671.50"></text></g><g><title>boolean java.lang.String.equals(java.lang.Object){jit} (32,476,855 cycles, 0.20%)</title><rect x="70.9027%" y="661" width="0.2042%" height="15" fill="rgb(237,72,25)" fg:x="11275677679" fg:w="32476855"/><text x="71.1527%" y="671.50"></text></g><g><title>byte[] com.mysql.cj.protocol.a.StringValueEncoder.getBytes(com.mysql.cj.BindValue){jit} (944,523,421 cycles, 5.94%)</title><rect x="65.6036%" y="677" width="5.9393%" height="15" fill="rgb(244,70,9)" fg:x="10432964723" fg:w="944523421"/><text x="65.8536%" y="687.50">byte[] c..</text></g><g><title>java.lang.StringBuilder com.mysql.cj.util.StringUtils.escapeString(java.lang.StringBuilder, java.lang.String, boolean, java.nio.charset.CharsetEncoder){jit} (56,320,058 cycles, 0.35%)</title><rect x="71.1888%" y="661" width="0.3541%" height="15" fill="rgb(217,125,39)" fg:x="11321168086" fg:w="56320058"/><text x="71.4388%" y="671.50"></text></g><g><title>int jdk.internal.math.DoubleToDecimal.toDecimal(byte[], int, int, long, int, jdk.internal.math.FormattedFPDecimal){jit} (171,873,481 cycles, 1.08%)</title><rect x="74.5078%" y="661" width="1.0808%" height="15" fill="rgb(235,36,10)" fg:x="11848996813" fg:w="171873481"/><text x="74.7578%" y="671.50"></text></g><g><title>com.mysql.cj.protocol.a.NativePacketPayload com.mysql.cj.protocol.a.NativeMessageBuilder.buildComQuery(com.mysql.cj.protocol.a.NativePacketPayload, com.mysql.cj.Session, com.mysql.cj.PreparedQuery, com.mysql.cj.QueryBindings, java.lang.String){jit} (2,710,457,364 cycles, 17.04%)</title><rect x="59.0628%" y="709" width="17.0437%" height="15" fill="rgb(251,123,47)" fg:x="9392780089" fg:w="2710457364"/><text x="59.3128%" y="719.50">com.mysql.cj.protocol.a.Na..</text></g><g><title>void com.mysql.cj.NativeQueryBindValue.writeAsText(com.mysql.cj.protocol.Message){jit} (2,504,412,622 cycles, 15.75%)</title><rect x="60.3585%" y="693" width="15.7480%" height="15" fill="rgb(221,13,13)" fg:x="9598824831" fg:w="2504412622"/><text x="60.6085%" y="703.50">void com.mysql.cj.Native..</text></g><g><title>java.lang.String com.mysql.cj.protocol.a.NumberValueEncoder.getString(com.mysql.cj.BindValue){jit} (725,749,309 cycles, 4.56%)</title><rect x="71.5429%" y="677" width="4.5636%" height="15" fill="rgb(238,131,9)" fg:x="11377488144" fg:w="725749309"/><text x="71.7929%" y="687.50">java...</text></g><g><title>void java.lang.String.&lt;init&gt;(java.nio.charset.Charset, byte[], int, int){jit} (82,367,159 cycles, 0.52%)</title><rect x="75.5886%" y="661" width="0.5179%" height="15" fill="rgb(211,50,8)" fg:x="12020870294" fg:w="82367159"/><text x="75.8386%" y="671.50"></text></g><g><title>StubRoutines{perf-1810033.map} (33,104,081 cycles, 0.21%)</title><rect x="75.8983%" y="645" width="0.2082%" height="15" fill="rgb(245,182,24)" fg:x="12070133372" fg:w="33104081"/><text x="76.1483%" y="655.50"></text></g><g><title>long com.mysql.cj.jdbc.ClientPreparedStatement.executeUpdateInternal(com.mysql.cj.QueryBindings, boolean){jit} (2,963,949,474 cycles, 18.64%)</title><rect x="57.5017%" y="725" width="18.6376%" height="15" fill="rgb(242,14,37)" fg:x="9144505543" fg:w="2963949474"/><text x="57.7517%" y="735.50">long com.mysql.cj.jdbc.Client..</text></g><g><title>void org.springframework.jdbc.core.StatementCreatorUtils.setValue(java.sql.PreparedStatement, int, int, java.lang.String, java.lang.Integer, java.lang.Object){jit} (3,636,994,208 cycles, 22.87%)</title><rect x="76.1705%" y="725" width="22.8698%" height="15" fill="rgb(246,228,12)" fg:x="12113416424" fg:w="3636994208"/><text x="76.4205%" y="735.50">void org.springframework.jdbc.core.S..</text></g><g><title>void com.mysql.cj.jdbc.ClientPreparedStatement.setString(int, java.lang.String){jit} (854,626,670 cycles, 5.37%)</title><rect x="93.6663%" y="709" width="5.3740%" height="15" fill="rgb(213,55,15)" fg:x="14895783962" fg:w="854626670"/><text x="93.9163%" y="719.50">void co..</text></g><g><title>void com.mysql.cj.NativeQueryBindValue.setBinding(java.lang.Object, com.mysql.cj.MysqlType, int, java.util.concurrent.atomic.AtomicBoolean){jit} (144,732,797 cycles, 0.91%)</title><rect x="98.1302%" y="693" width="0.9101%" height="15" fill="rgb(209,9,3)" fg:x="15605677835" fg:w="144732797"/><text x="98.3802%" y="703.50"></text></g><g><title>int org.springframework.jdbc.core.JdbcTemplate.update(java.lang.String, org.springframework.jdbc.core.PreparedStatementSetter){jit} (14,576,732,261 cycles, 91.66%)</title><rect x="7.4947%" y="741" width="91.6601%" height="15" fill="rgb(230,59,30)" fg:x="1191886384" fg:w="14576732261"/><text x="7.7447%" y="751.50">int org.springframework.jdbc.core.JdbcTemplate.update(java.lang.String, org.springframework.jdbc.core.PreparedStatementSetter){jit}</text></g><g><title>all (15,903,028,492 cycles, 100%)</title><rect x="0.0000%" y="997" width="100.0000%" height="15" fill="rgb(209,121,21)" fg:x="0" fg:w="15903028492"/><text x="0.2500%" y="1007.50"></text></g><g><title>java (15,044,117,926 cycles, 94.60%)</title><rect x="5.4009%" y="981" width="94.5991%" height="15" fill="rgb(220,109,13)" fg:x="858910566" fg:w="15044117926"/><text x="5.6509%" y="991.50">java</text></g><g><title>__GI___clone3{libc.so.6} (14,994,465,505 cycles, 94.29%)</title><rect x="5.7131%" y="965" width="94.2869%" height="15" fill="rgb(232,18,1)" fg:x="908562987" fg:w="14994465505"/><text x="5.9631%" y="975.50">__GI___clone3{libc.so.6}</text></g><g><title>start_thread{libc.so.6} (14,994,465,505 cycles, 94.29%)</title><rect x="5.7131%" y="949" width="94.2869%" height="15" fill="rgb(215,41,42)" fg:x="908562987" fg:w="14994465505"/><text x="5.9631%" y="959.50">start_thread{libc.so.6}</text></g><g><title>ThreadJavaMain{libjli.so} (14,994,465,505 cycles, 94.29%)</title><rect x="5.7131%" y="933" width="94.2869%" height="15" fill="rgb(224,123,36)" fg:x="908562987" fg:w="14994465505"/><text x="5.9631%" y="943.50">ThreadJavaMain{libjli.so}</text></g><g><title>JavaMain{libjli.so} (14,994,465,505 cycles, 94.29%)</title><rect x="5.7131%" y="917" width="94.2869%" height="15" fill="rgb(240,125,3)" fg:x="908562987" fg:w="14994465505"/><text x="5.9631%" y="927.50">JavaMain{libjli.so}</text></g><g><title>invokeStaticMainWithArgs{libjli.so} (14,994,465,505 cycles, 94.29%)</title><rect x="5.7131%" y="901" width="94.2869%" height="15" fill="rgb(205,98,50)" fg:x="908562987" fg:w="14994465505"/><text x="5.9631%" y="911.50">invokeStaticMainWithArgs{libjli.so}</text></g><g><title>jni_CallStaticVoidMethod{libjvm.so} (14,994,465,505 cycles, 94.29%)</title><rect x="5.7131%" y="885" width="94.2869%" height="15" fill="rgb(205,185,37)" fg:x="908562987" fg:w="14994465505"/><text x="5.9631%" y="895.50">jni_CallStaticVoidMethod{libjvm.so}</text></g><g><title>jni_invoke_static(JNIEnv_*, JavaValue*, _jobject*, JNICallType, _jmethodID*, JNI_ArgumentPusher*, JavaThread*) [clone .constprop.1]{libjvm.so} (14,994,465,505 cycles, 94.29%)</title><rect x="5.7131%" y="869" width="94.2869%" height="15" fill="rgb(238,207,15)" fg:x="908562987" fg:w="14994465505"/><text x="5.9631%" y="879.50">jni_invoke_static(JNIEnv_*, JavaValue*, _jobject*, JNICallType, _jmethodID*, JNI_ArgumentPusher*, JavaThread*) [clone .constprop.1]{libjvm.so}</text></g><g><title>JavaCalls::call_helper(JavaValue*, methodHandle const&amp;, JavaCallArguments*, JavaThread*){libjvm.so} (14,994,465,505 cycles, 94.29%)</title><rect x="5.7131%" y="853" width="94.2869%" height="15" fill="rgb(213,199,42)" fg:x="908562987" fg:w="14994465505"/><text x="5.9631%" y="863.50">JavaCalls::call_helper(JavaValue*, methodHandle const&amp;, JavaCallArguments*, JavaThread*){libjvm.so}</text></g><g><title>StubRoutines{perf-1810033.map} (14,994,465,505 cycles, 94.29%)</title><rect x="5.7131%" y="837" width="94.2869%" height="15" fill="rgb(235,201,11)" fg:x="908562987" fg:w="14994465505"/><text x="5.9631%" y="847.50">StubRoutines{perf-1810033.map}</text></g><g><title>Interpreter{jit} (14,994,465,505 cycles, 94.29%)</title><rect x="5.7131%" y="821" width="94.2869%" height="15" fill="rgb(207,46,11)" fg:x="908562987" fg:w="14994465505"/><text x="5.9631%" y="831.50">Interpreter{jit}</text></g><g><title>Interpreter{jit} (14,994,465,505 cycles, 94.29%)</title><rect x="5.7131%" y="805" width="94.2869%" height="15" fill="rgb(241,35,35)" fg:x="908562987" fg:w="14994465505"/><text x="5.9631%" y="815.50">Interpreter{jit}</text></g><g><title>Interpreter{jit} (14,994,465,505 cycles, 94.29%)</title><rect x="5.7131%" y="789" width="94.2869%" height="15" fill="rgb(243,32,47)" fg:x="908562987" fg:w="14994465505"/><text x="5.9631%" y="799.50">Interpreter{jit}</text></g><g><title>Interpreter{jit} (14,994,441,268 cycles, 94.29%)</title><rect x="5.7133%" y="773" width="94.2867%" height="15" fill="rgb(247,202,23)" fg:x="908587224" fg:w="14994441268"/><text x="5.9633%" y="783.50">Interpreter{jit}</text></g><g><title>void bench.fw.Fw$Tmpl.t6(java.lang.String){jit} (14,985,279,323 cycles, 94.23%)</title><rect x="5.7709%" y="757" width="94.2291%" height="15" fill="rgb(219,102,11)" fg:x="917749169" fg:w="14985279323"/><text x="6.0209%" y="767.50">void bench.fw.Fw$Tmpl.t6(java.lang.String){jit}</text></g><g><title>java.lang.String java.lang.String.join(java.lang.CharSequence, java.lang.Iterable){jit} (134,409,847 cycles, 0.85%)</title><rect x="99.1548%" y="741" width="0.8452%" height="15" fill="rgb(243,110,44)" fg:x="15768618645" fg:w="134409847"/><text x="99.4048%" y="751.50"></text></g><g><title>StubRoutines{perf-1810033.map} (31,858,438 cycles, 0.20%)</title><rect x="99.7997%" y="725" width="0.2003%" height="15" fill="rgb(222,74,54)" fg:x="15871170054" fg:w="31858438"/><text x="100.0497%" y="735.50"></text></g></svg></svg>

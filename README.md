@@ -67,7 +67,9 @@ Sequel 5.110, ActiveRecord 8.1, Diesel 2.4, SeaORM 2.0. Later: async drivers, OD
 - 2026-11-26: steady-state correction for JIT runtimes (warm-up could stop on a plateau of unoptimized code; 90 cells
   rerun) and for the Node.js drivers' streamed rows; see the correction section in each report.
 - `results/summary.json` (timed runs) and `results/summary-mem.json` (memory pass) aggregate `results/raw/` and `results/raw-mem/`.
-- Next: profiling pass (where the time goes).
+- **Profiles** (where the client CPU goes, 381 perf profiles with flame graphs): [reports/profiles.md](reports/profiles.md).
+  Breakdowns in `results/profile-summary.json`, flame graphs in `results/profiles/svg/`; the raw folded stacks (1.8 GB) are in
+  `results/profiles-folded-2026-11-26.tar.zst` (`orchestrator/profile_stats.py` recomputes the stack-level figures).
 
 ## Updating the results page
 

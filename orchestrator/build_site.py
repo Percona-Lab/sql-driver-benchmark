@@ -101,7 +101,7 @@ html = f"""<!doctype html>
   <div class="eyebrow">Percona Lab · MySQL &amp; MariaDB drivers in ten languages</div>
   <h1>SQL Driver Benchmark</h1>
 {body}
-  <p class="rp-foot">Code, raw data and method: <a href="https://github.com/Percona-Lab/sql-driver-benchmark">github.com/Percona-Lab/sql-driver-benchmark</a> · Data: <a href="data/cells.json">cells.json</a>, <a href="data/notes.json">notes.json</a>, <a href="data/tuned.json">tuned.json</a> · Apache License 2.0</p>
+  <p class="rp-foot">Code, raw data and method: <a href="https://github.com/Percona-Lab/sql-driver-benchmark">github.com/Percona-Lab/sql-driver-benchmark</a> · Reports: <a href="https://github.com/Percona-Lab/sql-driver-benchmark/blob/main/reports/phase3.md">frameworks</a>, <a href="https://github.com/Percona-Lab/sql-driver-benchmark/blob/main/reports/profiles.md">where the CPU goes (profiles)</a> · Data: <a href="data/cells.json">cells.json</a>, <a href="data/notes.json">notes.json</a>, <a href="data/tuned.json">tuned.json</a> · Apache License 2.0</p>
 </main>
 <script>{SHIM}</script>
 """ + "".join(f"<script>{s}</script>\n" for s in scripts) + """<script>

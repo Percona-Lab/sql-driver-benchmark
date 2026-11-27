@@ -148,10 +148,19 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args, min_warmu
         # client memory cap (cgroup): a runaway client is killed, not the database server
         prefix = ["systemd-run", "--scope", "--quiet", "-p", f"MemoryMax={CLIENT_MEM}", "-p", "MemorySwapMax=0",
                   "taskset", "-c", CLIENT_CPU]
-        if evset:
+        if args.profile:
+            # CPU profile of the measured iterations only (perf record gated by the runner's control fifo).
+            # JIT runtimes write perf maps (/tmp/perf-<pid>.map) so their generated code has names.
+            env.update(PROFILE_ENV)
+            cg = "fp"
+            if stack.startswith("rust-"):   # profile a frame-pointer build of the same code (build.sh: target-fp/)
+                argv = [a.replace("target/release", "target-fp/release") for a in argv]
+            prefix += ["perf", "record", "-q", "-F", str(args.profile_hz), "--call-graph", cg, "-o", perfout + ".data",
+                       "-D", "-1", "--control", f"fifo:{ctl},{ack}", "--"]
+        elif evset:
             prefix += ["perf", "stat", "-x", ",", "-o", perfout, "-D", "-1", "--control", f"fifo:{ctl},{ack}",
                        "-e", EVENTS[evset], "--"]
-        else:
+        if not args.profile and not evset:
             env.pop("PERF_CTL"); env.pop("PERF_ACK")
         cmd = (prefix
                + argv + ["--test", test, "--variant", base, "--config", config, "--server", server,
@@ -183,10 +192,29 @@ def run_one(server, stack, test, variant, config, rep, pid, exp, args, min_warmu
     json.dump(d, open(res, "w"))
     if evset:
         os.unlink(perfout)
+    if args.profile and os.path.exists(perfout + ".data"):
+        folded = res.replace(".json", ".folded")
+        with open(folded, "w") as fo:
+            ps = subprocess.Popen(["perf", "script", "-i", perfout + ".data"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            col = subprocess.Popen(["python3", f"{SRC}/orchestrator/collapse_perf.py"], stdin=ps.stdout, stdout=fo)   # keeps each frame's library
+            ps.stdout.close()   # only the collapser reads the pipe (else perf blocks if it exits early)
+            col.wait(); ps.wait()
+        os.unlink(perfout + ".data")
     if bad:
         return "fail", f"checksum {bad[0]} != {want}"
     cpu = sorted(it["cpu_ns"] for it in d["iters"])[len(d["iters"]) // 2]
     return "ok", f"cpu/op {cpu / d['ops_per_iter'] / 1000:.3f} us  tls={d['tls']}"
+
+
+# runtime switches that let perf name JIT-generated code (and keep frame pointers for the unwinder)
+PROFILE_ENV = {
+    "JAVA_TOOL_OPTIONS": "-XX:+PreserveFramePointer -XX:+UnlockDiagnosticVMOptions -XX:+DumpPerfMapAtExit",
+    "NODE_OPTIONS": "--perf-basic-prof --interpreted-frames-native-stack",
+    "PYTHONPERFSUPPORT": "1",
+    "DOTNET_PerfMapEnabled": "1",
+    "DOTNET_EnableWriteXorExecute": "0",   # W^X double-maps JIT code through a memfd, which hides it from the perf map
+    "RUBYOPT": "--yjit-perf",
+}
 
 
 def trending(server, stack, test, variant, config, rep, args):
@@ -213,10 +241,16 @@ def main():
     ap.add_argument("--quick", action="store_true", help="smoke test: 1 process, 1 iteration, no warm-up")
     ap.add_argument("--results", default=RESULTS)
     ap.add_argument("--no-counters", action="store_true", help="skip the two hardware-counter processes per cell")
+    ap.add_argument("--profile", action="store_true", help="CPU profile (perf record) of the measured iterations instead of timing")
+    ap.add_argument("--profile-hz", type=int, default=2999)
     ap.add_argument("--min-warmup", type=int, default=3, help="JIT runtimes: minimum warm-up iterations before the stability test")
     args = ap.parse_args()
     if args.quick:
         args.repeats, args.results = 1, f"{ROOT}/results-smoke"
+    if args.profile:   # one profiled process per cell, no counter processes, separate results
+        args.repeats, args.no_counters = 1, True
+        if args.results == RESULTS:
+            args.results = f"{ROOT}/results-prof"
     subprocess.run(["/root/03-runtime-cpu.sh"], capture_output=True)
     log = open(f"{ROOT}/run.log", "a")
     for server in args.servers.split(","):
@@ -241,7 +275,7 @@ def main():
                             # (first > 1.10 x median of the last three) stopped warming up on a plateau; rerun it with
                             # twice the minimum warm-up, up to the 40-iteration cap. See SPEC.md section 6.
                             mw, retries = args.min_warmup, 0
-                            while (status == "ok" and STACKS[stack][2] and test != "T0" and not args.quick
+                            while (status == "ok" and not args.profile and STACKS[stack][2] and test != "T0" and not args.quick
                                    and str(rep) not in ("cA", "cB") and mw < 40 and trending(server, stack, test, variant, config, rep, args)):
                                 mw, retries = min(40, mw * 2 if mw >= 5 else 10), retries + 1
                                 status, msg = run_one(server, stack, test, variant, config, rep, pid, exp, args, min_warmup=mw)

@@ -15,3 +15,7 @@ cargo build --release
 cargo build --release
 grep -A1 -E '^name = "(diesel|sea-orm|sqlx)"$' Cargo.lock
 ldd target/release/fwrunner | grep -i mysql
+# Frame-pointer builds of the same code for the profiling pass (run.py --profile uses target-fp/)
+cd ..
+RUSTFLAGS="-C force-frame-pointers=yes" CARGO_TARGET_DIR=target-fp cargo build --release
+cd fw && RUSTFLAGS="$RUSTFLAGS -C force-frame-pointers=yes" CARGO_TARGET_DIR=target-fp cargo build --release

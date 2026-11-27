@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="1398" onload="init(evt)" viewBox="0 0 1200 1398" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="1398" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">rust-sqlx/T3-text-buffered-default-0.folded (Percona, default; sampled CPU cycles)</text><text id="details" fill="rgb(0,0,0)" x="10" y="1381.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="1381.00"> </text><svg id="frames" x="10" width="1180" total_samples="5267519552"><g><title>_int_free_merge_chunk{libc.so.6} (17,826,602 cycles, 0.34%)</title><rect x="4.0611%" y="661" width="0.3384%" height="15" fill="rgb(227,0,7)" fg:x="213920424" fg:w="17826602"/><text x="4.3111%" y="671.50"></text></g><g><title>_int_free_create_chunk{inlined} (11,406,763 cycles, 0.22%)</title><rect x="4.1830%" y="645" width="0.2165%" height="15" fill="rgb(217,0,24)" fg:x="220340263" fg:w="11406763"/><text x="4.4330%" y="655.50"></text></g><g><title>core::ptr::drop_glue::&lt;alloc::sync::Arc&lt;alloc::vec::Vec&lt;sqlx_mysql::column::MySqlColumn&gt;&gt;&gt;{inlined} (227,880,603 cycles, 4.33%)</title><rect x="0.1224%" y="741" width="4.3261%" height="15" fill="rgb(221,193,54)" fg:x="6444989" fg:w="227880603"/><text x="0.3724%" y="751.50">core:..</text></g><g><title>&lt;alloc::sync::Arc&lt;alloc::vec::Vec&lt;sqlx_mysql::column::MySqlColumn&gt;&gt; as core::ops::drop::Drop&gt;::drop{inlined} (227,880,603 cycles, 4.33%)</title><rect x="0.1224%" y="725" width="4.3261%" height="15" fill="rgb(248,212,6)" fg:x="6444989" fg:w="227880603"/><text x="0.3724%" y="735.50">&lt;allo..</text></g><g><title>&lt;alloc::sync::Arc&lt;alloc::vec::Vec&lt;sqlx_mysql::column::MySqlColumn&gt;&gt;&gt;::inner{inlined} (27,875,767 cycles, 0.53%)</title><rect x="3.9193%" y="709" width="0.5292%" height="15" fill="rgb(208,68,35)" fg:x="206449825" fg:w="27875767"/><text x="4.1693%" y="719.50"></text></g><g><title>&lt;core::ptr::non_null::NonNull&lt;alloc::sync::ArcInner&lt;alloc::vec::Vec&lt;sqlx_mysql::column::MySqlColumn&gt;&gt;&gt;&gt;::as_ref{inlined} (27,875,767 cycles, 0.53%)</title><rect x="3.9193%" y="693" width="0.5292%" height="15" fill="rgb(232,128,0)" fg:x="206449825" fg:w="27875767"/><text x="4.1693%" y="703.50"></text></g><g><title>_int_free_chunk{libc.so.6} (27,875,767 cycles, 0.53%)</title><rect x="3.9193%" y="677" width="0.5292%" height="15" fill="rgb(207,160,47)" fg:x="206449825" fg:w="27875767"/><text x="4.1693%" y="687.50"></text></g><g><title>core::ptr::drop_glue::&lt;alloc::sync::Arc&lt;hashbrown::map::HashMap&lt;sqlx_core::ext::ustr::UStr, usize&gt;&gt;&gt;{inlined} (30,454,256 cycles, 0.58%)</title><rect x="4.4485%" y="741" width="0.5782%" height="15" fill="rgb(228,23,34)" fg:x="234325592" fg:w="30454256"/><text x="4.6985%" y="751.50"></text></g><g><title>&lt;alloc::sync::Arc&lt;hashbrown::map::HashMap&lt;sqlx_core::ext::ustr::UStr, usize&gt;&gt; as core::ops::drop::Drop&gt;::drop{inlined} (30,454,256 cycles, 0.58%)</title><rect x="4.4485%" y="725" width="0.5782%" height="15" fill="rgb(218,30,26)" fg:x="234325592" fg:w="30454256"/><text x="4.6985%" y="735.50"></text></g><g><title>core::ptr::drop_glue::&lt;alloc::vec::Vec&lt;core::option::Option&lt;core::ops::range::Range&lt;usize&gt;&gt;&gt;&gt;{inlined} (487,823,324 cycles, 9.26%)</title><rect x="5.0267%" y="725" width="9.2610%" height="15" fill="rgb(220,122,19)" fg:x="264779848" fg:w="487823324"/><text x="5.2767%" y="735.50">core::ptr::dr..</text></g><g><title>core::ptr::drop_glue::&lt;alloc::raw_vec::RawVec&lt;core::option::Option&lt;core::ops::range::Range&lt;usize&gt;&gt;&gt;&gt;{inlined} (487,823,324 cycles, 9.26%)</title><rect x="5.0267%" y="709" width="9.2610%" height="15" fill="rgb(250,228,42)" fg:x="264779848" fg:w="487823324"/><text x="5.2767%" y="719.50">core::ptr::dr..</text></g><g><title>&lt;alloc::raw_vec::RawVec&lt;core::option::Option&lt;core::ops::range::Range&lt;usize&gt;&gt;&gt; as core::ops::drop::Drop&gt;::drop{inlined} (487,823,324 cycles, 9.26%)</title><rect x="5.0267%" y="693" width="9.2610%" height="15" fill="rgb(240,193,28)" fg:x="264779848" fg:w="487823324"/><text x="5.2767%" y="703.50">&lt;alloc::raw_v..</text></g><g><title>bytes::bytes_mut::shared_v_drop{runner} (486,532,582 cycles, 9.24%)</title><rect x="5.0512%" y="677" width="9.2365%" height="15" fill="rgb(216,20,37)" fg:x="266070590" fg:w="486532582"/><text x="5.3012%" y="687.50">bytes::bytes_..</text></g><g><title>bytes::bytes_mut::release_shared{inlined} (486,532,582 cycles, 9.24%)</title><rect x="5.0512%" y="661" width="9.2365%" height="15" fill="rgb(206,188,39)" fg:x="266070590" fg:w="486532582"/><text x="5.3012%" y="671.50">bytes::bytes_..</text></g><g><title>&lt;alloc::vec::into_iter::IntoIter&lt;sqlx_mysql::row::MySqlRow&gt; as core::iter::traits::iterator::Iterator&gt;::next{inlined} (752,592,762 cycles, 14.29%)</title><rect x="0.0735%" y="789" width="14.2874%" height="15" fill="rgb(217,207,13)" fg:x="3869489" fg:w="752592762"/><text x="0.3235%" y="799.50">&lt;alloc::vec::into_iter..</text></g><g><title>&lt;core::ptr::non_null::NonNull&lt;sqlx_mysql::row::MySqlRow&gt; as core::cmp::PartialEq&gt;::eq{inlined} (752,592,762 cycles, 14.29%)</title><rect x="0.0735%" y="773" width="14.2874%" height="15" fill="rgb(231,73,38)" fg:x="3869489" fg:w="752592762"/><text x="0.3235%" y="783.50">&lt;core::ptr::non_null::..</text></g><g><title>core::ptr::drop_glue::&lt;sqlx_mysql::row::MySqlRow&gt;{runner} (750,017,262 cycles, 14.24%)</title><rect x="0.1224%" y="757" width="14.2385%" height="15" fill="rgb(225,20,46)" fg:x="6444989" fg:w="750017262"/><text x="0.3724%" y="767.50">core::ptr::drop_glue::..</text></g><g><title>core::ptr::drop_glue::&lt;sqlx_mysql::protocol::row::Row&gt;{inlined} (491,682,403 cycles, 9.33%)</title><rect x="5.0267%" y="741" width="9.3342%" height="15" fill="rgb(210,31,41)" fg:x="264779848" fg:w="491682403"/><text x="5.2767%" y="751.50">core::ptr::dr..</text></g><g><title>&lt;core::result::Result&lt;i64, alloc::boxed::Box&lt;dyn core::error::Error + core::marker::Send + core::marker::Sync&gt;&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (19,201,217 cycles, 0.36%)</title><rect x="14.4301%" y="725" width="0.3645%" height="15" fill="rgb(221,200,47)" fg:x="760106707" fg:w="19201217"/><text x="14.6801%" y="735.50"></text></g><g><title>&lt;i32 as sqlx_core::decode::Decode&lt;sqlx_mysql::database::MySql&gt;&gt;::decode{runner} (23,073,069 cycles, 0.44%)</title><rect x="14.4301%" y="741" width="0.4380%" height="15" fill="rgb(226,26,5)" fg:x="760106707" fg:w="23073069"/><text x="14.6801%" y="751.50"></text></g><g><title>&lt;core::result::Result&lt;i32, sqlx_core::error::Error&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (28,007,343 cycles, 0.53%)</title><rect x="14.3609%" y="789" width="0.5317%" height="15" fill="rgb(249,33,26)" fg:x="756462251" fg:w="28007343"/><text x="14.6109%" y="799.50"></text></g><g><title>&lt;sqlx_mysql::row::MySqlRow as sqlx_core::row::Row&gt;::try_get::&lt;i32, usize&gt;{runner} (26,754,702 cycles, 0.51%)</title><rect x="14.3847%" y="773" width="0.5079%" height="15" fill="rgb(235,183,28)" fg:x="757714892" fg:w="26754702"/><text x="14.6347%" y="783.50"></text></g><g><title>&lt;core::result::Result&lt;i32, alloc::boxed::Box&lt;dyn core::error::Error + core::marker::Send + core::marker::Sync&gt;&gt;&gt;::map_err::&lt;sqlx_core::error::Error, &lt;sqlx_mysql::row::MySqlRow as sqlx_core::row::Row&gt;::try_get&lt;i32, usize&gt;::{closure#0}&gt;{inlined} (26,754,702 cycles, 0.51%)</title><rect x="14.3847%" y="757" width="0.5079%" height="15" fill="rgb(221,5,38)" fg:x="757714892" fg:w="26754702"/><text x="14.6347%" y="767.50"></text></g><g><title>do_anonymous_page{kernel} (28,013,338 cycles, 0.53%)</title><rect x="15.1581%" y="501" width="0.5318%" height="15" fill="rgb(247,18,42)" fg:x="798456654" fg:w="28013338"/><text x="15.4081%" y="511.50"></text></g><g><title>handle_mm_fault{kernel} (31,876,504 cycles, 0.61%)</title><rect x="15.1092%" y="549" width="0.6052%" height="15" fill="rgb(241,131,45)" fg:x="795880780" fg:w="31876504"/><text x="15.3592%" y="559.50"></text></g><g><title>__handle_mm_fault{kernel} (31,876,504 cycles, 0.61%)</title><rect x="15.1092%" y="533" width="0.6052%" height="15" fill="rgb(249,31,29)" fg:x="795880780" fg:w="31876504"/><text x="15.3592%" y="543.50"></text></g><g><title>handle_pte_fault{kernel} (29,300,630 cycles, 0.56%)</title><rect x="15.1581%" y="517" width="0.5563%" height="15" fill="rgb(225,111,53)" fg:x="798456654" fg:w="29300630"/><text x="15.4081%" y="527.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (47,149,776 cycles, 0.90%)</title><rect x="14.8926%" y="613" width="0.8951%" height="15" fill="rgb(238,160,17)" fg:x="784469594" fg:w="47149776"/><text x="15.1426%" y="623.50"></text></g><g><title>asm_exc_page_fault{kernel} (40,748,320 cycles, 0.77%)</title><rect x="15.0141%" y="597" width="0.7736%" height="15" fill="rgb(214,148,48)" fg:x="790871050" fg:w="40748320"/><text x="15.2641%" y="607.50"></text></g><g><title>exc_page_fault{kernel} (38,310,706 cycles, 0.73%)</title><rect x="15.0604%" y="581" width="0.7273%" height="15" fill="rgb(232,36,49)" fg:x="793308664" fg:w="38310706"/><text x="15.3104%" y="591.50"></text></g><g><title>do_user_addr_fault{kernel} (38,310,706 cycles, 0.73%)</title><rect x="15.0604%" y="565" width="0.7273%" height="15" fill="rgb(209,103,24)" fg:x="793308664" fg:w="38310706"/><text x="15.3104%" y="575.50"></text></g><g><title>&lt;alloc::vec::set_len_on_drop::SetLenOnDrop&gt;::new{inlined} (49,728,421 cycles, 0.94%)</title><rect x="14.8926%" y="725" width="0.9441%" height="15" fill="rgb(229,88,8)" fg:x="784469594" fg:w="49728421"/><text x="15.1426%" y="735.50"></text></g><g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt;{runner} (49,728,421 cycles, 0.94%)</title><rect x="14.8926%" y="709" width="0.9441%" height="15" fill="rgb(213,181,19)" fg:x="784469594" fg:w="49728421"/><text x="15.1426%" y="719.50"></text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::grow_amortized{inlined} (49,728,421 cycles, 0.94%)</title><rect x="14.8926%" y="693" width="0.9441%" height="15" fill="rgb(254,191,54)" fg:x="784469594" fg:w="49728421"/><text x="15.1426%" y="703.50"></text></g><g><title>&lt;core::result::Result&lt;core::ptr::non_null::NonNull&lt;[u8]&gt;, alloc::collections::TryReserveError&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (49,728,421 cycles, 0.94%)</title><rect x="14.8926%" y="677" width="0.9441%" height="15" fill="rgb(241,83,37)" fg:x="784469594" fg:w="49728421"/><text x="15.1426%" y="687.50"></text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow{runner} (49,728,421 cycles, 0.94%)</title><rect x="14.8926%" y="661" width="0.9441%" height="15" fill="rgb(233,36,39)" fg:x="784469594" fg:w="49728421"/><text x="15.1426%" y="671.50"></text></g><g><title>&lt;core::result::Result&lt;core::ptr::non_null::NonNull&lt;[u8]&gt;, core::alloc::AllocError&gt;&gt;::map_err::&lt;alloc::collections::TryReserveError, &lt;alloc::raw_vec::RawVecInner&gt;::finish_grow::{closure#0}&gt;{inlined} (49,728,421 cycles, 0.94%)</title><rect x="14.8926%" y="645" width="0.9441%" height="15" fill="rgb(226,3,54)" fg:x="784469594" fg:w="49728421"/><text x="15.1426%" y="655.50"></text></g><g><title>realloc{libc.so.6} (49,728,421 cycles, 0.94%)</title><rect x="14.8926%" y="629" width="0.9441%" height="15" fill="rgb(245,192,40)" fg:x="784469594" fg:w="49728421"/><text x="15.1426%" y="639.50"></text></g><g><title>_raw_spin_lock{kernel} (12,800,013 cycles, 0.24%)</title><rect x="16.5356%" y="533" width="0.2430%" height="15" fill="rgb(238,167,29)" fg:x="871018474" fg:w="12800013"/><text x="16.7856%" y="543.50"></text></g><g><title>__alloc_frozen_pages_noprof{kernel} (25,093,345 cycles, 0.48%)</title><rect x="17.1180%" y="485" width="0.4764%" height="15" fill="rgb(232,182,51)" fg:x="901695582" fg:w="25093345"/><text x="17.3680%" y="495.50"></text></g><g><title>get_page_from_freelist{kernel} (18,771,613 cycles, 0.36%)</title><rect x="17.2380%" y="469" width="0.3564%" height="15" fill="rgb(231,60,39)" fg:x="908017314" fg:w="18771613"/><text x="17.4880%" y="479.50"></text></g><g><title>alloc_anon_folio{kernel} (44,255,386 cycles, 0.84%)</title><rect x="16.7786%" y="533" width="0.8402%" height="15" fill="rgb(208,69,12)" fg:x="883818487" fg:w="44255386"/><text x="17.0286%" y="543.50"></text></g><g><title>vma_alloc_folio_noprof{kernel} (27,669,311 cycles, 0.53%)</title><rect x="17.0935%" y="517" width="0.5253%" height="15" fill="rgb(235,93,37)" fg:x="900404562" fg:w="27669311"/><text x="17.3435%" y="527.50"></text></g><g><title>alloc_pages_mpol{kernel} (26,378,291 cycles, 0.50%)</title><rect x="17.1180%" y="501" width="0.5008%" height="15" fill="rgb(213,116,39)" fg:x="901695582" fg:w="26378291"/><text x="17.3680%" y="511.50"></text></g><g><title>folio_add_lru_vma{kernel} (20,444,479 cycles, 0.39%)</title><rect x="17.6188%" y="533" width="0.3881%" height="15" fill="rgb(222,207,29)" fg:x="928073873" fg:w="20444479"/><text x="17.8688%" y="543.50"></text></g><g><title>folio_add_lru{kernel} (20,444,479 cycles, 0.39%)</title><rect x="17.6188%" y="517" width="0.3881%" height="15" fill="rgb(206,96,30)" fg:x="928073873" fg:w="20444479"/><text x="17.8688%" y="527.50"></text></g><g><title>do_anonymous_page{kernel} (100,225,315 cycles, 1.90%)</title><rect x="16.3188%" y="549" width="1.9027%" height="15" fill="rgb(218,138,4)" fg:x="859597198" fg:w="100225315"/><text x="16.5688%" y="559.50">d..</text></g><g><title>handle_mm_fault{kernel} (107,923,243 cycles, 2.05%)</title><rect x="16.2455%" y="597" width="2.0488%" height="15" fill="rgb(250,191,14)" fg:x="855736466" fg:w="107923243"/><text x="16.4955%" y="607.50">h..</text></g><g><title>__handle_mm_fault{kernel} (107,923,243 cycles, 2.05%)</title><rect x="16.2455%" y="581" width="2.0488%" height="15" fill="rgb(239,60,40)" fg:x="855736466" fg:w="107923243"/><text x="16.4955%" y="591.50">_..</text></g><g><title>handle_pte_fault{kernel} (104,062,511 cycles, 1.98%)</title><rect x="16.3188%" y="565" width="1.9756%" height="15" fill="rgb(206,27,48)" fg:x="859597198" fg:w="104062511"/><text x="16.5688%" y="575.50">h..</text></g><g><title>lock_vma_under_rcu{kernel} (30,394,819 cycles, 0.58%)</title><rect x="18.2944%" y="597" width="0.5770%" height="15" fill="rgb(225,35,8)" fg:x="963659709" fg:w="30394819"/><text x="18.5444%" y="607.50"></text></g><g><title>asm_exc_page_fault{kernel} (154,726,915 cycles, 2.94%)</title><rect x="16.0072%" y="645" width="2.9374%" height="15" fill="rgb(250,213,24)" fg:x="843181663" fg:w="154726915"/><text x="16.2572%" y="655.50">as..</text></g><g><title>exc_page_fault{kernel} (149,807,735 cycles, 2.84%)</title><rect x="16.1006%" y="629" width="2.8440%" height="15" fill="rgb(247,123,22)" fg:x="848100843" fg:w="149807735"/><text x="16.3506%" y="639.50">ex..</text></g><g><title>do_user_addr_fault{kernel} (149,807,735 cycles, 2.84%)</title><rect x="16.1006%" y="613" width="2.8440%" height="15" fill="rgb(231,138,38)" fg:x="848100843" fg:w="149807735"/><text x="16.3506%" y="623.50">do..</text></g><g><title>&lt;alloc::vec::Vec&lt;sqlx_mysql::row::MySqlRow&gt; as core::iter::traits::collect::Extend&lt;sqlx_mysql::row::MySqlRow&gt;&gt;::extend::&lt;core::option::Option&lt;sqlx_mysql::row::MySqlRow&gt;&gt;{inlined} (217,177,298 cycles, 4.12%)</title><rect x="14.8926%" y="773" width="4.1230%" height="15" fill="rgb(231,145,46)" fg:x="784469594" fg:w="217177298"/><text x="15.1426%" y="783.50">&lt;all..</text></g><g><title>&lt;alloc::vec::Vec&lt;sqlx_mysql::row::MySqlRow&gt; as alloc::vec::spec_extend::SpecExtend&lt;sqlx_mysql::row::MySqlRow, core::option::IntoIter&lt;sqlx_mysql::row::MySqlRow&gt;&gt;&gt;::spec_extend{inlined} (217,177,298 cycles, 4.12%)</title><rect x="14.8926%" y="757" width="4.1230%" height="15" fill="rgb(251,118,11)" fg:x="784469594" fg:w="217177298"/><text x="15.1426%" y="767.50">&lt;all..</text></g><g><title>&lt;alloc::vec::Vec&lt;sqlx_mysql::row::MySqlRow&gt;&gt;::extend_trusted::&lt;core::option::IntoIter&lt;sqlx_mysql::row::MySqlRow&gt;&gt;{inlined} (217,177,298 cycles, 4.12%)</title><rect x="14.8926%" y="741" width="4.1230%" height="15" fill="rgb(217,147,25)" fg:x="784469594" fg:w="217177298"/><text x="15.1426%" y="751.50">&lt;all..</text></g><g><title>&lt;core::option::IntoIter&lt;sqlx_mysql::row::MySqlRow&gt; as core::iter::traits::iterator::Iterator&gt;::for_each::&lt;&lt;alloc::vec::Vec&lt;sqlx_mysql::row::MySqlRow&gt;&gt;::extend_trusted&lt;core::option::IntoIter&lt;sqlx_mysql::row::MySqlRow&gt;&gt;::{closure#0}&gt;{inlined} (167,448,877 cycles, 3.18%)</title><rect x="15.8366%" y="725" width="3.1789%" height="15" fill="rgb(247,81,37)" fg:x="834198015" fg:w="167448877"/><text x="16.0866%" y="735.50">&lt;co..</text></g><g><title>&lt;core::option::IntoIter&lt;sqlx_mysql::row::MySqlRow&gt; as core::iter::traits::iterator::Iterator&gt;::fold::&lt;(), core::iter::traits::iterator::Iterator::for_each::call&lt;sqlx_mysql::row::MySqlRow, &lt;alloc::vec::Vec&lt;sqlx_mysql::row::MySqlRow&gt;&gt;::extend_trusted&lt;core::option::IntoIter&lt;sqlx_mysql::row::MySqlRow&gt;&gt;::{closure#0}&gt;::{closure#0}&gt;{inlined} (167,448,877 cycles, 3.18%)</title><rect x="15.8366%" y="709" width="3.1789%" height="15" fill="rgb(209,12,38)" fg:x="834198015" fg:w="167448877"/><text x="16.0866%" y="719.50">&lt;co..</text></g><g><title>core::iter::traits::iterator::Iterator::for_each::call::&lt;sqlx_mysql::row::MySqlRow, &lt;alloc::vec::Vec&lt;sqlx_mysql::row::MySqlRow&gt;&gt;::extend_trusted&lt;core::option::IntoIter&lt;sqlx_mysql::row::MySqlRow&gt;&gt;::{closure#0}&gt;::{closure#0}{inlined} (167,448,877 cycles, 3.18%)</title><rect x="15.8366%" y="693" width="3.1789%" height="15" fill="rgb(227,1,9)" fg:x="834198015" fg:w="167448877"/><text x="16.0866%" y="703.50">cor..</text></g><g><title>&lt;alloc::vec::Vec&lt;sqlx_mysql::row::MySqlRow&gt;&gt;::extend_trusted::&lt;core::option::IntoIter&lt;sqlx_mysql::row::MySqlRow&gt;&gt;::{closure#0}{inlined} (167,448,877 cycles, 3.18%)</title><rect x="15.8366%" y="677" width="3.1789%" height="15" fill="rgb(248,47,43)" fg:x="834198015" fg:w="167448877"/><text x="16.0866%" y="687.50">&lt;al..</text></g><g><title>core::ptr::write::&lt;sqlx_mysql::row::MySqlRow&gt;{inlined} (167,448,877 cycles, 3.18%)</title><rect x="15.8366%" y="661" width="3.1789%" height="15" fill="rgb(221,10,30)" fg:x="834198015" fg:w="167448877"/><text x="16.0866%" y="671.50">cor..</text></g><g><title>&lt;alloc::sync::Arc&lt;alloc::vec::Vec&lt;sqlx_mysql::column::MySqlColumn&gt;&gt; as core::clone::Clone&gt;::clone{inlined} (59,891,591 cycles, 1.14%)</title><rect x="24.6737%" y="533" width="1.1370%" height="15" fill="rgb(210,229,1)" fg:x="1299693165" fg:w="59891591"/><text x="24.9237%" y="543.50"></text></g><g><title>&lt;core::sync::atomic::Atomic&lt;usize&gt;&gt;::fetch_add{inlined} (59,891,591 cycles, 1.14%)</title><rect x="24.6737%" y="517" width="1.1370%" height="15" fill="rgb(222,148,37)" fg:x="1299693165" fg:w="59891591"/><text x="24.9237%" y="527.50"></text></g><g><title>core::sync::atomic::atomic_add::&lt;usize, usize&gt;{inlined} (59,891,591 cycles, 1.14%)</title><rect x="24.6737%" y="501" width="1.1370%" height="15" fill="rgb(234,67,33)" fg:x="1299693165" fg:w="59891591"/><text x="24.9237%" y="511.50"></text></g><g><title>&lt;alloc::sync::Arc&lt;hashbrown::map::HashMap&lt;sqlx_core::ext::ustr::UStr, usize&gt;&gt; as core::clone::Clone&gt;::clone{inlined} (22,920,590 cycles, 0.44%)</title><rect x="25.8107%" y="533" width="0.4351%" height="15" fill="rgb(247,98,35)" fg:x="1359584756" fg:w="22920590"/><text x="26.0607%" y="543.50"></text></g><g><title>&lt;core::sync::atomic::Atomic&lt;usize&gt;&gt;::fetch_add{inlined} (22,920,590 cycles, 0.44%)</title><rect x="25.8107%" y="517" width="0.4351%" height="15" fill="rgb(247,138,52)" fg:x="1359584756" fg:w="22920590"/><text x="26.0607%" y="527.50"></text></g><g><title>core::sync::atomic::atomic_add::&lt;usize, usize&gt;{inlined} (22,920,590 cycles, 0.44%)</title><rect x="25.8107%" y="501" width="0.4351%" height="15" fill="rgb(213,79,30)" fg:x="1359584756" fg:w="22920590"/><text x="26.0607%" y="511.50"></text></g><g><title>&lt;std::sync::poison::mutex::Mutex&lt;core::option::Option&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt;&gt;::lock{inlined} (323,133,114 cycles, 6.13%)</title><rect x="26.6831%" y="517" width="6.1344%" height="15" fill="rgb(246,177,23)" fg:x="1405537823" fg:w="323133114"/><text x="26.9331%" y="527.50">&lt;std::sy..</text></g><g><title>&lt;std::sys::sync::mutex::futex::Mutex&gt;::lock{inlined} (323,133,114 cycles, 6.13%)</title><rect x="26.6831%" y="501" width="6.1344%" height="15" fill="rgb(230,62,27)" fg:x="1405537823" fg:w="323133114"/><text x="26.9331%" y="511.50">&lt;std::sy..</text></g><g><title>&lt;sqlx_core::ext::async_stream::Yielder&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt;::yield::{closure#0}{runner} (377,891,972 cycles, 7.17%)</title><rect x="26.2703%" y="533" width="7.1740%" height="15" fill="rgb(216,154,8)" fg:x="1383795709" fg:w="377891972"/><text x="26.5203%" y="543.50">&lt;sqlx_core..</text></g><g><title>core::ptr::drop_glue::&lt;std::sync::poison::mutex::MutexGuard&lt;core::option::Option&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt;&gt;{inlined} (31,727,530 cycles, 0.60%)</title><rect x="32.8420%" y="517" width="0.6023%" height="15" fill="rgb(244,35,45)" fg:x="1729960151" fg:w="31727530"/><text x="33.0920%" y="527.50"></text></g><g><title>&lt;std::sync::poison::mutex::MutexGuard&lt;core::option::Option&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt; as core::ops::drop::Drop&gt;::drop{inlined} (31,727,530 cycles, 0.60%)</title><rect x="32.8420%" y="501" width="0.6023%" height="15" fill="rgb(251,115,12)" fg:x="1729960151" fg:w="31727530"/><text x="33.0920%" y="511.50"></text></g><g><title>&lt;std::sys::sync::mutex::futex::Mutex&gt;::unlock{inlined} (31,727,530 cycles, 0.60%)</title><rect x="32.8420%" y="485" width="0.6023%" height="15" fill="rgb(240,54,50)" fg:x="1729960151" fg:w="31727530"/><text x="33.0920%" y="495.50"></text></g><g><title>&lt;sqlx_core::net::socket::buffered::BufferedSocket&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;&gt;::read::&lt;bytes::bytes::Bytes&gt;::{closure#0}{runner} (26,495,869 cycles, 0.50%)</title><rect x="35.2687%" y="517" width="0.5030%" height="15" fill="rgb(233,84,52)" fg:x="1857785139" fg:w="26495869"/><text x="35.5187%" y="527.50"></text></g><g><title>&lt;sqlx_core::net::socket::buffered::BufferedSocket&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;&gt;::read_with::&lt;bytes::bytes::Bytes,{)&gt;::{closure#0}+0x26d (inlined} (1,216,857,295 cycles, 23.10%)</title><rect x="38.5154%" y="485" width="23.1011%" height="15" fill="rgb(207,117,47)" fg:x="2028804590" fg:w="1216857295"/><text x="38.7654%" y="495.50">&lt;sqlx_core::net::socket::buffered::Bu..</text></g><g><title>&lt;sqlx_core::net::socket::buffered::BufferedSocket&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;&gt;::read_buffered::{closure#0}{inlined} (1,216,857,295 cycles, 23.10%)</title><rect x="38.5154%" y="469" width="23.1011%" height="15" fill="rgb(249,43,39)" fg:x="2028804590" fg:w="1216857295"/><text x="38.7654%" y="479.50">&lt;sqlx_core::net::socket::buffered::Bu..</text></g><g><title>&lt;sqlx_core::net::socket::buffered::BufferedSocket&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;&gt;::try_read::&lt;&lt;sqlx_core::net::socket::buffered::BufferedSocket&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;&gt;::read_buffered::{closure#0}::{closure#0}, bytes::bytes_mut::BytesMut&gt;::{closure#0}{inlined} (1,216,857,295 cycles, 23.10%)</title><rect x="38.5154%" y="453" width="23.1011%" height="15" fill="rgb(209,38,44)" fg:x="2028804590" fg:w="1216857295"/><text x="38.7654%" y="463.50">&lt;sqlx_core::net::socket::buffered::Bu..</text></g><g><title>&lt;sqlx_core::net::socket::buffered::BufferedSocket&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;&gt;::read_buffered::{closure#0}::{closure#0}{inlined} (1,216,857,295 cycles, 23.10%)</title><rect x="38.5154%" y="437" width="23.1011%" height="15" fill="rgb(236,212,23)" fg:x="2028804590" fg:w="1216857295"/><text x="38.7654%" y="447.50">&lt;sqlx_core::net::socket::buffered::Bu..</text></g><g><title>&lt;bytes::bytes_mut::BytesMut&gt;::split_to{runner} (1,216,857,295 cycles, 23.10%)</title><rect x="38.5154%" y="421" width="23.1011%" height="15" fill="rgb(242,79,21)" fg:x="2028804590" fg:w="1216857295"/><text x="38.7654%" y="431.50">&lt;bytes::bytes_mut::BytesMut&gt;::split_t..</text></g><g><title>&lt;bytes::bytes_mut::BytesMut&gt;::shallow_clone{inlined} (1,214,388,440 cycles, 23.05%)</title><rect x="38.5622%" y="405" width="23.0543%" height="15" fill="rgb(211,96,35)" fg:x="2031273445" fg:w="1214388440"/><text x="38.8122%" y="415.50">&lt;bytes::bytes_mut::BytesMut&gt;::shallow..</text></g><g><title>bytes::bytes_mut::increment_shared{inlined} (1,128,493,333 cycles, 21.42%)</title><rect x="40.1929%" y="389" width="21.4236%" height="15" fill="rgb(253,215,40)" fg:x="2117168552" fg:w="1128493333"/><text x="40.4429%" y="399.50">bytes::bytes_mut::increment_shared..</text></g><g><title>&lt;sqlx_core::net::socket::buffered::BufferedSocket&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;&gt;::read_with::&lt;bytes::bytes::Bytes,{)&gt;::{closure#0}+0x3f9 (inlined} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="485" width="0.5521%" height="15" fill="rgb(211,81,21)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="495.50"></text></g><g><title>&lt;sqlx_core::net::socket::buffered::BufferedSocket&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;&gt;::read_buffered::{closure#0}{inlined} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="469" width="0.5521%" height="15" fill="rgb(208,190,38)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="479.50"></text></g><g><title>&lt;sqlx_core::net::socket::buffered::BufferedSocket&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;&gt;::try_read::&lt;&lt;sqlx_core::net::socket::buffered::BufferedSocket&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;&gt;::read_buffered::{closure#0}::{closure#0}, bytes::bytes_mut::BytesMut&gt;::{closure#0}{inlined} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="453" width="0.5521%" height="15" fill="rgb(235,213,38)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="463.50"></text></g><g><title>&lt;sqlx_core::net::socket::buffered::ReadBuffer&gt;::read::&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;::{closure#0}{inlined} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="437" width="0.5521%" height="15" fill="rgb(237,122,38)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="447.50"></text></g><g><title>&lt;sqlx_core::net::socket::Read&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;, bytes::bytes_mut::BytesMut&gt; as core::future::future::Future&gt;::poll{runner} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="421" width="0.5521%" height="15" fill="rgb(244,218,35)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="431.50"></text></g><g><title>&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt; as sqlx_core::net::socket::Socket&gt;::try_read{inlined} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="405" width="0.5521%" height="15" fill="rgb(240,68,47)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="415.50"></text></g><g><title>&lt;tokio::net::tcp::stream::TcpStream as sqlx_core::net::socket::Socket&gt;::try_read{runner} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="389" width="0.5521%" height="15" fill="rgb(210,16,53)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="399.50"></text></g><g><title>&lt;tokio::net::tcp::stream::TcpStream&gt;::try_read_buf::&lt;&amp;mut dyn sqlx_core::io::read_buf::ReadBuf&gt;{inlined} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="373" width="0.5521%" height="15" fill="rgb(235,124,12)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="383.50"></text></g><g><title>&lt;tokio::runtime::io::registration::Registration&gt;::try_io::&lt;usize, &lt;tokio::net::tcp::stream::TcpStream&gt;::try_read_buf&lt;&amp;mut dyn sqlx_core::io::read_buf::ReadBuf&gt;::{closure#0}&gt;{inlined} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="357" width="0.5521%" height="15" fill="rgb(224,169,11)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="367.50"></text></g><g><title>&lt;tokio::net::tcp::stream::TcpStream&gt;::try_read_buf::&lt;&amp;mut dyn sqlx_core::io::read_buf::ReadBuf&gt;::{closure#0}{inlined} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="341" width="0.5521%" height="15" fill="rgb(250,166,2)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="351.50"></text></g><g><title>&lt;&amp;mio::net::tcp::stream::TcpStream as alloc::io::read::Read&gt;::read{runner} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="325" width="0.5521%" height="15" fill="rgb(242,216,29)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="335.50"></text></g><g><title>&lt;&amp;std::net::tcp::TcpStream as alloc::io::read::Read&gt;::read{runner} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="309" width="0.5521%" height="15" fill="rgb(230,116,27)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="319.50"></text></g><g><title>&lt;std::sys::net::connection::socket::TcpStream&gt;::read{inlined} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="293" width="0.5521%" height="15" fill="rgb(228,99,48)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="303.50"></text></g><g><title>&lt;std::sys::net::connection::socket::unix::Socket&gt;::read{inlined} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="277" width="0.5521%" height="15" fill="rgb(253,11,6)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="287.50"></text></g><g><title>&lt;std::sys::net::connection::socket::unix::Socket&gt;::recv_with_flags{inlined} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="261" width="0.5521%" height="15" fill="rgb(247,143,39)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="271.50"></text></g><g><title>std::sys::pal::unix::cvt::&lt;isize&gt;{inlined} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="245" width="0.5521%" height="15" fill="rgb(236,97,10)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="255.50"></text></g><g><title>&lt;isize as std::sys::pal::unix::IsMinusOne&gt;::is_minus_one{inlined} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="229" width="0.5521%" height="15" fill="rgb(233,208,19)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="239.50"></text></g><g><title>recv{libc.so.6} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="213" width="0.5521%" height="15" fill="rgb(216,164,2)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="223.50"></text></g><g><title>__syscall_cancel{libc.so.6} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="197" width="0.5521%" height="15" fill="rgb(220,129,5)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="207.50"></text></g><g><title>__internal_syscall_cancel{inlined} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="181" width="0.5521%" height="15" fill="rgb(242,17,10)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="191.50"></text></g><g><title>entry_SYSCALL_64_after_hwframe{kernel} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="165" width="0.5521%" height="15" fill="rgb(242,107,0)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="175.50"></text></g><g><title>do_syscall_64{kernel} (29,081,078 cycles, 0.55%)</title><rect x="61.6410%" y="149" width="0.5521%" height="15" fill="rgb(251,28,31)" fg:x="3246952240" fg:w="29081078"/><text x="61.8910%" y="159.50"></text></g><g><title>x64_sys_call{kernel} (27,790,444 cycles, 0.53%)</title><rect x="61.6655%" y="133" width="0.5276%" height="15" fill="rgb(233,223,10)" fg:x="3248242874" fg:w="27790444"/><text x="61.9155%" y="143.50"></text></g><g><title>__x64_sys_recvfrom{kernel} (27,790,444 cycles, 0.53%)</title><rect x="61.6655%" y="117" width="0.5276%" height="15" fill="rgb(215,21,27)" fg:x="3248242874" fg:w="27790444"/><text x="61.9155%" y="127.50"></text></g><g><title>__sys_recvfrom{kernel} (27,790,444 cycles, 0.53%)</title><rect x="61.6655%" y="101" width="0.5276%" height="15" fill="rgb(232,23,21)" fg:x="3248242874" fg:w="27790444"/><text x="61.9155%" y="111.50"></text></g><g><title>sock_recvmsg{kernel} (26,499,651 cycles, 0.50%)</title><rect x="61.6900%" y="85" width="0.5031%" height="15" fill="rgb(244,5,23)" fg:x="3249533667" fg:w="26499651"/><text x="61.9400%" y="95.50"></text></g><g><title>inet_recvmsg{kernel} (26,499,651 cycles, 0.50%)</title><rect x="61.6900%" y="69" width="0.5031%" height="15" fill="rgb(226,81,46)" fg:x="3249533667" fg:w="26499651"/><text x="61.9400%" y="79.50"></text></g><g><title>tcp_recvmsg{kernel} (26,499,651 cycles, 0.50%)</title><rect x="61.6900%" y="53" width="0.5031%" height="15" fill="rgb(247,70,30)" fg:x="3249533667" fg:w="26499651"/><text x="61.9400%" y="63.50"></text></g><g><title>tcp_recvmsg_locked{kernel} (18,904,952 cycles, 0.36%)</title><rect x="61.8342%" y="37" width="0.3589%" height="15" fill="rgb(212,68,19)" fg:x="3257128366" fg:w="18904952"/><text x="62.0842%" y="47.50"></text></g><g><title>&lt;sqlx_core::net::socket::buffered::BufferedSocket&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;&gt;::read_with::&lt;bytes::bytes::Bytes,{)&gt;::{closure#0}+0x90 (inlined} (118,325,044 cycles, 2.25%)</title><rect x="62.3821%" y="485" width="2.2463%" height="15" fill="rgb(240,187,13)" fg:x="3285990514" fg:w="118325044"/><text x="62.6321%" y="495.50">&lt;..</text></g><g><title>&lt;sqlx_core::net::socket::buffered::BufferedSocket&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;&gt;::read::&lt;bytes::bytes::Bytes&gt;::{closure#0}{runner} (1,463,799,055 cycles, 27.79%)</title><rect x="37.1273%" y="501" width="27.7892%" height="15" fill="rgb(223,113,26)" fg:x="1955685475" fg:w="1463799055"/><text x="37.3773%" y="511.50">&lt;sqlx_core::net::socket::buffered::BufferedSo..</text></g><g><title>&lt;sqlx_mysql::connection::stream::MySqlStream&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;&gt;::recv_packet_part::{closure#0}{runner} (1,654,280,197 cycles, 31.41%)</title><rect x="35.7717%" y="517" width="31.4053%" height="15" fill="rgb(206,192,2)" fg:x="1884281008" fg:w="1654280197"/><text x="36.0217%" y="527.50">&lt;sqlx_mysql::connection::stream::MySqlStream&lt;alloc:..</text></g><g><title>bytes::bytes_mut::shared_v_drop{runner} (119,076,675 cycles, 2.26%)</title><rect x="64.9164%" y="501" width="2.2606%" height="15" fill="rgb(241,108,4)" fg:x="3419484530" fg:w="119076675"/><text x="65.1664%" y="511.50">b..</text></g><g><title>bytes::bytes_mut::release_shared{inlined} (119,076,675 cycles, 2.26%)</title><rect x="64.9164%" y="485" width="2.2606%" height="15" fill="rgb(247,173,49)" fg:x="3419484530" fg:w="119076675"/><text x="65.1664%" y="495.50">b..</text></g><g><title>&lt;sqlx_mysql::connection::stream::MySqlStream&lt;alloc::boxed::Box&lt;dyn sqlx_core::net::socket::Socket&gt;&gt;&gt;::recv_packet::{closure#0}{runner} (1,778,154,791 cycles, 33.76%)</title><rect x="33.4444%" y="533" width="33.7570%" height="15" fill="rgb(224,114,35)" fg:x="1761687681" fg:w="1778154791"/><text x="33.6944%" y="543.50">&lt;sqlx_mysql::connection::stream::MySqlStream&lt;alloc::box..</text></g><g><title>_int_malloc{libc.so.6} (25,480,525 cycles, 0.48%)</title><rect x="74.0674%" y="421" width="0.4837%" height="15" fill="rgb(245,159,27)" fg:x="3901512184" fg:w="25480525"/><text x="74.3174%" y="431.50"></text></g><g><title>&lt;alloc::vec::Vec&lt;core::option::Option&lt;core::ops::range::Range&lt;usize&gt;&gt;&gt;&gt;::with_capacity{inlined} (30,567,758 cycles, 0.58%)</title><rect x="74.0429%" y="517" width="0.5803%" height="15" fill="rgb(245,172,44)" fg:x="3900222282" fg:w="30567758"/><text x="74.2929%" y="527.50"></text></g><g><title>&lt;alloc::vec::Vec&lt;core::option::Option&lt;core::ops::range::Range&lt;usize&gt;&gt;&gt;&gt;::with_capacity_in{inlined} (30,567,758 cycles, 0.58%)</title><rect x="74.0429%" y="501" width="0.5803%" height="15" fill="rgb(236,23,11)" fg:x="3900222282" fg:w="30567758"/><text x="74.2929%" y="511.50"></text></g><g><title>&lt;alloc::raw_vec::RawVec&lt;core::option::Option&lt;core::ops::range::Range&lt;usize&gt;&gt;&gt;&gt;::with_capacity_in{inlined} (30,567,758 cycles, 0.58%)</title><rect x="74.0429%" y="485" width="0.5803%" height="15" fill="rgb(205,117,38)" fg:x="3900222282" fg:w="30567758"/><text x="74.2929%" y="495.50"></text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::with_capacity_in{inlined} (30,567,758 cycles, 0.58%)</title><rect x="74.0429%" y="469" width="0.5803%" height="15" fill="rgb(237,72,25)" fg:x="3900222282" fg:w="30567758"/><text x="74.2929%" y="479.50"></text></g><g><title>&lt;alloc::raw_vec::RawVecInner&gt;::try_allocate_in{inlined} (30,567,758 cycles, 0.58%)</title><rect x="74.0429%" y="453" width="0.5803%" height="15" fill="rgb(244,70,9)" fg:x="3900222282" fg:w="30567758"/><text x="74.2929%" y="463.50"></text></g><g><title>__libc_malloc2{libc.so.6} (30,567,758 cycles, 0.58%)</title><rect x="74.0429%" y="437" width="0.5803%" height="15" fill="rgb(217,125,39)" fg:x="3900222282" fg:w="30567758"/><text x="74.2929%" y="447.50"></text></g><g><title>&lt;sqlx_mysql::protocol::text::row::TextRow as sqlx_core::io::decode::ProtocolDecode&lt;&amp;[sqlx_mysql::column::MySqlColumn]&gt;&gt;::decode_with{runner} (602,387,813 cycles, 11.44%)</title><rect x="67.2734%" y="533" width="11.4359%" height="15" fill="rgb(235,36,10)" fg:x="3543637039" fg:w="602387813"/><text x="67.5234%" y="543.50">&lt;sqlx_mysql::prot..</text></g><g><title>bytes::bytes_mut::shared_v_drop{runner} (202,631,118 cycles, 3.85%)</title><rect x="74.8624%" y="517" width="3.8468%" height="15" fill="rgb(251,123,47)" fg:x="3943393734" fg:w="202631118"/><text x="75.1124%" y="527.50">byte..</text></g><g><title>bytes::bytes_mut::release_shared{inlined} (202,631,118 cycles, 3.85%)</title><rect x="74.8624%" y="501" width="3.8468%" height="15" fill="rgb(221,13,13)" fg:x="3943393734" fg:w="202631118"/><text x="75.1124%" y="511.50">byte..</text></g><g><title>bytes::bytes_mut::shared_v_clone{runner} (289,201,952 cycles, 5.49%)</title><rect x="78.7092%" y="533" width="5.4903%" height="15" fill="rgb(238,131,9)" fg:x="4146024852" fg:w="289201952"/><text x="78.9592%" y="543.50">bytes::..</text></g><g><title>bytes::bytes_mut::increment_shared{inlined} (289,201,952 cycles, 5.49%)</title><rect x="78.7092%" y="517" width="5.4903%" height="15" fill="rgb(211,50,8)" fg:x="4146024852" fg:w="289201952"/><text x="78.9592%" y="527.50">bytes::..</text></g><g><title>cfree@GLIBC_2.2.5{libc.so.6} (12,509,008 cycles, 0.24%)</title><rect x="84.1995%" y="533" width="0.2375%" height="15" fill="rgb(245,182,24)" fg:x="4435226804" fg:w="12509008"/><text x="84.4495%" y="543.50"></text></g><g><title>&lt;sqlx_mysql::connection::MySqlConnection&gt;::run::{closure#0}::{closure#0}::{closure#0}{inlined} (3,419,433,404 cycles, 64.92%)</title><rect x="19.6924%" y="549" width="64.9154%" height="15" fill="rgb(242,14,37)" fg:x="1037300115" fg:w="3419433404"/><text x="19.9424%" y="559.50">&lt;sqlx_mysql::connection::MySqlConnection&gt;::run::{closure#0}::{closure#0}::{closure#0}{inlined}</text></g><g><title>&lt;futures_util::future::future::fuse::Fuse&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn core::future::future::Future&lt;Output = core::result::Result&lt;(), sqlx_core::error::Error&gt;&gt; + core::marker::Send&gt;&gt;&gt; as core::future::future::Future&gt;::poll{runner} (3,448,636,435 cycles, 65.47%)</title><rect x="19.2801%" y="597" width="65.4698%" height="15" fill="rgb(246,228,12)" fg:x="1015581687" fg:w="3448636435"/><text x="19.5301%" y="607.50">&lt;futures_util::future::future::fuse::Fuse&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn core::future::future::Future&lt;..</text></g><g><title>&lt;core::task::poll::Poll&lt;core::result::Result&lt;(), sqlx_core::error::Error&gt;&gt;&gt;::map::&lt;core::result::Result&lt;(), sqlx_core::error::Error&gt;, &lt;futures_util::future::future::fuse::Fuse&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn core::future::future::Future&lt;Output = core::result::Result&lt;(), sqlx_core::error::Error&gt;&gt; + core::marker::Send&gt;&gt;&gt; as core::future::future::Future&gt;::poll::{closure#0}&gt;{inlined} (3,438,608,319 cycles, 65.28%)</title><rect x="19.4705%" y="581" width="65.2795%" height="15" fill="rgb(213,55,15)" fg:x="1025609803" fg:w="3438608319"/><text x="19.7205%" y="591.50">&lt;core::task::poll::Poll&lt;core::result::Result&lt;(), sqlx_core::error::Error&gt;&gt;&gt;::map::&lt;core::result::Result&lt;(), ..</text></g><g><title>&lt;tracing::instrument::Instrumented&lt;&lt;sqlx_mysql::connection::MySqlConnection&gt;::run::{closure#0}::{closure#0}::{closure#0}&gt; as core::future::future::Future&gt;::poll{runner} (3,430,957,175 cycles, 65.13%)</title><rect x="19.6157%" y="565" width="65.1342%" height="15" fill="rgb(209,9,3)" fg:x="1033260947" fg:w="3430957175"/><text x="19.8657%" y="575.50">&lt;tracing::instrument::Instrumented&lt;&lt;sqlx_mysql::connection::MySqlConnection&gt;::run::{closure#0}::{closure#0}:..</text></g><g><title>&lt;std::sync::poison::mutex::Mutex&lt;core::option::Option&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt;&gt;::lock{inlined} (75,065,720 cycles, 1.43%)</title><rect x="84.7740%" y="581" width="1.4251%" height="15" fill="rgb(230,59,30)" fg:x="4465488481" fg:w="75065720"/><text x="85.0240%" y="591.50"></text></g><g><title>&lt;std::sys::sync::mutex::futex::Mutex&gt;::lock{inlined} (75,065,720 cycles, 1.43%)</title><rect x="84.7740%" y="565" width="1.4251%" height="15" fill="rgb(209,121,21)" fg:x="4465488481" fg:w="75065720"/><text x="85.0240%" y="575.50"></text></g><g><title>&lt;sqlx_core::ext::async_stream::Yielder&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt;::take{inlined} (126,150,693 cycles, 2.39%)</title><rect x="84.7740%" y="597" width="2.3949%" height="15" fill="rgb(220,109,13)" fg:x="4465488481" fg:w="126150693"/><text x="85.0240%" y="607.50">&lt;s..</text></g><g><title>core::ptr::drop_glue::&lt;std::sync::poison::mutex::MutexGuard&lt;core::option::Option&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt;&gt;{inlined} (51,084,973 cycles, 0.97%)</title><rect x="86.1991%" y="581" width="0.9698%" height="15" fill="rgb(232,18,1)" fg:x="4540554201" fg:w="51084973"/><text x="86.4491%" y="591.50"></text></g><g><title>&lt;std::sync::poison::mutex::MutexGuard&lt;core::option::Option&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt; as core::ops::drop::Drop&gt;::drop{inlined} (51,084,973 cycles, 0.97%)</title><rect x="86.1991%" y="565" width="0.9698%" height="15" fill="rgb(215,41,42)" fg:x="4540554201" fg:w="51084973"/><text x="86.4491%" y="575.50"></text></g><g><title>&lt;std::sys::sync::mutex::futex::Mutex&gt;::unlock{inlined} (51,084,973 cycles, 0.97%)</title><rect x="86.1991%" y="549" width="0.9698%" height="15" fill="rgb(224,123,36)" fg:x="4540554201" fg:w="51084973"/><text x="86.4491%" y="559.50"></text></g><g><title>&lt;futures_util::stream::try_stream::try_next::TryNext&lt;core::pin::Pin&lt;&amp;mut sqlx_core::ext::async_stream::TryAsyncStream&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt;&gt; as core::future::future::Future&gt;::poll{inlined} (3,587,174,883 cycles, 68.10%)</title><rect x="19.1377%" y="645" width="68.0999%" height="15" fill="rgb(240,125,3)" fg:x="1008080565" fg:w="3587174883"/><text x="19.3877%" y="655.50">&lt;futures_util::stream::try_stream::try_next::TryNext&lt;core::pin::Pin&lt;&amp;mut sqlx_core::ext::async_stream::TryAsyncSt..</text></g><g><title>&lt;core::task::poll::Poll&lt;core::option::Option&lt;core::result::Result&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;, sqlx_core::error::Error&gt;&gt;&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (3,582,253,010 cycles, 68.01%)</title><rect x="19.2311%" y="629" width="68.0064%" height="15" fill="rgb(205,98,50)" fg:x="1013002438" fg:w="3582253010"/><text x="19.4811%" y="639.50">&lt;core::task::poll::Poll&lt;core::option::Option&lt;core::result::Result&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQ..</text></g><g><title>&lt;sqlx_core::ext::async_stream::TryAsyncStream&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt; as futures_core::stream::Stream&gt;::poll_next{runner} (3,582,253,010 cycles, 68.01%)</title><rect x="19.2311%" y="613" width="68.0064%" height="15" fill="rgb(205,185,37)" fg:x="1013002438" fg:w="3582253010"/><text x="19.4811%" y="623.50">&lt;sqlx_core::ext::async_stream::TryAsyncStream&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mys..</text></g><g><title>&lt;std::sync::poison::mutex::Mutex&lt;core::option::Option&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt;&gt;::lock{inlined} (139,584,475 cycles, 2.65%)</title><rect x="88.3422%" y="629" width="2.6499%" height="15" fill="rgb(238,207,15)" fg:x="4653441187" fg:w="139584475"/><text x="88.5922%" y="639.50">&lt;s..</text></g><g><title>&lt;std::sys::sync::mutex::futex::Mutex&gt;::lock{inlined} (139,584,475 cycles, 2.65%)</title><rect x="88.3422%" y="613" width="2.6499%" height="15" fill="rgb(213,199,42)" fg:x="4653441187" fg:w="139584475"/><text x="88.5922%" y="623.50">&lt;s..</text></g><g><title>&lt;&amp;mut sqlx_mysql::connection::MySqlConnection as sqlx_core::executor::Executor&gt;::fetch_many::&lt;sqlx_core::raw_sql::RawSql&gt;::{closure#0}::{closure#0}{inlined} (3,919,249,543 cycles, 74.40%)</title><rect x="19.0887%" y="661" width="74.4041%" height="15" fill="rgb(235,201,11)" fg:x="1005503067" fg:w="3919249543"/><text x="19.3387%" y="671.50">&lt;&amp;mut sqlx_mysql::connection::MySqlConnection as sqlx_core::executor::Executor&gt;::fetch_many::&lt;sqlx_core::raw_sql::RawSql&gt;::{..</text></g><g><title>&lt;sqlx_core::ext::async_stream::Yielder&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt;::yield::{closure#0}{runner} (328,239,730 cycles, 6.23%)</title><rect x="87.2614%" y="645" width="6.2314%" height="15" fill="rgb(207,46,11)" fg:x="4596512880" fg:w="328239730"/><text x="87.5114%" y="655.50">&lt;sqlx_co..</text></g><g><title>core::ptr::drop_glue::&lt;std::sync::poison::mutex::MutexGuard&lt;core::option::Option&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt;&gt;{inlined} (130,443,766 cycles, 2.48%)</title><rect x="91.0164%" y="629" width="2.4764%" height="15" fill="rgb(241,35,35)" fg:x="4794308844" fg:w="130443766"/><text x="91.2664%" y="639.50">co..</text></g><g><title>&lt;std::sync::poison::mutex::MutexGuard&lt;core::option::Option&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt; as core::ops::drop::Drop&gt;::drop{inlined} (130,443,766 cycles, 2.48%)</title><rect x="91.0164%" y="613" width="2.4764%" height="15" fill="rgb(243,32,47)" fg:x="4794308844" fg:w="130443766"/><text x="91.2664%" y="623.50">&lt;s..</text></g><g><title>&lt;std::sys::sync::mutex::futex::Mutex&gt;::unlock{inlined} (130,443,766 cycles, 2.48%)</title><rect x="91.0164%" y="597" width="2.4764%" height="15" fill="rgb(247,202,23)" fg:x="4794308844" fg:w="130443766"/><text x="91.2664%" y="607.50">&lt;s..</text></g><g><title>&lt;futures_util::future::future::fuse::Fuse&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn core::future::future::Future&lt;Output = core::result::Result&lt;(), sqlx_core::error::Error&gt;&gt; + core::marker::Send&gt;&gt;&gt; as core::future::future::Future&gt;::poll{runner} (3,928,184,850 cycles, 74.57%)</title><rect x="19.0397%" y="709" width="74.5737%" height="15" fill="rgb(219,102,11)" fg:x="1002921944" fg:w="3928184850"/><text x="19.2897%" y="719.50">&lt;futures_util::future::future::fuse::Fuse&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn core::future::future::Future&lt;Output = core::r..</text></g><g><title>&lt;core::task::poll::Poll&lt;core::result::Result&lt;(), sqlx_core::error::Error&gt;&gt;&gt;::map::&lt;core::result::Result&lt;(), sqlx_core::error::Error&gt;, &lt;futures_util::future::future::fuse::Fuse&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn core::future::future::Future&lt;Output = core::result::Result&lt;(), sqlx_core::error::Error&gt;&gt; + core::marker::Send&gt;&gt;&gt; as core::future::future::Future&gt;::poll::{closure#0}&gt;{inlined} (3,928,184,850 cycles, 74.57%)</title><rect x="19.0397%" y="693" width="74.5737%" height="15" fill="rgb(243,110,44)" fg:x="1002921944" fg:w="3928184850"/><text x="19.2897%" y="703.50">&lt;core::task::poll::Poll&lt;core::result::Result&lt;(), sqlx_core::error::Error&gt;&gt;&gt;::map::&lt;core::result::Result&lt;(), sqlx_core::error..</text></g><g><title>&lt;tracing::instrument::Instrumented&lt;&lt;&amp;mut sqlx_mysql::connection::MySqlConnection as sqlx_core::executor::Executor&gt;::fetch_many&lt;sqlx_core::raw_sql::RawSql&gt;::{closure#0}::{closure#0}&gt; as core::future::future::Future&gt;::poll{runner} (3,926,893,731 cycles, 74.55%)</title><rect x="19.0642%" y="677" width="74.5492%" height="15" fill="rgb(222,74,54)" fg:x="1004213063" fg:w="3926893731"/><text x="19.3142%" y="687.50">&lt;tracing::instrument::Instrumented&lt;&lt;&amp;mut sqlx_mysql::connection::MySqlConnection as sqlx_core::executor::Executor&gt;::fetch_ma..</text></g><g><title>&lt;std::sync::poison::mutex::Mutex&lt;core::option::Option&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt;&gt;::lock{inlined} (227,489,040 cycles, 4.32%)</title><rect x="93.6135%" y="693" width="4.3187%" height="15" fill="rgb(216,99,12)" fg:x="4931106794" fg:w="227489040"/><text x="93.8635%" y="703.50">&lt;std:..</text></g><g><title>&lt;std::sys::sync::mutex::futex::Mutex&gt;::lock{inlined} (227,489,040 cycles, 4.32%)</title><rect x="93.6135%" y="677" width="4.3187%" height="15" fill="rgb(226,22,26)" fg:x="4931106794" fg:w="227489040"/><text x="93.8635%" y="687.50">&lt;std:..</text></g><g><title>&lt;sqlx_core::ext::async_stream::Yielder&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt;::take{inlined} (298,156,506 cycles, 5.66%)</title><rect x="93.6135%" y="709" width="5.6603%" height="15" fill="rgb(217,163,10)" fg:x="4931106794" fg:w="298156506"/><text x="93.8635%" y="719.50">&lt;sqlx_c..</text></g><g><title>core::ptr::drop_glue::&lt;std::sync::poison::mutex::MutexGuard&lt;core::option::Option&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt;&gt;{inlined} (70,667,466 cycles, 1.34%)</title><rect x="97.9322%" y="693" width="1.3416%" height="15" fill="rgb(213,25,53)" fg:x="5158595834" fg:w="70667466"/><text x="98.1822%" y="703.50"></text></g><g><title>&lt;std::sync::poison::mutex::MutexGuard&lt;core::option::Option&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt;&gt; as core::ops::drop::Drop&gt;::drop{inlined} (70,667,466 cycles, 1.34%)</title><rect x="97.9322%" y="677" width="1.3416%" height="15" fill="rgb(252,105,26)" fg:x="5158595834" fg:w="70667466"/><text x="98.1822%" y="687.50"></text></g><g><title>&lt;std::sys::sync::mutex::futex::Mutex&gt;::unlock{inlined} (70,667,466 cycles, 1.34%)</title><rect x="97.9322%" y="661" width="1.3416%" height="15" fill="rgb(220,39,43)" fg:x="5158595834" fg:w="70667466"/><text x="98.1822%" y="671.50"></text></g><g><title>&lt;futures_util::stream::try_stream::try_collect::TryCollect&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn futures_core::stream::Stream&lt;Item = core::result::Result&lt;sqlx_mysql::row::MySqlRow, sqlx_core::error::Error&gt;&gt; + core::marker::Send&gt;&gt;, alloc::vec::Vec&lt;sqlx_mysql::row::MySqlRow&gt;&gt; as core::future::future::Future&gt;::poll{runner} (4,449,963,209 cycles, 84.48%)</title><rect x="14.8926%" y="789" width="84.4793%" height="15" fill="rgb(229,68,48)" fg:x="784469594" fg:w="4449963209"/><text x="15.1426%" y="799.50">&lt;futures_util::stream::try_stream::try_collect::TryCollect&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn futures_core::stream::Stream&lt;Item = core::res..</text></g><g><title>&lt;core::task::poll::Poll&lt;core::option::Option&lt;core::result::Result&lt;sqlx_mysql::row::MySqlRow, sqlx_core::error::Error&gt;&gt;&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (4,232,785,911 cycles, 80.36%)</title><rect x="19.0155%" y="773" width="80.3563%" height="15" fill="rgb(252,8,32)" fg:x="1001646892" fg:w="4232785911"/><text x="19.2655%" y="783.50">&lt;core::task::poll::Poll&lt;core::option::Option&lt;core::result::Result&lt;sqlx_mysql::row::MySqlRow, sqlx_core::error::Error&gt;&gt;&gt; as core::ops::..</text></g><g><title>&lt;futures_util::stream::try_stream::try_filter_map::TryFilterMap&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn futures_core::stream::Stream&lt;Item = core::result::Result&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;, sqlx_core::error::Error&gt;&gt; + core::marker::Send&gt;&gt;, &lt;&amp;mut sqlx_mysql::connection::MySqlConnection as sqlx_core::executor::Executor&gt;::fetch&lt;sqlx_core::query::Query&lt;sqlx_mysql::database::MySql, sqlx_mysql::arguments::MySqlArguments&gt;&gt;::{closure#0}::{closure#0}, &lt;&amp;mut sqlx_mysql::connection::MySqlConnection as sqlx_core::executor::Executor&gt;::fetch&lt;sqlx_core::query::Query&lt;sqlx_mysql::database::MySql, sqlx_mysql::arguments::MySqlArguments&gt;&gt;::{closure#0}&gt; as futures_core::stream::Stream&gt;::poll_next{runner} (4,232,785,911 cycles, 80.36%)</title><rect x="19.0155%" y="757" width="80.3563%" height="15" fill="rgb(223,20,43)" fg:x="1001646892" fg:w="4232785911"/><text x="19.2655%" y="767.50">&lt;futures_util::stream::try_stream::try_filter_map::TryFilterMap&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn futures_core::stream::Stream&lt;Item..</text></g><g><title>&lt;core::task::poll::Poll&lt;core::option::Option&lt;core::result::Result&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;, sqlx_core::error::Error&gt;&gt;&gt; as core::ops::try_trait::Try&gt;::branch{inlined} (4,231,510,859 cycles, 80.33%)</title><rect x="19.0397%" y="741" width="80.3321%" height="15" fill="rgb(229,81,49)" fg:x="1002921944" fg:w="4231510859"/><text x="19.2897%" y="751.50">&lt;core::task::poll::Poll&lt;core::option::Option&lt;core::result::Result&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysq..</text></g><g><title>&lt;sqlx_core::ext::async_stream::TryAsyncStream&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt; as futures_core::stream::Stream&gt;::poll_next{runner} (4,231,510,859 cycles, 80.33%)</title><rect x="19.0397%" y="725" width="80.3321%" height="15" fill="rgb(236,28,36)" fg:x="1002921944" fg:w="4231510859"/><text x="19.2897%" y="735.50">&lt;sqlx_core::ext::async_stream::TryAsyncStream&lt;either::Either&lt;sqlx_mysql::query_result::MySqlQueryResult, sqlx_mysql::row::MySqlRow&gt;&gt; a..</text></g><g><title>tlb_flush_mmu{kernel} (16,613,205 cycles, 0.32%)</title><rect x="99.3955%" y="533" width="0.3154%" height="15" fill="rgb(249,185,26)" fg:x="5235675603" fg:w="16613205"/><text x="99.6455%" y="543.50"></text></g><g><title>__tlb_batch_free_encoded_pages{kernel} (16,613,205 cycles, 0.32%)</title><rect x="99.3955%" y="517" width="0.3154%" height="15" fill="rgb(249,174,33)" fg:x="5235675603" fg:w="16613205"/><text x="99.6455%" y="527.50"></text></g><g><title>free_pages_and_swap_cache{kernel} (16,613,205 cycles, 0.32%)</title><rect x="99.3955%" y="501" width="0.3154%" height="15" fill="rgb(233,201,37)" fg:x="5235675603" fg:w="16613205"/><text x="99.6455%" y="511.50"></text></g><g><title>folios_put_refs{kernel} (16,613,205 cycles, 0.32%)</title><rect x="99.3955%" y="485" width="0.3154%" height="15" fill="rgb(221,78,26)" fg:x="5235675603" fg:w="16613205"/><text x="99.6455%" y="495.50"></text></g><g><title>all (5,267,519,552 cycles, 100%)</title><rect x="0.0000%" y="1349" width="100.0000%" height="15" fill="rgb(250,127,30)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1359.50"></text></g><g><title>runner (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1333" width="100.0000%" height="15" fill="rgb(230,49,44)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1343.50">runner</text></g><g><title>_start{runner} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1317" width="100.0000%" height="15" fill="rgb(229,67,23)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1327.50">_start{runner}</text></g><g><title>__libc_start_main@@GLIBC_2.34{libc.so.6} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1301" width="100.0000%" height="15" fill="rgb(249,83,47)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1311.50">__libc_start_main@@GLIBC_2.34{libc.so.6}</text></g><g><title>call_init{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1285" width="100.0000%" height="15" fill="rgb(215,43,3)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1295.50">call_init{inlined}</text></g><g><title>__libc_start_call_main{libc.so.6} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1269" width="100.0000%" height="15" fill="rgb(238,154,13)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1279.50">__libc_start_call_main{libc.so.6}</text></g><g><title>main{runner} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1253" width="100.0000%" height="15" fill="rgb(219,56,2)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1263.50">main{runner}</text></g><g><title>std::rt::lang_start_internal{runner} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1237" width="100.0000%" height="15" fill="rgb(233,0,4)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1247.50">std::rt::lang_start_internal{runner}</text></g><g><title>std::panic::catch_unwind::&lt;std::rt::lang_start_internal::{closure#0}, isize&gt;{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1221" width="100.0000%" height="15" fill="rgb(235,30,7)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1231.50">std::panic::catch_unwind::&lt;std::rt::lang_start_internal::{closure#0}, isize&gt;{inlined}</text></g><g><title>std::panicking::catch_unwind::&lt;isize, std::rt::lang_start_internal::{closure#0}&gt;{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1205" width="100.0000%" height="15" fill="rgb(250,79,13)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1215.50">std::panicking::catch_unwind::&lt;isize, std::rt::lang_start_internal::{closure#0}&gt;{inlined}</text></g><g><title>std::panicking::catch_unwind::do_call::&lt;std::rt::lang_start_internal::{closure#0}, isize&gt;{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1189" width="100.0000%" height="15" fill="rgb(211,146,34)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1199.50">std::panicking::catch_unwind::do_call::&lt;std::rt::lang_start_internal::{closure#0}, isize&gt;{inlined}</text></g><g><title>std::rt::lang_start_internal::{closure#0}{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1173" width="100.0000%" height="15" fill="rgb(228,22,38)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1183.50">std::rt::lang_start_internal::{closure#0}{inlined}</text></g><g><title>std::rt::lang_start::&lt;()&gt;::{closure#0}{runner} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1157" width="100.0000%" height="15" fill="rgb(235,168,5)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1167.50">std::rt::lang_start::&lt;()&gt;::{closure#0}{runner}</text></g><g><title>std::sys::backtrace::__rust_begin_short_backtrace::&lt;fn(),{runner} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1141" width="100.0000%" height="15" fill="rgb(221,155,16)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1151.50">std::sys::backtrace::__rust_begin_short_backtrace::&lt;fn(),{runner}</text></g><g><title>runner::main{runner} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1125" width="100.0000%" height="15" fill="rgb(215,215,53)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1135.50">runner::main{runner}</text></g><g><title>runner::run{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1109" width="100.0000%" height="15" fill="rgb(223,4,10)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1119.50">runner::run{inlined}</text></g><g><title>&lt;tokio::runtime::runtime::Runtime&gt;::block_on::&lt;runner::run::{closure#1}&gt;{runner} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1093" width="100.0000%" height="15" fill="rgb(234,103,6)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1103.50">&lt;tokio::runtime::runtime::Runtime&gt;::block_on::&lt;runner::run::{closure#1}&gt;{runner}</text></g><g><title>&lt;tokio::runtime::runtime::Runtime&gt;::block_on_inner::&lt;runner::run::{closure#1}&gt;{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1077" width="100.0000%" height="15" fill="rgb(227,97,0)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1087.50">&lt;tokio::runtime::runtime::Runtime&gt;::block_on_inner::&lt;runner::run::{closure#1}&gt;{inlined}</text></g><g><title>&lt;tokio::runtime::scheduler::current_thread::CurrentThread&gt;::block_on::&lt;runner::run::{closure#1}&gt;{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1061" width="100.0000%" height="15" fill="rgb(234,150,53)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1071.50">&lt;tokio::runtime::scheduler::current_thread::CurrentThread&gt;::block_on::&lt;runner::run::{closure#1}&gt;{inlined}</text></g><g><title>tokio::runtime::context::runtime::enter_runtime::&lt;&lt;tokio::runtime::scheduler::current_thread::CurrentThread&gt;::block_on&lt;runner::run::{closure#1}&gt;::{closure#0}, core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;{runner} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1045" width="100.0000%" height="15" fill="rgb(228,201,54)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1055.50">tokio::runtime::context::runtime::enter_runtime::&lt;&lt;tokio::runtime::scheduler::current_thread::CurrentThread&gt;::block_on&lt;runner::run::{closure#1}&gt;::{closure#0}, core::re..</text></g><g><title>&lt;tokio::runtime::scheduler::current_thread::CurrentThread&gt;::block_on::&lt;runner::run::{closure#1}&gt;::{closure#0}{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1029" width="100.0000%" height="15" fill="rgb(222,22,37)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1039.50">&lt;tokio::runtime::scheduler::current_thread::CurrentThread&gt;::block_on::&lt;runner::run::{closure#1}&gt;::{closure#0}{inlined}</text></g><g><title>&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on::&lt;runner::run::{closure#1}&gt;{runner} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="1013" width="100.0000%" height="15" fill="rgb(237,53,32)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1023.50">&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on::&lt;runner::run::{closure#1}&gt;{runner}</text></g><g><title>&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::enter::&lt;&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on&lt;runner::run::{closure#1}&gt;::{closure#0}, core::option::Option&lt;core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;&gt;{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="997" width="100.0000%" height="15" fill="rgb(233,25,53)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="1007.50">&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::enter::&lt;&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on&lt;runner::run::{closure#1}&gt;::{closure#0}..</text></g><g><title>tokio::runtime::context::set_scheduler::&lt;(alloc::boxed::Box&lt;tokio::runtime::scheduler::current_thread::Core&gt;, core::option::Option&lt;core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;), &lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::enter&lt;&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on&lt;runner::run::{closure#1}&gt;::{closure#0}, core::option::Option&lt;core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;&gt;::{closure#0}&gt;{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="981" width="100.0000%" height="15" fill="rgb(210,40,34)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="991.50">tokio::runtime::context::set_scheduler::&lt;(alloc::boxed::Box&lt;tokio::runtime::scheduler::current_thread::Core&gt;, core::option::Option&lt;core::result::Result&lt;(), alloc::boxe..</text></g><g><title>&lt;std::thread::local::LocalKey&lt;tokio::runtime::context::Context&gt;&gt;::with::&lt;tokio::runtime::context::set_scheduler&lt;(alloc::boxed::Box&lt;tokio::runtime::scheduler::current_thread::Core&gt;, core::option::Option&lt;core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;), &lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::enter&lt;&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on&lt;runner::run::{closure#1}&gt;::{closure#0}, core::option::Option&lt;core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;&gt;::{closure#0}&gt;::{closure#0},{alloc::boxed::Box&lt;tokio::runtime::scheduler::current_thread::Core&gt;, core::option::Option&lt;core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;)&gt;+0x91 (inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="965" width="100.0000%" height="15" fill="rgb(241,220,44)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="975.50">&lt;std::thread::local::LocalKey&lt;tokio::runtime::context::Context&gt;&gt;::with::&lt;tokio::runtime::context::set_scheduler&lt;(alloc::boxed::Box&lt;tokio::runtime::scheduler::current_t..</text></g><g><title>&lt;tokio::runtime::context::scoped::Scoped&lt;tokio::runtime::scheduler::Context&gt;&gt;::set::&lt;&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::enter&lt;&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on&lt;runner::run::{closure#1}&gt;::{closure#0}, core::option::Option&lt;core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;&gt;::{closure#0},{runner} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="949" width="100.0000%" height="15" fill="rgb(235,28,35)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="959.50">&lt;tokio::runtime::context::scoped::Scoped&lt;tokio::runtime::scheduler::Context&gt;&gt;::set::&lt;&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::enter&lt;&lt;tokio::runtime::sch..</text></g><g><title>&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::enter::&lt;&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on&lt;runner::run::{closure#1}&gt;::{closure#0}, core::option::Option&lt;core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;&gt;::{closure#0}{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="933" width="100.0000%" height="15" fill="rgb(210,56,17)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="943.50">&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::enter::&lt;&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on&lt;runner::run::{closure#1}&gt;::{closure#0}..</text></g><g><title>&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on::&lt;runner::run::{closure#1}&gt;::{closure#0}{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="917" width="100.0000%" height="15" fill="rgb(224,130,29)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="927.50">&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on::&lt;runner::run::{closure#1}&gt;::{closure#0}{inlined}</text></g><g><title>&lt;tokio::runtime::scheduler::current_thread::Context&gt;::enter::&lt;core::task::poll::Poll&lt;core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;, &lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on&lt;runner::run::{closure#1}&gt;::{closure#0}::{closure#0}&gt;{runner} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="901" width="100.0000%" height="15" fill="rgb(235,212,8)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="911.50">&lt;tokio::runtime::scheduler::current_thread::Context&gt;::enter::&lt;core::task::poll::Poll&lt;core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;, &lt;tokio::runt..</text></g><g><title>&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on::&lt;runner::run::{closure#1}&gt;::{closure#0}::{closure#0}{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="885" width="100.0000%" height="15" fill="rgb(223,33,50)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="895.50">&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on::&lt;runner::run::{closure#1}&gt;::{closure#0}::{closure#0}{inlined}</text></g><g><title>tokio::task::coop::budget::&lt;core::task::poll::Poll&lt;core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;, &lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on&lt;runner::run::{closure#1}&gt;::{closure#0}::{closure#0}::{closure#0}&gt;{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="869" width="100.0000%" height="15" fill="rgb(219,149,13)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="879.50">tokio::task::coop::budget::&lt;core::task::poll::Poll&lt;core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;, &lt;tokio::runtime::scheduler::current_thread::Co..</text></g><g><title>tokio::task::coop::with_budget::&lt;core::task::poll::Poll&lt;core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;, &lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on&lt;runner::run::{closure#1}&gt;::{closure#0}::{closure#0}::{closure#0}&gt;{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="853" width="100.0000%" height="15" fill="rgb(250,156,29)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="863.50">tokio::task::coop::with_budget::&lt;core::task::poll::Poll&lt;core::result::Result&lt;(), alloc::boxed::Box&lt;dyn core::error::Error&gt;&gt;&gt;, &lt;tokio::runtime::scheduler::current_threa..</text></g><g><title>&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on::&lt;runner::run::{closure#1}&gt;::{closure#0}::{closure#0}::{closure#0}{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="837" width="100.0000%" height="15" fill="rgb(216,193,19)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="847.50">&lt;tokio::runtime::scheduler::current_thread::CoreGuard&gt;::block_on::&lt;runner::run::{closure#1}&gt;::{closure#0}::{closure#0}::{closure#0}{inlined}</text></g><g><title>runner::run::{closure#1}{inlined} (5,267,519,552 cycles, 100.00%)</title><rect x="0.0000%" y="821" width="100.0000%" height="15" fill="rgb(216,135,14)" fg:x="0" fg:w="5267519552"/><text x="0.2500%" y="831.50">runner::run::{closure#1}{inlined}</text></g><g><title>runner::sqlx_drv::step::{closure#0}{runner} (5,266,229,147 cycles, 99.98%)</title><rect x="0.0245%" y="805" width="99.9755%" height="15" fill="rgb(241,47,5)" fg:x="1290405" fg:w="5266229147"/><text x="0.2745%" y="815.50">runner::sqlx_drv::step::{closure#0}{runner}</text></g><g><title>core::ptr::drop_glue::&lt;alloc::vec::into_iter::IntoIter&lt;sqlx_mysql::row::MySqlRow&gt;&gt;{inlined} (33,086,749 cycles, 0.63%)</title><rect x="99.3719%" y="789" width="0.6281%" height="15" fill="rgb(233,42,35)" fg:x="5234432803" fg:w="33086749"/><text x="99.6219%" y="799.50"></text></g><g><title>__munmap{libc.so.6} (33,086,749 cycles, 0.63%)</title><rect x="99.3719%" y="773" width="0.6281%" height="15" fill="rgb(231,13,6)" fg:x="5234432803" fg:w="33086749"/><text x="99.6219%" y="783.50"></text></g><g><title>entry_SYSCALL_64_after_hwframe{kernel} (33,086,749 cycles, 0.63%)</title><rect x="99.3719%" y="757" width="0.6281%" height="15" fill="rgb(207,181,40)" fg:x="5234432803" fg:w="33086749"/><text x="99.6219%" y="767.50"></text></g><g><title>do_syscall_64{kernel} (33,086,749 cycles, 0.63%)</title><rect x="99.3719%" y="741" width="0.6281%" height="15" fill="rgb(254,173,49)" fg:x="5234432803" fg:w="33086749"/><text x="99.6219%" y="751.50"></text></g><g><title>x64_sys_call{kernel} (33,086,749 cycles, 0.63%)</title><rect x="99.3719%" y="725" width="0.6281%" height="15" fill="rgb(221,1,38)" fg:x="5234432803" fg:w="33086749"/><text x="99.6219%" y="735.50"></text></g><g><title>__x64_sys_munmap{kernel} (33,086,749 cycles, 0.63%)</title><rect x="99.3719%" y="709" width="0.6281%" height="15" fill="rgb(206,124,46)" fg:x="5234432803" fg:w="33086749"/><text x="99.6219%" y="719.50"></text></g><g><title>__vm_munmap{kernel} (33,086,749 cycles, 0.63%)</title><rect x="99.3719%" y="693" width="0.6281%" height="15" fill="rgb(249,21,11)" fg:x="5234432803" fg:w="33086749"/><text x="99.6219%" y="703.50"></text></g><g><title>do_vmi_munmap{kernel} (33,086,749 cycles, 0.63%)</title><rect x="99.3719%" y="677" width="0.6281%" height="15" fill="rgb(222,201,40)" fg:x="5234432803" fg:w="33086749"/><text x="99.6219%" y="687.50"></text></g><g><title>do_vmi_align_munmap{kernel} (33,086,749 cycles, 0.63%)</title><rect x="99.3719%" y="661" width="0.6281%" height="15" fill="rgb(235,61,29)" fg:x="5234432803" fg:w="33086749"/><text x="99.6219%" y="671.50"></text></g><g><title>vms_complete_munmap_vmas{kernel} (33,086,749 cycles, 0.63%)</title><rect x="99.3719%" y="645" width="0.6281%" height="15" fill="rgb(219,207,3)" fg:x="5234432803" fg:w="33086749"/><text x="99.6219%" y="655.50"></text></g><g><title>unmap_region{kernel} (33,086,749 cycles, 0.63%)</title><rect x="99.3719%" y="629" width="0.6281%" height="15" fill="rgb(222,56,46)" fg:x="5234432803" fg:w="33086749"/><text x="99.6219%" y="639.50"></text></g><g><title>unmap_vmas{kernel} (31,843,949 cycles, 0.60%)</title><rect x="99.3955%" y="613" width="0.6045%" height="15" fill="rgb(239,76,54)" fg:x="5235675603" fg:w="31843949"/><text x="99.6455%" y="623.50"></text></g><g><title>unmap_single_vma{kernel} (31,843,949 cycles, 0.60%)</title><rect x="99.3955%" y="597" width="0.6045%" height="15" fill="rgb(231,124,27)" fg:x="5235675603" fg:w="31843949"/><text x="99.6455%" y="607.50"></text></g><g><title>unmap_page_range{kernel} (31,843,949 cycles, 0.60%)</title><rect x="99.3955%" y="581" width="0.6045%" height="15" fill="rgb(249,195,6)" fg:x="5235675603" fg:w="31843949"/><text x="99.6455%" y="591.50"></text></g><g><title>zap_pmd_range.isra.0{kernel} (31,843,949 cycles, 0.60%)</title><rect x="99.3955%" y="565" width="0.6045%" height="15" fill="rgb(237,174,47)" fg:x="5235675603" fg:w="31843949"/><text x="99.6455%" y="575.50"></text></g><g><title>zap_pte_range{kernel} (31,843,949 cycles, 0.60%)</title><rect x="99.3955%" y="549" width="0.6045%" height="15" fill="rgb(206,201,31)" fg:x="5235675603" fg:w="31843949"/><text x="99.6455%" y="559.50"></text></g><g><title>zap_present_ptes.constprop.0{kernel} (15,230,744 cycles, 0.29%)</title><rect x="99.7109%" y="533" width="0.2891%" height="15" fill="rgb(231,57,52)" fg:x="5252288808" fg:w="15230744"/><text x="99.9609%" y="543.50"></text></g></svg></svg>

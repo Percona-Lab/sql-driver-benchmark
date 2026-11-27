@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="806" onload="init(evt)" viewBox="0 0 1200 806" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="806" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">node-drizzle/T3-text-streamed-default-0.folded (Percona, default; sampled CPU cycles)</text><text id="details" fill="rgb(0,0,0)" x="10" y="789.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="789.00"> </text><svg id="frames" x="10" width="1180" total_samples="50261210247"><g><title>Builtins_CallFunction_ReceiverIsNullOrUndefined{node} (115,683,987 cycles, 0.23%)</title><rect x="0.1428%" y="357" width="0.2302%" height="15" fill="rgb(227,0,7)" fg:x="71782791" fg:w="115683987"/><text x="0.3928%" y="367.50"></text></g><g><title>v8::Context::GetMicrotaskQueue(){node} (124,620,451 cycles, 0.25%)</title><rect x="2.7219%" y="309" width="0.2479%" height="15" fill="rgb(217,0,24)" fg:x="1368039057" fg:w="124620451"/><text x="2.9719%" y="319.50"></text></g><g><title>v8::Context::GetNumberOfEmbedderDataFields(){node} (107,720,538 cycles, 0.21%)</title><rect x="2.9698%" y="309" width="0.2143%" height="15" fill="rgb(221,193,54)" fg:x="1492659508" fg:w="107720538"/><text x="3.2198%" y="319.50"></text></g><g><title>node::task_queue::RunMicrotasks(v8::FunctionCallbackInfo&lt;v8::Value&gt; const&amp;){node} (506,007,066 cycles, 1.01%)</title><rect x="2.2975%" y="325" width="1.0068%" height="15" fill="rgb(248,212,6)" fg:x="1154734517" fg:w="506007066"/><text x="2.5475%" y="335.50"></text></g><g><title>Builtins_CallFunction_ReceiverIsNullOrUndefined{node} (213,541,186 cycles, 0.42%)</title><rect x="7.3103%" y="213" width="0.4249%" height="15" fill="rgb(208,68,35)" fg:x="3674235652" fg:w="213541186"/><text x="7.5603%" y="223.50"></text></g><g><title>Builtins_Call_ReceiverIsNullOrUndefined{node} (195,075,927 cycles, 0.39%)</title><rect x="7.7351%" y="213" width="0.3881%" height="15" fill="rgb(232,128,0)" fg:x="3887776838" fg:w="195075927"/><text x="7.9851%" y="223.50"></text></g><g><title>Builtins_AsyncGeneratorAwait{node} (111,960,946 cycles, 0.22%)</title><rect x="10.0703%" y="133" width="0.2228%" height="15" fill="rgb(207,160,47)" fg:x="5061473016" fg:w="111960946"/><text x="10.3203%" y="143.50"></text></g><g><title>Builtins_CallFunction_ReceiverIsAny{node} (125,806,327 cycles, 0.25%)</title><rect x="14.8167%" y="69" width="0.2503%" height="15" fill="rgb(228,23,34)" fg:x="7447034030" fg:w="125806327"/><text x="15.0667%" y="79.50"></text></g><g><title>Builtins_CallFunction_ReceiverIsNotNullOrUndefined{node} (129,699,276 cycles, 0.26%)</title><rect x="15.0670%" y="69" width="0.2581%" height="15" fill="rgb(218,30,26)" fg:x="7572840357" fg:w="129699276"/><text x="15.3170%" y="79.50"></text></g><g><title>Builtins_Call_ReceiverIsAny{node} (158,899,424 cycles, 0.32%)</title><rect x="15.3250%" y="69" width="0.3161%" height="15" fill="rgb(220,122,19)" fg:x="7702539633" fg:w="158899424"/><text x="15.5750%" y="79.50"></text></g><g><title>Builtins_KeyedLoadIC_Megamorphic{node} (279,300,741 cycles, 0.56%)</title><rect x="15.8530%" y="69" width="0.5557%" height="15" fill="rgb(250,228,42)" fg:x="7967932092" fg:w="279300741"/><text x="16.1030%" y="79.50"></text></g><g><title>Builtins_LoadICTrampoline{node} (157,886,658 cycles, 0.31%)</title><rect x="16.4163%" y="69" width="0.3141%" height="15" fill="rgb(240,193,28)" fg:x="8251054840" fg:w="157886658"/><text x="16.6663%" y="79.50"></text></g><g><title>Builtins_LoadIC{node} (235,328,175 cycles, 0.47%)</title><rect x="16.7790%" y="69" width="0.4682%" height="15" fill="rgb(216,20,37)" fg:x="8433344000" fg:w="235328175"/><text x="17.0290%" y="79.50"></text></g><g><title>Builtins_NewPromiseCapability{node} (110,572,981 cycles, 0.22%)</title><rect x="17.2472%" y="69" width="0.2200%" height="15" fill="rgb(206,188,39)" fg:x="8668672175" fg:w="110572981"/><text x="17.4972%" y="79.50"></text></g><g><title>Builtins_ArrayIteratorPrototypeNext{node} (393,615,090 cycles, 0.78%)</title><rect x="18.7704%" y="53" width="0.7831%" height="15" fill="rgb(217,207,13)" fg:x="9434219238" fg:w="393615090"/><text x="19.0204%" y="63.50"></text></g><g><title>Builtins_GetProperty{node} (1,358,713,288 cycles, 2.70%)</title><rect x="19.6490%" y="53" width="2.7033%" height="15" fill="rgb(231,73,38)" fg:x="9875847182" fg:w="1358713288"/><text x="19.8990%" y="63.50">Bu..</text></g><g><title>Builtins_NewPromiseCapability{node} (248,440,458 cycles, 0.49%)</title><rect x="22.3523%" y="53" width="0.4943%" height="15" fill="rgb(225,20,46)" fg:x="11234560470" fg:w="248440458"/><text x="22.6023%" y="63.50"></text></g><g><title>Builtins_PromisePrototypeThen{node} (592,665,322 cycles, 1.18%)</title><rect x="22.8466%" y="53" width="1.1792%" height="15" fill="rgb(210,31,41)" fg:x="11483000928" fg:w="592665322"/><text x="23.0966%" y="63.50"></text></g><g><title>Builtins_RecordWriteSaveFP{node} (160,282,440 cycles, 0.32%)</title><rect x="23.7069%" y="37" width="0.3189%" height="15" fill="rgb(221,200,47)" fg:x="11915383810" fg:w="160282440"/><text x="23.9569%" y="47.50"></text></g><g><title>Builtins_PromiseRace{node} (3,284,794,471 cycles, 6.54%)</title><rect x="17.5362%" y="69" width="6.5354%" height="15" fill="rgb(226,26,5)" fg:x="8813893002" fg:w="3284794471"/><text x="17.7862%" y="79.50">Builtins_..</text></g><g><title>JS:*&apos;Readable.on node:internal/streams/readable:1219:33{jit} (130,625,364 cycles, 0.26%)</title><rect x="24.1842%" y="69" width="0.2599%" height="15" fill="rgb(249,33,26)" fg:x="12155254244" fg:w="130625364"/><text x="24.4342%" y="79.50"></text></g><g><title>Builtins_LoadIC{node} (119,276,676 cycles, 0.24%)</title><rect x="24.2067%" y="53" width="0.2373%" height="15" fill="rgb(235,183,28)" fg:x="12166602932" fg:w="119276676"/><text x="24.4567%" y="63.50"></text></g><g><title>Builtins_LoadIC{node} (198,764,692 cycles, 0.40%)</title><rect x="25.1209%" y="53" width="0.3955%" height="15" fill="rgb(221,5,38)" fg:x="12626073037" fg:w="198764692"/><text x="25.3709%" y="63.50"></text></g><g><title>Builtins_RecordWriteSaveFP{node} (155,527,301 cycles, 0.31%)</title><rect x="25.5164%" y="53" width="0.3094%" height="15" fill="rgb(247,18,42)" fg:x="12824837729" fg:w="155527301"/><text x="25.7664%" y="63.50"></text></g><g><title>JS:*&apos;nextTick node:internal/process/task_queues:126:18{jit} (715,072,251 cycles, 1.42%)</title><rect x="24.4441%" y="69" width="1.4227%" height="15" fill="rgb(241,131,45)" fg:x="12285879608" fg:w="715072251"/><text x="24.6941%" y="79.50"></text></g><g><title>Builtins_KeyedLoadIC_Megamorphic{node} (150,812,468 cycles, 0.30%)</title><rect x="26.5582%" y="53" width="0.3001%" height="15" fill="rgb(249,31,29)" fg:x="13348490838" fg:w="150812468"/><text x="26.8082%" y="63.50"></text></g><g><title>Builtins_KeyedStoreIC_Megamorphic{node} (459,768,584 cycles, 0.91%)</title><rect x="26.8583%" y="53" width="0.9148%" height="15" fill="rgb(225,111,53)" fg:x="13499303306" fg:w="459768584"/><text x="27.1083%" y="63.50"></text></g><g><title>Builtins_RecordWriteSaveFP{node} (241,463,320 cycles, 0.48%)</title><rect x="27.2926%" y="37" width="0.4804%" height="15" fill="rgb(238,160,17)" fg:x="13717608570" fg:w="241463320"/><text x="27.5426%" y="47.50"></text></g><g><title>JS:o+processTicksAndRejections node:internal/process/task_queues:72:35{jit} (953,122,013 cycles, 1.90%)</title><rect x="25.9125%" y="69" width="1.8963%" height="15" fill="rgb(214,148,48)" fg:x="13023933372" fg:w="953122013"/><text x="26.1625%" y="79.50">J..</text></g><g><title>JS:*&apos;iterator /root/bench/src/stacks/node/node_modules/drizzle-orm/mysql2/session.cjs:108:18{jit} (7,967,723,786 cycles, 15.85%)</title><rect x="11.9588%" y="85" width="15.8526%" height="15" fill="rgb(232,36,49)" fg:x="6010620981" fg:w="7967723786"/><text x="12.2088%" y="95.50">JS:*&apos;iterator /root/benc..</text></g><g><title>Builtins_AsyncGeneratorResumeNext{node} (8,217,352,260 cycles, 16.35%)</title><rect x="11.4749%" y="101" width="16.3493%" height="15" fill="rgb(209,103,24)" fg:x="5767436939" fg:w="8217352260"/><text x="11.7249%" y="111.50">Builtins_AsyncGeneratorRe..</text></g><g><title>Builtins_AsyncGeneratorPrototypeNext{node} (8,477,742,242 cycles, 16.87%)</title><rect x="11.2041%" y="117" width="16.8674%" height="15" fill="rgb(229,88,8)" fg:x="5631304895" fg:w="8477742242"/><text x="11.4541%" y="127.50">Builtins_AsyncGeneratorPro..</text></g><g><title>JS:+&apos;processTicksAndRejections node:internal/process/task_queues:72:35{jit} (8,871,990,316 cycles, 17.65%)</title><rect x="10.4916%" y="133" width="17.6518%" height="15" fill="rgb(213,181,19)" fg:x="5273189610" fg:w="8871990316"/><text x="10.7416%" y="143.50">JS:+&apos;processTicksAndRejecti..</text></g><g><title>Builtins_AsyncGeneratorResumeNext{node} (9,173,610,450 cycles, 18.25%)</title><rect x="9.9273%" y="149" width="18.2519%" height="15" fill="rgb(254,191,54)" fg:x="4989594607" fg:w="9173610450"/><text x="10.1773%" y="159.50">Builtins_AsyncGeneratorResum..</text></g><g><title>Builtins_RecordWriteSaveFP{node} (143,914,024 cycles, 0.29%)</title><rect x="28.2559%" y="149" width="0.2863%" height="15" fill="rgb(241,83,37)" fg:x="14201768844" fg:w="143914024"/><text x="28.5059%" y="159.50"></text></g><g><title>Builtins_AsyncGeneratorPrototypeNext{node} (9,593,103,752 cycles, 19.09%)</title><rect x="9.6498%" y="165" width="19.0865%" height="15" fill="rgb(233,36,39)" fg:x="4850125157" fg:w="9593103752"/><text x="9.8998%" y="175.50">Builtins_AsyncGeneratorPrototy..</text></g><g><title>Builtins_RecordWriteSaveFP{node} (196,767,527 cycles, 0.39%)</title><rect x="28.7798%" y="165" width="0.3915%" height="15" fill="rgb(226,3,54)" fg:x="14465061317" fg:w="196767527"/><text x="29.0298%" y="175.50"></text></g><g><title>JS:*&apos;t3 file:///root/bench/src/stacks/node/fw.mjs:194:13{jit} (10,104,186,985 cycles, 20.10%)</title><rect x="9.0702%" y="181" width="20.1033%" height="15" fill="rgb(245,192,40)" fg:x="4558810285" fg:w="10104186985"/><text x="9.3202%" y="191.50">JS:*&apos;t3 file:///root/bench/src/s..</text></g><g><title>Builtins_GetProperty{node} (175,182,184 cycles, 0.35%)</title><rect x="30.5765%" y="53" width="0.3485%" height="15" fill="rgb(238,167,29)" fg:x="15368136171" fg:w="175182184"/><text x="30.8265%" y="63.50"></text></g><g><title>Builtins_PromiseRace{node} (403,143,643 cycles, 0.80%)</title><rect x="30.3540%" y="69" width="0.8021%" height="15" fill="rgb(232,182,51)" fg:x="15256269886" fg:w="403143643"/><text x="30.6040%" y="79.50"></text></g><g><title>JS:*&apos;nextTick node:internal/process/task_queues:126:18{jit} (135,541,270 cycles, 0.27%)</title><rect x="31.1883%" y="69" width="0.2697%" height="15" fill="rgb(231,60,39)" fg:x="15675607796" fg:w="135541270"/><text x="31.4383%" y="79.50"></text></g><g><title>JS:o+processTicksAndRejections node:internal/process/task_queues:72:35{jit} (124,458,147 cycles, 0.25%)</title><rect x="31.4656%" y="69" width="0.2476%" height="15" fill="rgb(208,69,12)" fg:x="15815016203" fg:w="124458147"/><text x="31.7156%" y="79.50"></text></g><g><title>JS:*&apos;iterator /root/bench/src/stacks/node/node_modules/drizzle-orm/mysql2/session.cjs:108:18{jit} (1,027,745,958 cycles, 2.04%)</title><rect x="29.6710%" y="85" width="2.0448%" height="15" fill="rgb(235,93,37)" fg:x="14913016740" fg:w="1027745958"/><text x="29.9210%" y="95.50">J..</text></g><g><title>Builtins_AsyncGeneratorResumeNext{node} (1,050,764,858 cycles, 2.09%)</title><rect x="29.6278%" y="101" width="2.0906%" height="15" fill="rgb(213,116,39)" fg:x="14891288355" fg:w="1050764858"/><text x="29.8778%" y="111.50">B..</text></g><g><title>Builtins_AsyncGeneratorPrototypeNext{node} (1,096,702,416 cycles, 2.18%)</title><rect x="29.5743%" y="117" width="2.1820%" height="15" fill="rgb(222,207,29)" fg:x="14864381909" fg:w="1096702416"/><text x="29.8243%" y="127.50">B..</text></g><g><title>JS:+&apos;processTicksAndRejections node:internal/process/task_queues:72:35{jit} (1,144,090,965 cycles, 2.28%)</title><rect x="29.4926%" y="133" width="2.2763%" height="15" fill="rgb(206,96,30)" fg:x="14823343757" fg:w="1144090965"/><text x="29.7426%" y="143.50">J..</text></g><g><title>Builtins_AsyncGeneratorResumeNext{node} (1,190,148,000 cycles, 2.37%)</title><rect x="29.4162%" y="149" width="2.3679%" height="15" fill="rgb(218,138,4)" fg:x="14784952906" fg:w="1190148000"/><text x="29.6662%" y="159.50">Bu..</text></g><g><title>Builtins_AsyncGeneratorPrototypeNext{node} (1,257,840,951 cycles, 2.50%)</title><rect x="29.3451%" y="165" width="2.5026%" height="15" fill="rgb(250,191,14)" fg:x="14749218103" fg:w="1257840951"/><text x="29.5951%" y="175.50">Bu..</text></g><g><title>JS:+&apos;t3 file:///root/bench/src/stacks/node/fw.mjs:194:13{jit} (1,397,062,250 cycles, 2.78%)</title><rect x="29.1736%" y="181" width="2.7796%" height="15" fill="rgb(239,60,40)" fg:x="14662997270" fg:w="1397062250"/><text x="29.4236%" y="191.50">JS..</text></g><g><title>JS:^t3 file:///root/bench/src/stacks/node/fw.mjs:194:13{jit} (101,025,472 cycles, 0.20%)</title><rect x="31.9532%" y="181" width="0.2010%" height="15" fill="rgb(206,27,48)" fg:x="16060059520" fg:w="101025472"/><text x="32.2032%" y="191.50"></text></g><g><title>Builtins_AsyncFunctionAwaitResolveClosure{node} (11,777,795,252 cycles, 23.43%)</title><rect x="8.7446%" y="197" width="23.4332%" height="15" fill="rgb(225,35,8)" fg:x="4395164667" fg:w="11777795252"/><text x="8.9946%" y="207.50">Builtins_AsyncFunctionAwaitResolveClo..</text></g><g><title>Builtins_AsyncGeneratorYieldWithAwait{node} (161,845,462 cycles, 0.32%)</title><rect x="32.6165%" y="181" width="0.3220%" height="15" fill="rgb(250,213,24)" fg:x="16393439255" fg:w="161845462"/><text x="32.8665%" y="191.50"></text></g><g><title>Builtins_ResolvePromise{node} (412,207,920 cycles, 0.82%)</title><rect x="37.1085%" y="149" width="0.8201%" height="15" fill="rgb(247,123,22)" fg:x="18651193685" fg:w="412207920"/><text x="37.3585%" y="159.50"></text></g><g><title>Builtins_GetProperty{node} (322,994,389 cycles, 0.64%)</title><rect x="37.2860%" y="133" width="0.6426%" height="15" fill="rgb(231,138,38)" fg:x="18740407216" fg:w="322994389"/><text x="37.5360%" y="143.50"></text></g><g><title>Builtins_AsyncGeneratorYieldWithAwait{node} (964,739,256 cycles, 1.92%)</title><rect x="36.0117%" y="165" width="1.9195%" height="15" fill="rgb(231,145,46)" fg:x="18099934110" fg:w="964739256"/><text x="36.2617%" y="175.50">B..</text></g><g><title>Builtins_ObjectKeys{node} (228,484,355 cycles, 0.45%)</title><rect x="37.9926%" y="165" width="0.4546%" height="15" fill="rgb(251,118,11)" fg:x="19095560157" fg:w="228484355"/><text x="38.2426%" y="175.50"></text></g><g><title>JS:* /root/bench/src/stacks/node/node_modules/drizzle-orm/utils.cjs:43:5{jit} (108,579,434 cycles, 0.22%)</title><rect x="38.6717%" y="165" width="0.2160%" height="15" fill="rgb(217,147,25)" fg:x="19436844323" fg:w="108579434"/><text x="38.9217%" y="175.50"></text></g><g><title>JS:*&apos;t3 file:///root/bench/src/stacks/node/fw.mjs:194:13{jit} (207,862,106 cycles, 0.41%)</title><rect x="38.8877%" y="165" width="0.4136%" height="15" fill="rgb(247,81,37)" fg:x="19545423757" fg:w="207862106"/><text x="39.1377%" y="175.50"></text></g><g><title>JS:*&apos;iterator /root/bench/src/stacks/node/node_modules/drizzle-orm/mysql2/session.cjs:108:18{jit} (3,284,307,339 cycles, 6.53%)</title><rect x="32.9946%" y="181" width="6.5345%" height="15" fill="rgb(209,12,38)" fg:x="16583469773" fg:w="3284307339"/><text x="33.2446%" y="191.50">JS:*&apos;iter..</text></g><g><title>Builtins_EnqueueMicrotask{node} (144,869,134 cycles, 0.29%)</title><rect x="39.9241%" y="149" width="0.2882%" height="15" fill="rgb(227,1,9)" fg:x="20066315358" fg:w="144869134"/><text x="40.1741%" y="159.50"></text></g><g><title>Builtins_AsyncGeneratorResolve{node} (272,462,138 cycles, 0.54%)</title><rect x="39.8558%" y="165" width="0.5421%" height="15" fill="rgb(248,47,43)" fg:x="20032024079" fg:w="272462138"/><text x="40.1058%" y="175.50"></text></g><g><title>JS:+&apos;processTicksAndRejections node:internal/process/task_queues:72:35{jit} (437,993,153 cycles, 0.87%)</title><rect x="39.5342%" y="181" width="0.8714%" height="15" fill="rgb(221,10,30)" fg:x="19870356335" fg:w="437993153"/><text x="39.7842%" y="191.50"></text></g><g><title>JS:+&apos;shift /root/bench/src/stacks/node/node_modules/mysql2/lib/ring_queue.js:62:8{jit} (115,062,439 cycles, 0.23%)</title><rect x="40.4056%" y="181" width="0.2289%" height="15" fill="rgb(210,229,1)" fg:x="20308349488" fg:w="115062439"/><text x="40.6556%" y="191.50"></text></g><g><title>Builtins_AsyncGeneratorAwaitResolveClosure{node} (4,253,029,910 cycles, 8.46%)</title><rect x="32.1778%" y="197" width="8.4619%" height="15" fill="rgb(222,148,37)" fg:x="16172959919" fg:w="4253029910"/><text x="32.4278%" y="207.50">Builtins_Asy..</text></g><g><title>Builtins_AsyncGeneratorResumeNext{node} (119,605,026 cycles, 0.24%)</title><rect x="40.7393%" y="197" width="0.2380%" height="15" fill="rgb(234,67,33)" fg:x="20476072345" fg:w="119605026"/><text x="40.9893%" y="207.50"></text></g><g><title>Builtins_EnqueueMicrotask{node} (163,515,421 cycles, 0.33%)</title><rect x="41.0694%" y="165" width="0.3253%" height="15" fill="rgb(247,98,35)" fg:x="20641982830" fg:w="163515421"/><text x="41.3194%" y="175.50"></text></g><g><title>Builtins_AsyncGeneratorResolve{node} (302,103,613 cycles, 0.60%)</title><rect x="41.0155%" y="181" width="0.6011%" height="15" fill="rgb(247,138,52)" fg:x="20614887292" fg:w="302103613"/><text x="41.2655%" y="191.50"></text></g><g><title>Builtins_FulfillPromise{node} (111,492,654 cycles, 0.22%)</title><rect x="41.3947%" y="165" width="0.2218%" height="15" fill="rgb(213,79,30)" fg:x="20805498251" fg:w="111492654"/><text x="41.6447%" y="175.50"></text></g><g><title>Builtins_AsyncGeneratorYieldWithAwaitResolveClosure{node} (329,047,909 cycles, 0.65%)</title><rect x="40.9773%" y="197" width="0.6547%" height="15" fill="rgb(246,177,23)" fg:x="20595677371" fg:w="329047909"/><text x="41.2273%" y="207.50"></text></g><g><title>Builtins_PromiseCapabilityDefaultResolve{node} (1,047,107,122 cycles, 2.08%)</title><rect x="41.6447%" y="197" width="2.0833%" height="15" fill="rgb(230,62,27)" fg:x="20931152874" fg:w="1047107122"/><text x="41.8947%" y="207.50">B..</text></g><g><title>Builtins_ResolvePromise{node} (964,391,278 cycles, 1.92%)</title><rect x="41.8093%" y="181" width="1.9188%" height="15" fill="rgb(216,154,8)" fg:x="21013868718" fg:w="964391278"/><text x="42.0593%" y="191.50">B..</text></g><g><title>Builtins_GetProperty{node} (754,264,818 cycles, 1.50%)</title><rect x="42.2274%" y="165" width="1.5007%" height="15" fill="rgb(244,35,45)" fg:x="21223995178" fg:w="754264818"/><text x="42.4774%" y="175.50"></text></g><g><title>Builtins_EnqueueMicrotask{node} (185,634,539 cycles, 0.37%)</title><rect x="43.9263%" y="181" width="0.3693%" height="15" fill="rgb(251,115,12)" fg:x="22077887127" fg:w="185634539"/><text x="44.1763%" y="191.50"></text></g><g><title>Builtins_RecordWriteSaveFP{node} (180,637,697 cycles, 0.36%)</title><rect x="45.4508%" y="165" width="0.3594%" height="15" fill="rgb(240,54,50)" fg:x="22844116813" fg:w="180637697"/><text x="45.7008%" y="175.50"></text></g><g><title>v8::internal::Heap::InsertIntoRememberedSetFromCode(v8::internal::MutablePage*, unsigned long){node} (110,119,891 cycles, 0.22%)</title><rect x="45.5911%" y="149" width="0.2191%" height="15" fill="rgb(233,84,52)" fg:x="22914634619" fg:w="110119891"/><text x="45.8411%" y="159.50"></text></g><g><title>Builtins_FulfillPromise{node} (766,324,632 cycles, 1.52%)</title><rect x="44.2956%" y="181" width="1.5247%" height="15" fill="rgb(207,117,47)" fg:x="22263521666" fg:w="766324632"/><text x="44.5456%" y="191.50"></text></g><g><title>Builtins_ResolvePromise{node} (1,051,129,974 cycles, 2.09%)</title><rect x="43.7408%" y="197" width="2.0913%" height="15" fill="rgb(249,43,39)" fg:x="21984674080" fg:w="1051129974"/><text x="43.9908%" y="207.50">B..</text></g><g><title>Builtins_ResumeGeneratorTrampoline{node} (472,765,329 cycles, 0.94%)</title><rect x="45.8322%" y="197" width="0.9406%" height="15" fill="rgb(209,38,44)" fg:x="23035804054" fg:w="472765329"/><text x="46.0822%" y="207.50"></text></g><g><title>Builtins_RecordWriteIgnoreFP{node} (281,704,695 cycles, 0.56%)</title><rect x="46.2123%" y="181" width="0.5605%" height="15" fill="rgb(236,212,23)" fg:x="23226864688" fg:w="281704695"/><text x="46.4623%" y="191.50"></text></g><g><title>Builtins_PromiseFulfillReactionJob{node} (19,394,207,195 cycles, 38.59%)</title><rect x="8.2192%" y="213" width="38.5868%" height="15" fill="rgb(242,79,21)" fg:x="4131081694" fg:w="19394207195"/><text x="8.4692%" y="223.50">Builtins_PromiseFulfillReactionJob{node}</text></g><g><title>Builtins_JSRunMicrotasksEntry{node} (21,307,289,759 cycles, 42.39%)</title><rect x="4.4410%" y="245" width="42.3931%" height="15" fill="rgb(211,96,35)" fg:x="2232096560" fg:w="21307289759"/><text x="4.6910%" y="255.50">Builtins_JSRunMicrotasksEntry{node}</text></g><g><title>Builtins_RunMicrotasks{node} (21,223,959,867 cycles, 42.23%)</title><rect x="4.6068%" y="229" width="42.2273%" height="15" fill="rgb(253,215,40)" fg:x="2315426452" fg:w="21223959867"/><text x="4.8568%" y="239.50">Builtins_RunMicrotasks{node}</text></g><g><title>v8::internal::(anonymous namespace)::Invoke(v8::internal::Isolate*, v8::internal::(anonymous namespace)::InvokeParams const&amp;){node} (21,617,949,766 cycles, 43.01%)</title><rect x="3.9380%" y="261" width="43.0112%" height="15" fill="rgb(211,81,21)" fg:x="1979288851" fg:w="21617949766"/><text x="4.1880%" y="271.50">v8::internal::(anonymous namespace)::Invoke(v8::internal::Isolate*, v8..</text></g><g><title>v8::internal::(anonymous namespace)::InvokeWithTryCatch(v8::internal::Isolate*, v8::internal::(anonymous namespace)::InvokeParams const&amp;){node} (21,711,411,652 cycles, 43.20%)</title><rect x="3.8284%" y="277" width="43.1972%" height="15" fill="rgb(208,190,38)" fg:x="1924203554" fg:w="21711411652"/><text x="4.0784%" y="287.50">v8::internal::(anonymous namespace)::InvokeWithTryCatch(v8::internal::I..</text></g><g><title>Builtins_CallApiCallbackOptimizedNoProfiling{node} (22,520,813,974 cycles, 44.81%)</title><rect x="2.2513%" y="341" width="44.8075%" height="15" fill="rgb(235,213,38)" fg:x="1131539624" fg:w="22520813974"/><text x="2.5013%" y="351.50">Builtins_CallApiCallbackOptimizedNoProfiling{node}</text></g><g><title>v8::internal::MicrotaskQueue::PerformCheckpoint(v8::Isolate*){node} (21,881,170,285 cycles, 43.53%)</title><rect x="3.5240%" y="325" width="43.5349%" height="15" fill="rgb(237,122,38)" fg:x="1771183313" fg:w="21881170285"/><text x="3.7740%" y="335.50">v8::internal::MicrotaskQueue::PerformCheckpoint(v8::Isolate*){node}</text></g><g><title>v8::internal::MicrotaskQueue::RunMicrotasks(v8::internal::Isolate*){node} (21,832,300,052 cycles, 43.44%)</title><rect x="3.6212%" y="309" width="43.4377%" height="15" fill="rgb(244,218,35)" fg:x="1820053546" fg:w="21832300052"/><text x="3.8712%" y="319.50">v8::internal::MicrotaskQueue::RunMicrotasks(v8::internal::Isolate*){nod..</text></g><g><title>v8::internal::Execution::TryRunMicrotasks(v8::internal::Isolate*, v8::internal::MicrotaskQueue*){node} (21,751,315,833 cycles, 43.28%)</title><rect x="3.7823%" y="293" width="43.2765%" height="15" fill="rgb(240,68,47)" fg:x="1901037765" fg:w="21751315833"/><text x="4.0323%" y="303.50">v8::internal::Execution::TryRunMicrotasks(v8::internal::Isolate*, v8::i..</text></g><g><title>Builtins_KeyedLoadIC_Megamorphic{node} (201,570,970 cycles, 0.40%)</title><rect x="47.0589%" y="341" width="0.4010%" height="15" fill="rgb(210,16,53)" fg:x="23652353598" fg:w="201570970"/><text x="47.3089%" y="351.50"></text></g><g><title>Builtins_RecordWriteSaveFP{node} (564,159,702 cycles, 1.12%)</title><rect x="47.4599%" y="341" width="1.1225%" height="15" fill="rgb(235,124,12)" fg:x="23853924568" fg:w="564159702"/><text x="47.7099%" y="351.50"></text></g><g><title>JS:*&apos;emitReadable_ node:internal/streams/readable:899:23{jit} (387,554,210 cycles, 0.77%)</title><rect x="48.5824%" y="341" width="0.7711%" height="15" fill="rgb(224,169,11)" fg:x="24418084270" fg:w="387554210"/><text x="48.8324%" y="351.50"></text></g><g><title>Builtins_Call_ReceiverIsAny{node} (105,938,762 cycles, 0.21%)</title><rect x="50.1960%" y="325" width="0.2108%" height="15" fill="rgb(250,166,2)" fg:x="25229133667" fg:w="105938762"/><text x="50.4460%" y="335.50"></text></g><g><title>Builtins_KeyedLoadIC_Megamorphic{node} (399,579,836 cycles, 0.80%)</title><rect x="50.5349%" y="325" width="0.7950%" height="15" fill="rgb(242,216,29)" fg:x="25399438342" fg:w="399579836"/><text x="50.7849%" y="335.50"></text></g><g><title>Builtins_KeyedLoadIC_Megamorphic{node} (356,967,707 cycles, 0.71%)</title><rect x="53.9623%" y="309" width="0.7102%" height="15" fill="rgb(230,116,27)" fg:x="27122116108" fg:w="356967707"/><text x="54.2123%" y="319.50"></text></g><g><title>Builtins_LoadICTrampoline{node} (151,409,878 cycles, 0.30%)</title><rect x="54.6725%" y="309" width="0.3012%" height="15" fill="rgb(228,99,48)" fg:x="27479083815" fg:w="151409878"/><text x="54.9225%" y="319.50"></text></g><g><title>Builtins_LoadIC{node} (224,339,029 cycles, 0.45%)</title><rect x="54.9738%" y="309" width="0.4463%" height="15" fill="rgb(253,11,6)" fg:x="27630493693" fg:w="224339029"/><text x="55.2238%" y="319.50"></text></g><g><title>Builtins_LoadIC{node} (236,381,053 cycles, 0.47%)</title><rect x="56.2160%" y="293" width="0.4703%" height="15" fill="rgb(247,143,39)" fg:x="28254854802" fg:w="236381053"/><text x="56.4660%" y="303.50"></text></g><g><title>Builtins_RecordWriteSaveFP{node} (107,863,292 cycles, 0.21%)</title><rect x="56.6863%" y="293" width="0.2146%" height="15" fill="rgb(236,97,10)" fg:x="28491235855" fg:w="107863292"/><text x="56.9363%" y="303.50"></text></g><g><title>JS:*&apos;nextTick node:internal/process/task_queues:126:18{jit} (653,241,236 cycles, 1.30%)</title><rect x="55.6426%" y="309" width="1.2997%" height="15" fill="rgb(233,208,19)" fg:x="27966660247" fg:w="653241236"/><text x="55.8926%" y="319.50"></text></g><g><title>JS:*dataListener /root/bench/src/stacks/node/node_modules/drizzle-orm/mysql2/session.cjs:115:26{jit} (266,962,402 cycles, 0.53%)</title><rect x="56.9423%" y="309" width="0.5311%" height="15" fill="rgb(216,164,2)" fg:x="28619901483" fg:w="266962402"/><text x="57.1923%" y="319.50"></text></g><g><title>Builtins_KeyedLoadIC_Megamorphic{node} (208,109,484 cycles, 0.41%)</title><rect x="57.0594%" y="293" width="0.4141%" height="15" fill="rgb(220,129,5)" fg:x="28678754401" fg:w="208109484"/><text x="57.3094%" y="303.50"></text></g><g><title>Builtins_KeyedLoadIC_Megamorphic{node} (231,674,790 cycles, 0.46%)</title><rect x="59.4416%" y="277" width="0.4609%" height="15" fill="rgb(242,17,10)" fg:x="29876059388" fg:w="231674790"/><text x="59.6916%" y="287.50"></text></g><g><title>Builtins_LoadICTrampoline{node} (142,185,457 cycles, 0.28%)</title><rect x="59.9025%" y="277" width="0.2829%" height="15" fill="rgb(242,107,0)" fg:x="30107734178" fg:w="142185457"/><text x="60.1525%" y="287.50"></text></g><g><title>Builtins_KeyedLoadIC_Megamorphic{node} (200,179,465 cycles, 0.40%)</title><rect x="61.5523%" y="261" width="0.3983%" height="15" fill="rgb(251,28,31)" fg:x="30936914337" fg:w="200179465"/><text x="61.8023%" y="271.50"></text></g><g><title>Builtins_RecordWriteSaveFP{node} (136,000,338 cycles, 0.27%)</title><rect x="62.1370%" y="261" width="0.2706%" height="15" fill="rgb(233,223,10)" fg:x="31230784850" fg:w="136000338"/><text x="62.3870%" y="271.50"></text></g><g><title>Builtins_KeyedLoadIC_Megamorphic{node} (258,431,552 cycles, 0.51%)</title><rect x="62.8979%" y="245" width="0.5142%" height="15" fill="rgb(215,21,27)" fg:x="31613239305" fg:w="258431552"/><text x="63.1479%" y="255.50"></text></g><g><title>Builtins_ArrayPrototypePush{node} (261,917,078 cycles, 0.52%)</title><rect x="63.9625%" y="229" width="0.5211%" height="15" fill="rgb(232,23,21)" fg:x="32148320418" fg:w="261917078"/><text x="64.2125%" y="239.50"></text></g><g><title>JS:*&apos;readableAddChunkPushObjectMode node:internal/streams/readable:560:40{jit} (553,952,898 cycles, 1.10%)</title><rect x="63.6210%" y="245" width="1.1021%" height="15" fill="rgb(244,5,23)" fg:x="31976666084" fg:w="553952898"/><text x="63.8710%" y="255.50"></text></g><g><title>Builtins_LoadIC{node} (120,381,486 cycles, 0.24%)</title><rect x="64.4836%" y="229" width="0.2395%" height="15" fill="rgb(226,81,46)" fg:x="32410237496" fg:w="120381486"/><text x="64.7336%" y="239.50"></text></g><g><title>Builtins_LoadIC{node} (196,811,758 cycles, 0.39%)</title><rect x="65.8067%" y="213" width="0.3916%" height="15" fill="rgb(247,70,30)" fg:x="33075249275" fg:w="196811758"/><text x="66.0567%" y="223.50"></text></g><g><title>JS:+&apos;executeStart /root/bench/src/stacks/node/node_modules/mysql2/lib/packet_parser.js:67:15{jit} (1,974,865,904 cycles, 3.93%)</title><rect x="62.4152%" y="261" width="3.9292%" height="15" fill="rgb(212,68,19)" fg:x="31370656261" fg:w="1974865904"/><text x="62.6652%" y="271.50">JS:+..</text></g><g><title>JS:+&apos;maybeReadMore_ node:internal/streams/readable:933:24{jit} (748,119,436 cycles, 1.49%)</title><rect x="64.8560%" y="245" width="1.4885%" height="15" fill="rgb(240,187,13)" fg:x="32597402729" fg:w="748119436"/><text x="65.1060%" y="255.50"></text></g><g><title>JS:*&apos;nextTick node:internal/process/task_queues:126:18{jit} (617,419,570 cycles, 1.23%)</title><rect x="65.1160%" y="229" width="1.2284%" height="15" fill="rgb(223,113,26)" fg:x="32728102595" fg:w="617419570"/><text x="65.3660%" y="239.50"></text></g><g><title>JS:*&apos;row /root/bench/src/stacks/node/node_modules/mysql2/lib/commands/query.js:252:6{jit} (3,053,367,953 cycles, 6.07%)</title><rect x="60.2720%" y="277" width="6.0750%" height="15" fill="rgb(206,192,2)" fg:x="30293434911" fg:w="3053367953"/><text x="60.5220%" y="287.50">JS:*&apos;row..</text></g><g><title>JS:*&apos;handlePacket /root/bench/src/stacks/node/node_modules/mysql2/lib/base/connection.js:556:15{jit} (4,026,466,746 cycles, 8.01%)</title><rect x="58.4356%" y="293" width="8.0111%" height="15" fill="rgb(241,108,4)" fg:x="29370455086" fg:w="4026466746"/><text x="58.6856%" y="303.50">JS:*&apos;handle..</text></g><g><title>JS:+&apos;executeStart /root/bench/src/stacks/node/node_modules/mysql2/lib/packet_parser.js:67:15{jit} (4,515,144,362 cycles, 8.98%)</title><rect x="57.4735%" y="309" width="8.9834%" height="15" fill="rgb(247,173,49)" fg:x="28886863885" fg:w="4515144362"/><text x="57.7235%" y="319.50">JS:+&apos;executeS..</text></g><g><title>Builtins_KeyedLoadICTrampoline_Megamorphic{node} (153,885,441 cycles, 0.31%)</title><rect x="66.7685%" y="293" width="0.3062%" height="15" fill="rgb(224,114,35)" fg:x="33558658708" fg:w="153885441"/><text x="67.0185%" y="303.50"></text></g><g><title>Builtins_KeyedLoadIC_Megamorphic{node} (238,677,164 cycles, 0.47%)</title><rect x="67.0747%" y="293" width="0.4749%" height="15" fill="rgb(245,159,27)" fg:x="33712544149" fg:w="238677164"/><text x="67.3247%" y="303.50"></text></g><g><title>Builtins_LoadIC{node} (209,116,233 cycles, 0.42%)</title><rect x="67.7830%" y="293" width="0.4161%" height="15" fill="rgb(245,172,44)" fg:x="34068572003" fg:w="209116233"/><text x="68.0330%" y="303.50"></text></g><g><title>Builtins_EnqueueMicrotask{node} (149,947,777 cycles, 0.30%)</title><rect x="68.3423%" y="261" width="0.2983%" height="15" fill="rgb(236,23,11)" fg:x="34349654883" fg:w="149947777"/><text x="68.5923%" y="271.50"></text></g><g><title>Builtins_PromiseCapabilityDefaultResolve{node} (988,030,015 cycles, 1.97%)</title><rect x="68.1991%" y="293" width="1.9658%" height="15" fill="rgb(205,117,38)" fg:x="34277688236" fg:w="988030015"/><text x="68.4491%" y="303.50">B..</text></g><g><title>Builtins_ResolvePromise{node} (937,962,503 cycles, 1.87%)</title><rect x="68.2987%" y="277" width="1.8662%" height="15" fill="rgb(237,72,25)" fg:x="34327755748" fg:w="937962503"/><text x="68.5487%" y="287.50">B..</text></g><g><title>Builtins_GetProperty{node} (693,668,932 cycles, 1.38%)</title><rect x="68.7848%" y="261" width="1.3801%" height="15" fill="rgb(244,70,9)" fg:x="34572049319" fg:w="693668932"/><text x="69.0348%" y="271.50"></text></g><g><title>Builtins_ResolvePromise{node} (175,018,424 cycles, 0.35%)</title><rect x="70.1649%" y="293" width="0.3482%" height="15" fill="rgb(217,125,39)" fg:x="35265718251" fg:w="175018424"/><text x="70.4149%" y="303.50"></text></g><g><title>Builtins_KeyedStoreIC_Megamorphic{node} (234,705,563 cycles, 0.47%)</title><rect x="71.0368%" y="277" width="0.4670%" height="15" fill="rgb(235,36,10)" fg:x="35703972906" fg:w="234705563"/><text x="71.2868%" y="287.50"></text></g><g><title>JS:+&apos;normalizeString node:path:92:25{jit} (2,724,139,716 cycles, 5.42%)</title><rect x="66.4568%" y="309" width="5.4200%" height="15" fill="rgb(251,123,47)" fg:x="33402008247" fg:w="2724139716"/><text x="66.7068%" y="319.50">JS:+&apos;no..</text></g><g><title>JS:o+processTicksAndRejections node:internal/process/task_queues:72:35{jit} (685,411,288 cycles, 1.36%)</title><rect x="70.5131%" y="293" width="1.3637%" height="15" fill="rgb(221,13,13)" fg:x="35440736675" fg:w="685411288"/><text x="70.7631%" y="303.50"></text></g><g><title>Builtins_RecordWriteSaveFP{node} (116,956,528 cycles, 0.23%)</title><rect x="71.6441%" y="277" width="0.2327%" height="15" fill="rgb(238,131,9)" fg:x="36009191435" fg:w="116956528"/><text x="71.8941%" y="287.50"></text></g><g><title>JS:*&apos;resume_ node:internal/streams/readable:1357:17{jit} (11,283,300,180 cycles, 22.45%)</title><rect x="49.4403%" y="341" width="22.4493%" height="15" fill="rgb(211,50,8)" fg:x="24849275218" fg:w="11283300180"/><text x="49.6903%" y="351.50">JS:*&apos;resume_ node:internal/streams/r..</text></g><g><title>JS:o+processTicksAndRejections node:internal/process/task_queues:72:35{jit} (10,148,651,040 cycles, 20.19%)</title><rect x="51.6978%" y="325" width="20.1918%" height="15" fill="rgb(245,182,24)" fg:x="25983924358" fg:w="10148651040"/><text x="51.9478%" y="335.50">JS:o+processTicksAndRejections n..</text></g><g><title>JS:*&apos;processTicksAndRejections node:internal/process/task_queues:72:35{jit} (35,893,834,815 cycles, 71.41%)</title><rect x="0.5312%" y="357" width="71.4146%" height="15" fill="rgb(242,14,37)" fg:x="267009342" fg:w="35893834815"/><text x="0.7812%" y="367.50">JS:*&apos;processTicksAndRejections node:internal/process/task_queues:72:35{jit}</text></g><g><title>node::InternalCallbackScope::Close(){node} (36,157,840,661 cycles, 71.94%)</title><rect x="0.0795%" y="453" width="71.9399%" height="15" fill="rgb(246,228,12)" fg:x="39935742" fg:w="36157840661"/><text x="0.3295%" y="463.50">node::InternalCallbackScope::Close(){node}</text></g><g><title>v8::Function::Call(v8::Isolate*, v8::Local&lt;v8::Context&gt;, v8::Local&lt;v8::Value&gt;, int, v8::Local&lt;v8::Value&gt;*){node} (36,153,973,211 cycles, 71.93%)</title><rect x="0.0872%" y="437" width="71.9322%" height="15" fill="rgb(213,55,15)" fg:x="43803192" fg:w="36153973211"/><text x="0.3372%" y="447.50">v8::Function::Call(v8::Isolate*, v8::Local&lt;v8::Context&gt;, v8::Local&lt;v8::Value&gt;, int, v8::Local&lt;v8::Value&gt;*){node}</text></g><g><title>v8::internal::Execution::Call(v8::internal::Isolate*, v8::internal::DirectHandle&lt;v8::internal::Object&gt;, v8::internal::DirectHandle&lt;v8::internal::Object&gt;, v8::base::Vector&lt;v8::internal::DirectHandle&lt;v8::internal::Object&gt; const&gt;){node} (36,151,552,204 cycles, 71.93%)</title><rect x="0.0920%" y="421" width="71.9273%" height="15" fill="rgb(209,9,3)" fg:x="46224199" fg:w="36151552204"/><text x="0.3420%" y="431.50">v8::internal::Execution::Call(v8::internal::Isolate*, v8::internal::DirectHandle&lt;v8::internal::Object&gt;, v8::internal::D..</text></g><g><title>v8::internal::(anonymous namespace)::Invoke(v8::internal::Isolate*, v8::internal::(anonymous namespace)::InvokeParams const&amp;){node} (36,150,263,291 cycles, 71.92%)</title><rect x="0.0945%" y="405" width="71.9248%" height="15" fill="rgb(230,59,30)" fg:x="47513112" fg:w="36150263291"/><text x="0.3445%" y="415.50">v8::internal::(anonymous namespace)::Invoke(v8::internal::Isolate*, v8::internal::(anonymous namespace)::InvokeParams c..</text></g><g><title>Builtins_JSEntry{node} (36,150,263,291 cycles, 71.92%)</title><rect x="0.0945%" y="389" width="71.9248%" height="15" fill="rgb(209,121,21)" fg:x="47513112" fg:w="36150263291"/><text x="0.3445%" y="399.50">Builtins_JSEntry{node}</text></g><g><title>Builtins_JSEntryTrampoline{node} (36,150,263,291 cycles, 71.92%)</title><rect x="0.0945%" y="373" width="71.9248%" height="15" fill="rgb(220,109,13)" fg:x="47513112" fg:w="36150263291"/><text x="0.3445%" y="383.50">Builtins_JSEntryTrampoline{node}</text></g><g><title>JS:*&apos;handlePacket /root/bench/src/stacks/node/node_modules/mysql2/lib/base/connection.js:556:15{jit} (156,993,791 cycles, 0.31%)</title><rect x="72.5350%" y="245" width="0.3124%" height="15" fill="rgb(232,18,1)" fg:x="36456969398" fg:w="156993791"/><text x="72.7850%" y="255.50"></text></g><g><title>JS:*&apos;executeStart /root/bench/src/stacks/node/node_modules/mysql2/lib/packet_parser.js:67:15{jit} (331,186,205 cycles, 0.66%)</title><rect x="72.1910%" y="261" width="0.6589%" height="15" fill="rgb(215,41,42)" fg:x="36284067513" fg:w="331186205"/><text x="72.4410%" y="271.50"></text></g><g><title>JS:+&apos;executePayload /root/bench/src/stacks/node/node_modules/mysql2/lib/packet_parser.js:124:17{jit} (356,779,616 cycles, 0.71%)</title><rect x="72.1757%" y="277" width="0.7099%" height="15" fill="rgb(224,123,36)" fg:x="36276359507" fg:w="356779616"/><text x="72.4257%" y="287.50"></text></g><g><title>v8::Function::Call(v8::Isolate*, v8::Local&lt;v8::Context&gt;, v8::Local&lt;v8::Value&gt;, int, v8::Local&lt;v8::Value&gt;*){node} (519,846,010 cycles, 1.03%)</title><rect x="72.0219%" y="453" width="1.0343%" height="15" fill="rgb(240,125,3)" fg:x="36199065147" fg:w="519846010"/><text x="72.2719%" y="463.50"></text></g><g><title>v8::internal::Execution::Call(v8::internal::Isolate*, v8::internal::DirectHandle&lt;v8::internal::Object&gt;, v8::internal::DirectHandle&lt;v8::internal::Object&gt;, v8::base::Vector&lt;v8::internal::DirectHandle&lt;v8::internal::Object&gt; const&gt;){node} (519,846,010 cycles, 1.03%)</title><rect x="72.0219%" y="437" width="1.0343%" height="15" fill="rgb(205,98,50)" fg:x="36199065147" fg:w="519846010"/><text x="72.2719%" y="447.50"></text></g><g><title>v8::internal::(anonymous namespace)::Invoke(v8::internal::Isolate*, v8::internal::(anonymous namespace)::InvokeParams const&amp;){node} (518,557,477 cycles, 1.03%)</title><rect x="72.0244%" y="421" width="1.0317%" height="15" fill="rgb(205,185,37)" fg:x="36200353680" fg:w="518557477"/><text x="72.2744%" y="431.50"></text></g><g><title>Builtins_JSEntry{node} (517,273,485 cycles, 1.03%)</title><rect x="72.0270%" y="405" width="1.0292%" height="15" fill="rgb(238,207,15)" fg:x="36201637672" fg:w="517273485"/><text x="72.2770%" y="415.50"></text></g><g><title>Builtins_JSEntryTrampoline{node} (517,273,485 cycles, 1.03%)</title><rect x="72.0270%" y="389" width="1.0292%" height="15" fill="rgb(213,199,42)" fg:x="36201637672" fg:w="517273485"/><text x="72.2770%" y="399.50"></text></g><g><title>JS:+&apos;onStreamRead node:internal/stream_base_commons:171:22{jit} (515,983,135 cycles, 1.03%)</title><rect x="72.0296%" y="373" width="1.0266%" height="15" fill="rgb(235,201,11)" fg:x="36202928022" fg:w="515983135"/><text x="72.2796%" y="383.50"></text></g><g><title>JS:+&apos;Readable.push node:internal/streams/readable:411:35{jit} (512,198,132 cycles, 1.02%)</title><rect x="72.0371%" y="357" width="1.0191%" height="15" fill="rgb(207,46,11)" fg:x="36206713025" fg:w="512198132"/><text x="72.2871%" y="367.50"></text></g><g><title>JS:*&apos;t3 file:///root/bench/src/stacks/node/fw.mjs:194:13{jit} (512,198,132 cycles, 1.02%)</title><rect x="72.0371%" y="341" width="1.0191%" height="15" fill="rgb(241,35,35)" fg:x="36206713025" fg:w="512198132"/><text x="72.2871%" y="351.50"></text></g><g><title>JS:*&apos;addChunk node:internal/streams/readable:594:18{jit} (512,198,132 cycles, 1.02%)</title><rect x="72.0371%" y="325" width="1.0191%" height="15" fill="rgb(243,32,47)" fg:x="36206713025" fg:w="512198132"/><text x="72.2871%" y="335.50"></text></g><g><title>JS:+&apos;executeStart /root/bench/src/stacks/node/node_modules/mysql2/lib/packet_parser.js:67:15{jit} (507,040,622 cycles, 1.01%)</title><rect x="72.0474%" y="309" width="1.0088%" height="15" fill="rgb(247,202,23)" fg:x="36211870535" fg:w="507040622"/><text x="72.2974%" y="319.50"></text></g><g><title>JS:+&apos; /root/bench/src/stacks/node/node_modules/mysql2/lib/base/connection.js:150:28{jit} (504,462,593 cycles, 1.00%)</title><rect x="72.0525%" y="293" width="1.0037%" height="15" fill="rgb(219,102,11)" fg:x="36214448564" fg:w="504462593"/><text x="72.3025%" y="303.50"></text></g><g><title>node::StreamBase::CallJSOnreadMethod(long, v8::Local&lt;v8::ArrayBuffer&gt;, unsigned long, node::StreamBase::StreamBaseJSChecks){node} (36,680,265,851 cycles, 72.98%)</title><rect x="0.0795%" y="501" width="72.9793%" height="15" fill="rgb(243,110,44)" fg:x="39935742" fg:w="36680265851"/><text x="0.3295%" y="511.50">node::StreamBase::CallJSOnreadMethod(long, v8::Local&lt;v8::ArrayBuffer&gt;, unsigned long, node::StreamBase::StreamBaseJSCheck..</text></g><g><title>node::AsyncWrap::MakeCallback(v8::Local&lt;v8::Function&gt;, int, v8::Local&lt;v8::Value&gt;*){node} (36,680,265,851 cycles, 72.98%)</title><rect x="0.0795%" y="485" width="72.9793%" height="15" fill="rgb(222,74,54)" fg:x="39935742" fg:w="36680265851"/><text x="0.3295%" y="495.50">node::AsyncWrap::MakeCallback(v8::Local&lt;v8::Function&gt;, int, v8::Local&lt;v8::Value&gt;*){node}</text></g><g><title>node::InternalMakeCallback(node::Environment*, v8::Local&lt;v8::Object&gt;, v8::Local&lt;v8::Object&gt;, v8::Local&lt;v8::Function&gt;, int, v8::Local&lt;v8::Value&gt;*, node::async_context, v8::Local&lt;v8::Value&gt;){node} (36,680,265,851 cycles, 72.98%)</title><rect x="0.0795%" y="469" width="72.9793%" height="15" fill="rgb(216,99,12)" fg:x="39935742" fg:w="36680265851"/><text x="0.3295%" y="479.50">node::InternalMakeCallback(node::Environment*, v8::Local&lt;v8::Object&gt;, v8::Local&lt;v8::Object&gt;, v8::Local&lt;v8::Function&gt;, int..</text></g><g><title>node::LibuvStreamWrap::ReadStart()::$_1::__invoke(uv_stream_s*, long, uv_buf_t const*){node} (36,694,327,391 cycles, 73.01%)</title><rect x="0.0718%" y="549" width="73.0072%" height="15" fill="rgb(226,22,26)" fg:x="36095373" fg:w="36694327391"/><text x="0.3218%" y="559.50">node::LibuvStreamWrap::ReadStart()::$_1::__invoke(uv_stream_s*, long, uv_buf_t const*){node}</text></g><g><title>node::LibuvStreamWrap::OnUvRead(long, uv_buf_t const*){node} (36,691,777,239 cycles, 73.00%)</title><rect x="0.0769%" y="533" width="73.0022%" height="15" fill="rgb(217,163,10)" fg:x="38645525" fg:w="36691777239"/><text x="0.3269%" y="543.50">node::LibuvStreamWrap::OnUvRead(long, uv_buf_t const*){node}</text></g><g><title>node::EmitToJSStreamListener::OnStreamRead(long, uv_buf_t const&amp;){node} (36,691,777,239 cycles, 73.00%)</title><rect x="0.0769%" y="517" width="73.0022%" height="15" fill="rgb(213,25,53)" fg:x="38645525" fg:w="36691777239"/><text x="0.3269%" y="527.50">node::EmitToJSStreamListener::OnStreamRead(long, uv_buf_t const&amp;){node}</text></g><g><title>uv__io_poll{node} (36,792,051,518 cycles, 73.20%)</title><rect x="0.0198%" y="597" width="73.2017%" height="15" fill="rgb(252,105,26)" fg:x="9938800" fg:w="36792051518"/><text x="0.2698%" y="607.50">uv__io_poll{node}</text></g><g><title>uv__stream_io{node} (36,769,762,033 cycles, 73.16%)</title><rect x="0.0641%" y="581" width="73.1573%" height="15" fill="rgb(220,39,43)" fg:x="32228285" fg:w="36769762033"/><text x="0.3141%" y="591.50">uv__stream_io{node}</text></g><g><title>uv__read{inlined} (36,769,762,033 cycles, 73.16%)</title><rect x="0.0641%" y="565" width="73.1573%" height="15" fill="rgb(229,68,48)" fg:x="32228285" fg:w="36769762033"/><text x="0.3141%" y="575.50">uv__read{inlined}</text></g><g><title>_start{node} (36,802,997,600 cycles, 73.22%)</title><rect x="0.0198%" y="725" width="73.2235%" height="15" fill="rgb(252,8,32)" fg:x="9938800" fg:w="36802997600"/><text x="0.2698%" y="735.50">_start{node}</text></g><g><title>__libc_start_main@@GLIBC_2.34{libc.so.6} (36,802,997,600 cycles, 73.22%)</title><rect x="0.0198%" y="709" width="73.2235%" height="15" fill="rgb(223,20,43)" fg:x="9938800" fg:w="36802997600"/><text x="0.2698%" y="719.50">__libc_start_main@@GLIBC_2.34{libc.so.6}</text></g><g><title>call_init{inlined} (36,802,997,600 cycles, 73.22%)</title><rect x="0.0198%" y="693" width="73.2235%" height="15" fill="rgb(229,81,49)" fg:x="9938800" fg:w="36802997600"/><text x="0.2698%" y="703.50">call_init{inlined}</text></g><g><title>__libc_start_call_main{libc.so.6} (36,802,997,600 cycles, 73.22%)</title><rect x="0.0198%" y="677" width="73.2235%" height="15" fill="rgb(236,28,36)" fg:x="9938800" fg:w="36802997600"/><text x="0.2698%" y="687.50">__libc_start_call_main{libc.so.6}</text></g><g><title>node::Start(int, char**){node} (36,802,997,600 cycles, 73.22%)</title><rect x="0.0198%" y="661" width="73.2235%" height="15" fill="rgb(249,185,26)" fg:x="9938800" fg:w="36802997600"/><text x="0.2698%" y="671.50">node::Start(int, char**){node}</text></g><g><title>node::NodeMainInstance::Run(){node} (36,802,997,600 cycles, 73.22%)</title><rect x="0.0198%" y="645" width="73.2235%" height="15" fill="rgb(249,174,33)" fg:x="9938800" fg:w="36802997600"/><text x="0.2698%" y="655.50">node::NodeMainInstance::Run(){node}</text></g><g><title>node::SpinEventLoopInternal(node::Environment*){node} (36,802,997,600 cycles, 73.22%)</title><rect x="0.0198%" y="629" width="73.2235%" height="15" fill="rgb(233,201,37)" fg:x="9938800" fg:w="36802997600"/><text x="0.2698%" y="639.50">node::SpinEventLoopInternal(node::Environment*){node}</text></g><g><title>uv_run{node} (36,802,997,600 cycles, 73.22%)</title><rect x="0.0198%" y="613" width="73.2235%" height="15" fill="rgb(221,78,26)" fg:x="9938800" fg:w="36802997600"/><text x="0.2698%" y="623.50">uv_run{node}</text></g><g><title>node-MainThread (36,815,514,844 cycles, 73.25%)</title><rect x="0.0000%" y="741" width="73.2484%" height="15" fill="rgb(250,127,30)" fg:x="0" fg:w="36815514844"/><text x="0.2500%" y="751.50">node-MainThread</text></g><g><title>vms_complete_munmap_vmas{kernel} (109,505,440 cycles, 0.22%)</title><rect x="73.3270%" y="485" width="0.2179%" height="15" fill="rgb(230,49,44)" fg:x="36855045437" fg:w="109505440"/><text x="73.5770%" y="495.50"></text></g><g><title>unmap_region{kernel} (109,505,440 cycles, 0.22%)</title><rect x="73.3270%" y="469" width="0.2179%" height="15" fill="rgb(229,67,23)" fg:x="36855045437" fg:w="109505440"/><text x="73.5770%" y="479.50"></text></g><g><title>do_vmi_align_munmap{kernel} (113,264,996 cycles, 0.23%)</title><rect x="73.3220%" y="501" width="0.2254%" height="15" fill="rgb(249,83,47)" fg:x="36852507413" fg:w="113264996"/><text x="73.5720%" y="511.50"></text></g><g><title>do_vmi_munmap{kernel} (114,522,737 cycles, 0.23%)</title><rect x="73.3220%" y="517" width="0.2279%" height="15" fill="rgb(215,43,3)" fg:x="36852507413" fg:w="114522737"/><text x="73.5720%" y="527.50"></text></g><g><title>do_syscall_64{kernel} (117,115,842 cycles, 0.23%)</title><rect x="73.3195%" y="581" width="0.2330%" height="15" fill="rgb(238,154,13)" fg:x="36851247094" fg:w="117115842"/><text x="73.5695%" y="591.50"></text></g><g><title>x64_sys_call{kernel} (115,855,523 cycles, 0.23%)</title><rect x="73.3220%" y="565" width="0.2305%" height="15" fill="rgb(219,56,2)" fg:x="36852507413" fg:w="115855523"/><text x="73.5720%" y="575.50"></text></g><g><title>__x64_sys_munmap{kernel} (115,855,523 cycles, 0.23%)</title><rect x="73.3220%" y="549" width="0.2305%" height="15" fill="rgb(233,0,4)" fg:x="36852507413" fg:w="115855523"/><text x="73.5720%" y="559.50"></text></g><g><title>__vm_munmap{kernel} (115,855,523 cycles, 0.23%)</title><rect x="73.3220%" y="533" width="0.2305%" height="15" fill="rgb(235,30,7)" fg:x="36852507413" fg:w="115855523"/><text x="73.5720%" y="543.50"></text></g><g><title>v8::internal::MemoryPool::ReleasePooledChunksTask::RunInternal(){node} (123,422,543 cycles, 0.25%)</title><rect x="73.3094%" y="677" width="0.2456%" height="15" fill="rgb(250,79,13)" fg:x="36846207857" fg:w="123422543"/><text x="73.5594%" y="687.50"></text></g><g><title>v8::internal::MemoryPool::PoolImpl&lt;v8::internal::PooledPage&gt;::ReleaseUpTo(unsigned long){node} (122,136,564 cycles, 0.24%)</title><rect x="73.3120%" y="661" width="0.2430%" height="15" fill="rgb(211,146,34)" fg:x="36847493836" fg:w="122136564"/><text x="73.5620%" y="671.50"></text></g><g><title>v8::internal::VirtualMemory::Free(){node} (119,669,402 cycles, 0.24%)</title><rect x="73.3169%" y="645" width="0.2381%" height="15" fill="rgb(228,22,38)" fg:x="36849960998" fg:w="119669402"/><text x="73.5669%" y="655.50"></text></g><g><title>v8::base::PageAllocator::FreePages(void*, unsigned long){node} (118,383,306 cycles, 0.24%)</title><rect x="73.3195%" y="629" width="0.2355%" height="15" fill="rgb(235,168,5)" fg:x="36851247094" fg:w="118383306"/><text x="73.5695%" y="639.50"></text></g><g><title>__munmap{libc.so.6} (118,383,306 cycles, 0.24%)</title><rect x="73.3195%" y="613" width="0.2355%" height="15" fill="rgb(221,155,16)" fg:x="36851247094" fg:w="118383306"/><text x="73.5695%" y="623.50"></text></g><g><title>entry_SYSCALL_64_after_hwframe{kernel} (118,383,306 cycles, 0.24%)</title><rect x="73.3195%" y="597" width="0.2355%" height="15" fill="rgb(215,215,53)" fg:x="36851247094" fg:w="118383306"/><text x="73.5695%" y="607.50"></text></g><g><title>void v8::internal::JSFunction::BodyDescriptor::IterateBody&lt;v8::internal::ConcurrentMarkingVisitor&gt;(v8::internal::Tagged&lt;v8::internal::Map&gt;, v8::internal::Tagged&lt;v8::internal::HeapObject&gt;, int, v8::internal::ConcurrentMarkingVisitor*){node} (305,518,101 cycles, 0.61%)</title><rect x="74.0564%" y="629" width="0.6079%" height="15" fill="rgb(223,4,10)" fg:x="37221661238" fg:w="305518101"/><text x="74.3064%" y="639.50"></text></g><g><title>void v8::internal::MarkingVisitorBase&lt;v8::internal::ConcurrentMarkingVisitor&gt;::ProcessStrongHeapObject&lt;v8::internal::FullHeapObjectSlot&gt;(v8::internal::Tagged&lt;v8::internal::HeapObject&gt;, v8::internal::FullHeapObjectSlot, v8::internal::Tagged&lt;v8::internal::HeapObject&gt;){node} (283,267,914 cycles, 0.56%)</title><rect x="74.1007%" y="613" width="0.5636%" height="15" fill="rgb(234,103,6)" fg:x="37243911425" fg:w="283267914"/><text x="74.3507%" y="623.50"></text></g><g><title>void v8::internal::MarkingVisitorBase&lt;v8::internal::ConcurrentMarkingVisitor&gt;::ProcessStrongHeapObject&lt;v8::internal::FullHeapObjectSlot&gt;(v8::internal::Tagged&lt;v8::internal::HeapObject&gt;, v8::internal::FullHeapObjectSlot, v8::internal::Tagged&lt;v8::internal::HeapObject&gt;){node} (542,125,297 cycles, 1.08%)</title><rect x="74.6643%" y="629" width="1.0786%" height="15" fill="rgb(227,97,0)" fg:x="37527179339" fg:w="542125297"/><text x="74.9143%" y="639.50"></text></g><g><title>v8::internal::ConcurrentMarking::RunMajor(v8::JobDelegate*, v8::base::EnumSet&lt;v8::internal::CodeFlushMode, int&gt;, unsigned int, bool){node} (1,112,772,194 cycles, 2.21%)</title><rect x="73.5726%" y="645" width="2.2140%" height="15" fill="rgb(234,150,53)" fg:x="36978471017" fg:w="1112772194"/><text x="73.8226%" y="655.50">v..</text></g><g><title>v8::internal::ConcurrentMarking::JobTaskMajor::Run(v8::JobDelegate*){node} (1,135,340,680 cycles, 2.26%)</title><rect x="73.5726%" y="661" width="2.2589%" height="15" fill="rgb(228,201,54)" fg:x="36978471017" fg:w="1135340680"/><text x="73.8226%" y="671.50">v..</text></g><g><title>v8::internal::OptimizingCompileTaskExecutor::CompileTask::Run(v8::JobDelegate*){node} (180,792,661 cycles, 0.36%)</title><rect x="75.8315%" y="661" width="0.3597%" height="15" fill="rgb(222,22,37)" fg:x="38113811697" fg:w="180792661"/><text x="76.0815%" y="671.50"></text></g><g><title>v8::internal::OptimizingCompileTaskExecutor::RunCompilationJob(v8::internal::OptimizingCompileTaskState&amp;, v8::internal::Isolate*, v8::internal::LocalIsolate&amp;, v8::internal::TurbofanCompilationJob*){node} (180,792,661 cycles, 0.36%)</title><rect x="75.8315%" y="645" width="0.3597%" height="15" fill="rgb(237,53,32)" fg:x="38113811697" fg:w="180792661"/><text x="76.0815%" y="655.50"></text></g><g><title>v8::internal::OptimizedCompilationJob::ExecuteJob(v8::internal::RuntimeCallStats*, v8::internal::LocalIsolate*){node} (180,792,661 cycles, 0.36%)</title><rect x="75.8315%" y="629" width="0.3597%" height="15" fill="rgb(233,25,53)" fg:x="38113811697" fg:w="180792661"/><text x="76.0815%" y="639.50"></text></g><g><title>v8::internal::compiler::PipelineCompilationJob::ExecuteJobImpl(v8::internal::RuntimeCallStats*, v8::internal::LocalIsolate*){node} (179,505,428 cycles, 0.36%)</title><rect x="75.8340%" y="613" width="0.3571%" height="15" fill="rgb(210,40,34)" fg:x="38115098930" fg:w="179505428"/><text x="76.0840%" y="623.50"></text></g><g><title>heap::base::SlotCallbackResult v8::internal::Scavenger::ScavengeObject&lt;v8::internal::FullHeapObjectSlot&gt;(v8::internal::FullHeapObjectSlot, v8::internal::Tagged&lt;v8::internal::HeapObject&gt;){node} (5,349,858,116 cycles, 10.64%)</title><rect x="78.0474%" y="613" width="10.6441%" height="15" fill="rgb(241,220,44)" fg:x="39227583508" fg:w="5349858116"/><text x="78.2974%" y="623.50">heap::base::Slot..</text></g><g><title>do_anonymous_page{kernel} (172,900,158 cycles, 0.34%)</title><rect x="89.8058%" y="485" width="0.3440%" height="15" fill="rgb(235,28,35)" fg:x="45137472207" fg:w="172900158"/><text x="90.0558%" y="495.50"></text></g><g><title>handle_mm_fault{kernel} (184,502,283 cycles, 0.37%)</title><rect x="89.7904%" y="533" width="0.3671%" height="15" fill="rgb(210,56,17)" fg:x="45129739908" fg:w="184502283"/><text x="90.0404%" y="543.50"></text></g><g><title>__handle_mm_fault{kernel} (184,502,283 cycles, 0.37%)</title><rect x="89.7904%" y="517" width="0.3671%" height="15" fill="rgb(224,130,29)" fg:x="45129739908" fg:w="184502283"/><text x="90.0404%" y="527.50"></text></g><g><title>handle_pte_fault{kernel} (178,054,512 cycles, 0.35%)</title><rect x="89.8032%" y="501" width="0.3543%" height="15" fill="rgb(235,212,8)" fg:x="45136187679" fg:w="178054512"/><text x="90.0532%" y="511.50"></text></g><g><title>do_user_addr_fault{kernel} (254,975,053 cycles, 0.51%)</title><rect x="89.7546%" y="549" width="0.5073%" height="15" fill="rgb(223,33,50)" fg:x="45111733925" fg:w="254975053"/><text x="90.0046%" y="559.50"></text></g><g><title>asm_exc_page_fault{kernel} (262,634,357 cycles, 0.52%)</title><rect x="89.7496%" y="581" width="0.5225%" height="15" fill="rgb(219,149,13)" fg:x="45109232660" fg:w="262634357"/><text x="89.9996%" y="591.50"></text></g><g><title>exc_page_fault{kernel} (260,133,092 cycles, 0.52%)</title><rect x="89.7546%" y="565" width="0.5176%" height="15" fill="rgb(250,156,29)" fg:x="45111733925" fg:w="260133092"/><text x="90.0046%" y="575.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (269,010,661 cycles, 0.54%)</title><rect x="89.7446%" y="597" width="0.5352%" height="15" fill="rgb(216,193,19)" fg:x="45106719153" fg:w="269010661"/><text x="89.9946%" y="607.50"></text></g><g><title>v8::internal::MemoryAllocator::AllocatePage(v8::internal::MemoryAllocator::AllocationMode, v8::internal::Space*, v8::internal::Executability){node} (102,440,215 cycles, 0.20%)</title><rect x="95.5893%" y="517" width="0.2038%" height="15" fill="rgb(216,135,14)" fg:x="48044357373" fg:w="102440215"/><text x="95.8393%" y="527.50"></text></g><g><title>v8::internal::PagedSpaceAllocatorPolicy::TryExpandAndAllocate(unsigned long, v8::internal::AllocationOrigin){node} (110,101,747 cycles, 0.22%)</title><rect x="95.5869%" y="549" width="0.2191%" height="15" fill="rgb(241,47,5)" fg:x="48043108557" fg:w="110101747"/><text x="95.8369%" y="559.50"></text></g><g><title>v8::internal::PagedSpaceBase::TryExpand(v8::internal::LocalHeap*, v8::internal::AllocationOrigin){node} (110,101,747 cycles, 0.22%)</title><rect x="95.5869%" y="533" width="0.2191%" height="15" fill="rgb(233,42,35)" fg:x="48043108557" fg:w="110101747"/><text x="95.8369%" y="543.50"></text></g><g><title>heap::base::SlotCallbackResult v8::internal::Scavenger::ScavengeObject&lt;v8::internal::FullHeapObjectSlot&gt;(v8::internal::FullHeapObjectSlot, v8::internal::Tagged&lt;v8::internal::HeapObject&gt;){node} (2,778,722,357 cycles, 5.53%)</title><rect x="90.2824%" y="597" width="5.5286%" height="15" fill="rgb(231,13,6)" fg:x="45377019077" fg:w="2778722357"/><text x="90.5324%" y="607.50">heap::b..</text></g><g><title>v8::internal::MainAllocator::AllocateRawSlowUnaligned(int, v8::internal::AllocationOrigin){node} (118,944,872 cycles, 0.24%)</title><rect x="95.5743%" y="581" width="0.2367%" height="15" fill="rgb(207,181,40)" fg:x="48036796562" fg:w="118944872"/><text x="95.8243%" y="591.50"></text></g><g><title>v8::internal::PagedSpaceAllocatorPolicy::RefillLab(int, v8::internal::AllocationOrigin){node} (118,944,872 cycles, 0.24%)</title><rect x="95.5743%" y="565" width="0.2367%" height="15" fill="rgb(254,173,49)" fg:x="48036796562" fg:w="118944872"/><text x="95.8243%" y="575.50"></text></g><g><title>void v8::internal::BodyDescriptorBase::IteratePointers&lt;v8::internal::ScavengerPromotedObjectVisitor&gt;(v8::internal::Tagged&lt;v8::internal::HeapObject&gt;, int, int, v8::internal::ScavengerPromotedObjectVisitor*){node} (3,563,867,550 cycles, 7.09%)</title><rect x="88.8393%" y="613" width="7.0907%" height="15" fill="rgb(221,1,38)" fg:x="44651704782" fg:w="3563867550"/><text x="89.0893%" y="623.50">void v8::i..</text></g><g><title>heap::base::SlotCallbackResult v8::internal::Scavenger::ScavengeObject&lt;v8::internal::FullHeapObjectSlot&gt;(v8::internal::FullHeapObjectSlot, v8::internal::Tagged&lt;v8::internal::HeapObject&gt;){node} (1,052,320,482 cycles, 2.09%)</title><rect x="96.1467%" y="597" width="2.0937%" height="15" fill="rgb(206,124,46)" fg:x="48324501561" fg:w="1052320482"/><text x="96.3967%" y="607.50">h..</text></g><g><title>v8::internal::Scavenger::Process(v8::JobDelegate*){node} (10,992,880,800 cycles, 21.87%)</title><rect x="76.4147%" y="629" width="21.8715%" height="15" fill="rgb(249,21,11)" fg:x="38406961870" fg:w="10992880800"/><text x="76.6647%" y="639.50">v8::internal::Scavenger::Process(v8..</text></g><g><title>void v8::internal::JSFunction::BodyDescriptor::IterateBody&lt;v8::internal::ScavengerCopiedObjectVisitor&gt;(v8::internal::Tagged&lt;v8::internal::Map&gt;, v8::internal::Tagged&lt;v8::internal::HeapObject&gt;, int, v8::internal::ScavengerCopiedObjectVisitor*){node} (1,184,270,338 cycles, 2.36%)</title><rect x="95.9300%" y="613" width="2.3562%" height="15" fill="rgb(222,201,40)" fg:x="48215572332" fg:w="1184270338"/><text x="96.1800%" y="623.50">v..</text></g><g><title>v8::internal::Scavenger::ScavengePage(v8::internal::MutablePage*){node} (444,944,320 cycles, 0.89%)</title><rect x="98.2862%" y="629" width="0.8853%" height="15" fill="rgb(235,61,29)" fg:x="49399842670" fg:w="444944320"/><text x="98.5362%" y="639.50"></text></g><g><title>heap::base::SlotCallbackResult v8::internal::Scavenger::ScavengeObject&lt;v8::internal::FullHeapObjectSlot&gt;(v8::internal::FullHeapObjectSlot, v8::internal::Tagged&lt;v8::internal::HeapObject&gt;){node} (183,057,839 cycles, 0.36%)</title><rect x="98.8073%" y="613" width="0.3642%" height="15" fill="rgb(219,207,3)" fg:x="49661729151" fg:w="183057839"/><text x="99.0573%" y="623.50"></text></g><g><title>v8::internal::ScavengerJobTask::Run(v8::JobDelegate*){node} (11,474,799,254 cycles, 22.83%)</title><rect x="76.3969%" y="661" width="22.8303%" height="15" fill="rgb(222,56,46)" fg:x="38398004485" fg:w="11474799254"/><text x="76.6469%" y="671.50">v8::internal::ScavengerJobTask::Run(..</text></g><g><title>v8::internal::ScavengerJobTask::ProcessItems(v8::JobDelegate*, v8::internal::Scavenger*){node} (11,474,799,254 cycles, 22.83%)</title><rect x="76.3969%" y="645" width="22.8303%" height="15" fill="rgb(239,76,54)" fg:x="38398004485" fg:w="11474799254"/><text x="76.6469%" y="655.50">v8::internal::ScavengerJobTask::Proc..</text></g><g><title>v8::internal::Sweeper::MajorSweeperJob::RunImpl(v8::JobDelegate*, bool){node} (357,553,844 cycles, 0.71%)</title><rect x="99.2272%" y="661" width="0.7114%" height="15" fill="rgb(231,124,27)" fg:x="49872803739" fg:w="357553844"/><text x="99.4772%" y="671.50"></text></g><g><title>v8::internal::Sweeper::ConcurrentMajorSweeper::ConcurrentSweepSpace(v8::internal::AllocationSpace, v8::JobDelegate*){node} (357,553,844 cycles, 0.71%)</title><rect x="99.2272%" y="645" width="0.7114%" height="15" fill="rgb(249,195,6)" fg:x="49872803739" fg:w="357553844"/><text x="99.4772%" y="655.50"></text></g><g><title>v8::internal::Sweeper::RawSweep(v8::internal::NormalPage*, v8::internal::FreeSpaceTreatmentMode, v8::internal::Sweeper::SweepingMode, bool){node} (317,068,577 cycles, 0.63%)</title><rect x="99.3078%" y="629" width="0.6308%" height="15" fill="rgb(237,174,47)" fg:x="49913289006" fg:w="317068577"/><text x="99.5578%" y="639.50"></text></g><g><title>__GI___clone3{libc.so.6} (13,432,811,565 cycles, 26.73%)</title><rect x="73.2484%" y="725" width="26.7260%" height="15" fill="rgb(206,201,31)" fg:x="36815514844" fg:w="13432811565"/><text x="73.4984%" y="735.50">__GI___clone3{libc.so.6}</text></g><g><title>start_thread{libc.so.6} (13,432,811,565 cycles, 26.73%)</title><rect x="73.2484%" y="709" width="26.7260%" height="15" fill="rgb(231,57,52)" fg:x="36815514844" fg:w="13432811565"/><text x="73.4984%" y="719.50">start_thread{libc.so.6}</text></g><g><title>node::(anonymous namespace)::PlatformWorkerThread(void*){node} (13,432,811,565 cycles, 26.73%)</title><rect x="73.2484%" y="693" width="26.7260%" height="15" fill="rgb(248,177,22)" fg:x="36815514844" fg:w="13432811565"/><text x="73.4984%" y="703.50">node::(anonymous namespace)::PlatformWorker..</text></g><g><title>v8::platform::DefaultJobWorker::Run(){node} (13,278,696,009 cycles, 26.42%)</title><rect x="73.5550%" y="677" width="26.4194%" height="15" fill="rgb(215,211,37)" fg:x="36969630400" fg:w="13278696009"/><text x="73.8050%" y="687.50">v8::platform::DefaultJobWorker::Run(){node}</text></g><g><title>all (50,261,210,247 cycles, 100%)</title><rect x="0.0000%" y="757" width="100.0000%" height="15" fill="rgb(241,128,51)" fg:x="0" fg:w="50261210247"/><text x="0.2500%" y="767.50"></text></g><g><title>node-V8Worker (13,445,695,403 cycles, 26.75%)</title><rect x="73.2484%" y="741" width="26.7516%" height="15" fill="rgb(227,165,31)" fg:x="36815514844" fg:w="13445695403"/><text x="73.4984%" y="751.50">node-V8Worker</text></g></svg></svg>

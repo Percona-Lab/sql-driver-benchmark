@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="854" onload="init(evt)" viewBox="0 0 1200 854" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="854" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">cpp-mariadb/T3-binary-buffered-default-0.folded (Percona, default; sampled CPU cycles)</text><text id="details" fill="rgb(0,0,0)" x="10" y="837.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="837.00"> </text><svg id="frames" x="10" width="1180" total_samples="1716938892"><g><title>sql::mariadb::capi::SelectResultSetBin::getInt(int) const{libmariadbcpp.so} (27,015,037 cycles, 1.57%)</title><rect x="0.0001%" y="693" width="1.5734%" height="15" fill="rgb(227,0,7)" fg:x="1830" fg:w="27015037"/><text x="0.2501%" y="703.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetBin::next(){libmariadbcpp.so} (13,942,893 cycles, 0.81%)</title><rect x="1.5735%" y="693" width="0.8121%" height="15" fill="rgb(217,0,24)" fg:x="27016867" fg:w="13942893"/><text x="1.8235%" y="703.50"></text></g><g><title>sql::mariadb::capi::BinRowProtocolCapi::cacheCurrentRow(std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;&amp;, unsigned long){libmariadbcpp.so} (19,345,476 cycles, 1.13%)</title><rect x="3.2083%" y="613" width="1.1267%" height="15" fill="rgb(221,193,54)" fg:x="55085273" fg:w="19345476"/><text x="3.4583%" y="623.50"></text></g><g><title>sql::mariadb::capi::BinRowProtocolCapi::fetchNext(){libmariadbcpp.so} (3,857,198 cycles, 0.22%)</title><rect x="4.3351%" y="613" width="0.2247%" height="15" fill="rgb(248,212,6)" fg:x="74430749" fg:w="3857198"/><text x="4.5851%" y="623.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (119,711,265 cycles, 6.97%)</title><rect x="4.8594%" y="581" width="6.9724%" height="15" fill="rgb(208,68,35)" fg:x="83433784" fg:w="119711265"/><text x="5.1094%" y="591.50">__memmove..</text></g><g><title>operator new(unsigned long){libstdc++.so.6.0.35} (5,254,463 cycles, 0.31%)</title><rect x="12.0550%" y="581" width="0.3060%" height="15" fill="rgb(232,128,0)" fg:x="206976978" fg:w="5254463"/><text x="12.3050%" y="591.50"></text></g><g><title>sql::CArray&lt;char&gt;::CArray(char const*, unsigned long){libmariadbcpp.so} (5,156,586 cycles, 0.30%)</title><rect x="12.3610%" y="581" width="0.3003%" height="15" fill="rgb(207,160,47)" fg:x="212231441" fg:w="5156586"/><text x="12.6110%" y="591.50"></text></g><g><title>std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;::clear(){inlined} (7,607,423 cycles, 0.44%)</title><rect x="14.5357%" y="565" width="0.4431%" height="15" fill="rgb(228,23,34)" fg:x="249569091" fg:w="7607423"/><text x="14.7857%" y="575.50"></text></g><g><title>std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;::_M_erase_at_end(sql::CArray&lt;char&gt;*){inlined} (7,607,423 cycles, 0.44%)</title><rect x="14.5357%" y="549" width="0.4431%" height="15" fill="rgb(218,30,26)" fg:x="249569091" fg:w="7607423"/><text x="14.7857%" y="559.50"></text></g><g><title>operator new(unsigned long){libstdc++.so.6.0.35} (12,866,442 cycles, 0.75%)</title><rect x="14.9788%" y="549" width="0.7494%" height="15" fill="rgb(220,122,19)" fg:x="257176514" fg:w="12866442"/><text x="15.2288%" y="559.50"></text></g><g><title>malloc{libc.so.6} (9,013,445 cycles, 0.52%)</title><rect x="16.1032%" y="533" width="0.5250%" height="15" fill="rgb(250,228,42)" fg:x="276481558" fg:w="9013445"/><text x="16.3532%" y="543.50"></text></g><g><title>__libc_malloc2{libc.so.6} (64,346,073 cycles, 3.75%)</title><rect x="17.1519%" y="517" width="3.7477%" height="15" fill="rgb(240,193,28)" fg:x="294487725" fg:w="64346073"/><text x="17.4019%" y="527.50">__li..</text></g><g><title>_int_malloc{libc.so.6} (57,911,753 cycles, 3.37%)</title><rect x="17.5267%" y="501" width="3.3730%" height="15" fill="rgb(216,20,37)" fg:x="300922045" fg:w="57911753"/><text x="17.7767%" y="511.50">_in..</text></g><g><title>operator new(unsigned long){libstdc++.so.6.0.35} (84,780,534 cycles, 4.94%)</title><rect x="16.6281%" y="533" width="4.9379%" height="15" fill="rgb(206,188,39)" fg:x="285495003" fg:w="84780534"/><text x="16.8781%" y="543.50">operat..</text></g><g><title>_int_malloc{libc.so.6} (11,441,739 cycles, 0.67%)</title><rect x="20.8996%" y="517" width="0.6664%" height="15" fill="rgb(217,207,13)" fg:x="358833798" fg:w="11441739"/><text x="21.1496%" y="527.50"></text></g><g><title>sql::mariadb::capi::BinRowProtocolCapi::cacheCurrentRow(std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;&amp;, unsigned long){libmariadbcpp.so} (182,342,568 cycles, 10.62%)</title><rect x="12.6614%" y="581" width="10.6202%" height="15" fill="rgb(231,73,38)" fg:x="217388027" fg:w="182342568"/><text x="12.9114%" y="591.50">sql::mariadb::ca..</text></g><g><title>void std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;::emplace_back&lt;char const*, unsigned long&amp;&gt;(char const*&amp;&amp;, unsigned long&amp;){inlined} (142,554,081 cycles, 8.30%)</title><rect x="14.9788%" y="565" width="8.3028%" height="15" fill="rgb(225,20,46)" fg:x="257176514" fg:w="142554081"/><text x="15.2288%" y="575.50">void std::ve..</text></g><g><title>sql::CArray&lt;char&gt;::CArray(char const*, unsigned long){libmariadbcpp.so} (128,397,935 cycles, 7.48%)</title><rect x="15.8033%" y="549" width="7.4783%" height="15" fill="rgb(210,31,41)" fg:x="271332660" fg:w="128397935"/><text x="16.0533%" y="559.50">sql::CArra..</text></g><g><title>sql::CArray&lt;char&gt;::CArray(long){inlined} (29,455,058 cycles, 1.72%)</title><rect x="21.5660%" y="533" width="1.7156%" height="15" fill="rgb(221,200,47)" fg:x="370275537" fg:w="29455058"/><text x="21.8160%" y="543.50"></text></g><g><title>sql::CArray&lt;char&gt;::CArray(long){inlined} (24,295,203 cycles, 1.42%)</title><rect x="21.8666%" y="517" width="1.4150%" height="15" fill="rgb(226,26,5)" fg:x="375435392" fg:w="24295203"/><text x="22.1166%" y="527.50"></text></g><g><title>malloc{libc.so.6} (16,497,403 cycles, 0.96%)</title><rect x="24.9215%" y="485" width="0.9609%" height="15" fill="rgb(249,33,26)" fg:x="427886483" fg:w="16497403"/><text x="25.1715%" y="495.50"></text></g><g><title>checked_request2size{inlined} (10,272,364 cycles, 0.60%)</title><rect x="25.2840%" y="469" width="0.5983%" height="15" fill="rgb(235,183,28)" fg:x="434111522" fg:w="10272364"/><text x="25.5340%" y="479.50"></text></g><g><title>__libc_malloc2{libc.so.6} (53,821,479 cycles, 3.13%)</title><rect x="27.2076%" y="469" width="3.1347%" height="15" fill="rgb(221,5,38)" fg:x="467137038" fg:w="53821479"/><text x="27.4576%" y="479.50">__l..</text></g><g><title>_int_malloc{libc.so.6} (42,362,530 cycles, 2.47%)</title><rect x="27.8750%" y="453" width="2.4673%" height="15" fill="rgb(247,18,42)" fg:x="478595987" fg:w="42362530"/><text x="28.1250%" y="463.50">_i..</text></g><g><title>operator new(unsigned long){libstdc++.so.6.0.35} (82,604,358 cycles, 4.81%)</title><rect x="25.8823%" y="485" width="4.8111%" height="15" fill="rgb(241,131,45)" fg:x="444383886" fg:w="82604358"/><text x="26.1323%" y="495.50">operat..</text></g><g><title>_int_malloc{libc.so.6} (6,029,727 cycles, 0.35%)</title><rect x="30.3423%" y="469" width="0.3512%" height="15" fill="rgb(249,31,29)" fg:x="520958517" fg:w="6029727"/><text x="30.5923%" y="479.50"></text></g><g><title>sql::CArray&lt;char&gt;* std::__uninitialized_copy_a&lt;sql::CArray&lt;char&gt; const*, sql::CArray&lt;char&gt; const*, sql::CArray&lt;char&gt;*, sql::CArray&lt;char&gt; &gt;(sql::CArray&lt;char&gt; const*, sql::CArray&lt;char&gt; const*, sql::CArray&lt;char&gt;*, std::allocator&lt;sql::CArray&lt;char&gt; &gt;&amp;){inlined} (108,814,406 cycles, 6.34%)</title><rect x="24.3843%" y="533" width="6.3377%" height="15" fill="rgb(225,111,53)" fg:x="418664155" fg:w="108814406"/><text x="24.6343%" y="543.50">sql::CAr..</text></g><g><title>sql::CArray&lt;char&gt;* std::uninitialized_copy&lt;sql::CArray&lt;char&gt; const*, sql::CArray&lt;char&gt;*&gt;(sql::CArray&lt;char&gt; const*, sql::CArray&lt;char&gt; const*, sql::CArray&lt;char&gt;*){inlined} (108,814,406 cycles, 6.34%)</title><rect x="24.3843%" y="517" width="6.3377%" height="15" fill="rgb(238,160,17)" fg:x="418664155" fg:w="108814406"/><text x="24.6343%" y="527.50">sql::CAr..</text></g><g><title>sql::CArray&lt;char&gt;* std::__do_uninit_copy&lt;sql::CArray&lt;char&gt; const*, sql::CArray&lt;char&gt; const*, sql::CArray&lt;char&gt;*&gt;(sql::CArray&lt;char&gt; const*, sql::CArray&lt;char&gt; const*, sql::CArray&lt;char&gt;*){inlined} (108,814,406 cycles, 6.34%)</title><rect x="24.3843%" y="501" width="6.3377%" height="15" fill="rgb(214,148,48)" fg:x="418664155" fg:w="108814406"/><text x="24.6343%" y="511.50">sql::CAr..</text></g><g><title>sql::CArray&lt;char&gt;* std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;::_M_allocate_and_copy&lt;sql::CArray&lt;char&gt; const*&gt;(unsigned long, sql::CArray&lt;char&gt; const*, sql::CArray&lt;char&gt; const*){inlined} (138,363,048 cycles, 8.06%)</title><rect x="24.3843%" y="549" width="8.0587%" height="15" fill="rgb(232,36,49)" fg:x="418664155" fg:w="138363048"/><text x="24.6343%" y="559.50">sql::CArray..</text></g><g><title>std::_Vector_base&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;::_M_allocate(unsigned long){inlined} (29,548,642 cycles, 1.72%)</title><rect x="30.7220%" y="533" width="1.7210%" height="15" fill="rgb(209,103,24)" fg:x="527478561" fg:w="29548642"/><text x="30.9720%" y="543.50"></text></g><g><title>std::allocator_traits&lt;std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;::allocate(std::allocator&lt;sql::CArray&lt;char&gt; &gt;&amp;, unsigned long){inlined} (29,548,642 cycles, 1.72%)</title><rect x="30.7220%" y="517" width="1.7210%" height="15" fill="rgb(229,88,8)" fg:x="527478561" fg:w="29548642"/><text x="30.9720%" y="527.50"></text></g><g><title>std::__new_allocator&lt;sql::CArray&lt;char&gt; &gt;::allocate(unsigned long, void const*){inlined} (29,548,642 cycles, 1.72%)</title><rect x="30.7220%" y="501" width="1.7210%" height="15" fill="rgb(213,181,19)" fg:x="527478561" fg:w="29548642"/><text x="30.9720%" y="511.50"></text></g><g><title>std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;::reserve(unsigned long){inlined} (155,986,203 cycles, 9.09%)</title><rect x="23.6509%" y="565" width="9.0851%" height="15" fill="rgb(254,191,54)" fg:x="406071728" fg:w="155986203"/><text x="23.9009%" y="575.50">std::vector&lt;s..</text></g><g><title>std::_Vector_base&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;::_M_deallocate(sql::CArray&lt;char&gt;*, unsigned long){inlined} (5,030,728 cycles, 0.29%)</title><rect x="32.4430%" y="549" width="0.2930%" height="15" fill="rgb(241,83,37)" fg:x="557027203" fg:w="5030728"/><text x="32.6930%" y="559.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetBin::growDataArray(bool){libmariadbcpp.so} (167,553,238 cycles, 9.76%)</title><rect x="23.2816%" y="581" width="9.7588%" height="15" fill="rgb(233,36,39)" fg:x="399730595" fg:w="167553238"/><text x="23.5316%" y="591.50">sql::mariadb::..</text></g><g><title>std::vector&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;, std::allocator&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt; &gt; &gt;::push_back(std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;&amp;&amp;){inlined} (5,225,902 cycles, 0.30%)</title><rect x="32.7360%" y="565" width="0.3044%" height="15" fill="rgb(226,3,54)" fg:x="562057931" fg:w="5225902"/><text x="32.9860%" y="575.50"></text></g><g><title>void std::vector&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;, std::allocator&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt; &gt; &gt;::emplace_back&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt; &gt;(std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;&amp;&amp;){inlined} (5,225,902 cycles, 0.30%)</title><rect x="32.7360%" y="549" width="0.3044%" height="15" fill="rgb(245,192,40)" fg:x="562057931" fg:w="5225902"/><text x="32.9860%" y="559.50"></text></g><g><title>mthd_stmt_fetch_to_bind{libmariadb.so.3} (3,869,090 cycles, 0.23%)</title><rect x="33.1154%" y="565" width="0.2253%" height="15" fill="rgb(238,167,29)" fg:x="568571342" fg:w="3869090"/><text x="33.3654%" y="575.50"></text></g><g><title>mthd_stmt_fetch_to_bind{libmariadb.so.3} (88,481,588 cycles, 5.15%)</title><rect x="34.6125%" y="549" width="5.1535%" height="15" fill="rgb(232,182,51)" fg:x="594275348" fg:w="88481588"/><text x="34.8625%" y="559.50">mthd_s..</text></g><g><title>ps_fetch_from_1_to_8_bytes{libmariadb.so.3} (14,076,495 cycles, 0.82%)</title><rect x="38.9461%" y="533" width="0.8199%" height="15" fill="rgb(231,60,39)" fg:x="668680441" fg:w="14076495"/><text x="39.1961%" y="543.50"></text></g><g><title>ps_fetch_from_1_to_8_bytes{libmariadb.so.3} (6,422,618 cycles, 0.37%)</title><rect x="39.7659%" y="549" width="0.3741%" height="15" fill="rgb(208,69,12)" fg:x="682756936" fg:w="6422618"/><text x="40.0159%" y="559.50"></text></g><g><title>ps_fetch_int32{libmariadb.so.3} (6,444,316 cycles, 0.38%)</title><rect x="40.1400%" y="549" width="0.3753%" height="15" fill="rgb(235,93,37)" fg:x="689179554" fg:w="6444316"/><text x="40.3900%" y="559.50"></text></g><g><title>sql::mariadb::Results::loadFully(bool, sql::mariadb::Protocol*){libmariadbcpp.so} (667,485,745 cycles, 38.88%)</title><rect x="3.2083%" y="629" width="38.8765%" height="15" fill="rgb(213,116,39)" fg:x="55085273" fg:w="667485745"/><text x="3.4583%" y="639.50">sql::mariadb::Results::loadFully(bool, sql::mariadb::Protocol*)..</text></g><g><title>sql::mariadb::capi::SelectResultSetBin::cacheCompleteLocally(){libmariadbcpp.so} (644,283,071 cycles, 37.53%)</title><rect x="4.5597%" y="613" width="37.5251%" height="15" fill="rgb(222,207,29)" fg:x="78287947" fg:w="644283071"/><text x="4.8097%" y="623.50">sql::mariadb::capi::SelectResultSetBin::cacheCompleteLocally(..</text></g><g><title>sql::mariadb::capi::SelectResultSetBin::cacheCompleteLocally(){libmariadbcpp.so} (644,283,071 cycles, 37.53%)</title><rect x="4.5597%" y="597" width="37.5251%" height="15" fill="rgb(206,96,30)" fg:x="78287947" fg:w="644283071"/><text x="4.8097%" y="607.50">sql::mariadb::capi::SelectResultSetBin::cacheCompleteLocally(..</text></g><g><title>std::vector&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;, std::allocator&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt; &gt; &gt;::operator[](unsigned long){inlined} (155,287,185 cycles, 9.04%)</title><rect x="33.0404%" y="581" width="9.0444%" height="15" fill="rgb(218,138,4)" fg:x="567283833" fg:w="155287185"/><text x="33.2904%" y="591.50">std::vector&lt;s..</text></g><g><title>mysql_stmt_fetch@libmariadbclient_18{libmariadb.so.3} (150,130,586 cycles, 8.74%)</title><rect x="33.3408%" y="565" width="8.7441%" height="15" fill="rgb(250,191,14)" fg:x="572440432" fg:w="150130586"/><text x="33.5908%" y="575.50">mysql_stmt_f..</text></g><g><title>strcpy{inlined} (26,947,148 cycles, 1.57%)</title><rect x="40.5154%" y="549" width="1.5695%" height="15" fill="rgb(239,60,40)" fg:x="695623870" fg:w="26947148"/><text x="40.7654%" y="559.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (206,891,476 cycles, 12.05%)</title><rect x="42.0848%" y="565" width="12.0500%" height="15" fill="rgb(206,27,48)" fg:x="722571018" fg:w="206891476"/><text x="42.3348%" y="575.50">__memmove_avx512_u..</text></g><g><title>ma_alloc_root{libmariadb.so.3} (8,396,650 cycles, 0.49%)</title><rect x="54.1349%" y="565" width="0.4890%" height="15" fill="rgb(225,35,8)" fg:x="929462494" fg:w="8396650"/><text x="54.3849%" y="575.50"></text></g><g><title>ma_alloc_root{libmariadb.so.3} (9,058,052 cycles, 0.53%)</title><rect x="55.5952%" y="549" width="0.5276%" height="15" fill="rgb(250,213,24)" fg:x="954535798" fg:w="9058052"/><text x="55.8452%" y="559.50"></text></g><g><title>ma_pvio_cache_read{libmariadb.so.3} (8,718,336 cycles, 0.51%)</title><rect x="57.7124%" y="517" width="0.5078%" height="15" fill="rgb(247,123,22)" fg:x="990886015" fg:w="8718336"/><text x="57.9624%" y="527.50"></text></g><g><title>__memmove_avx512_unaligned_erms{libc.so.6} (16,362,352 cycles, 0.95%)</title><rect x="60.0924%" y="501" width="0.9530%" height="15" fill="rgb(231,138,38)" fg:x="1031750182" fg:w="16362352"/><text x="60.3424%" y="511.50"></text></g><g><title>tcp_cleanup_rbuf{kernel} (5,573,371 cycles, 0.32%)</title><rect x="61.6890%" y="245" width="0.3246%" height="15" fill="rgb(231,145,46)" fg:x="1059162280" fg:w="5573371"/><text x="61.9390%" y="255.50"></text></g><g><title>__tcp_cleanup_rbuf{kernel} (5,573,371 cycles, 0.32%)</title><rect x="61.6890%" y="229" width="0.3246%" height="15" fill="rgb(251,118,11)" fg:x="1059162280" fg:w="5573371"/><text x="61.9390%" y="239.50"></text></g><g><title>tcp_send_ack{kernel} (5,573,371 cycles, 0.32%)</title><rect x="61.6890%" y="213" width="0.3246%" height="15" fill="rgb(217,147,25)" fg:x="1059162280" fg:w="5573371"/><text x="61.9390%" y="223.50"></text></g><g><title>__tcp_send_ack.part.0{kernel} (5,573,371 cycles, 0.32%)</title><rect x="61.6890%" y="197" width="0.3246%" height="15" fill="rgb(247,81,37)" fg:x="1059162280" fg:w="5573371"/><text x="61.9390%" y="207.50"></text></g><g><title>__tcp_transmit_skb{kernel} (5,573,371 cycles, 0.32%)</title><rect x="61.6890%" y="181" width="0.3246%" height="15" fill="rgb(209,12,38)" fg:x="1059162280" fg:w="5573371"/><text x="61.9390%" y="191.50"></text></g><g><title>ip_queue_xmit{kernel} (5,201,006 cycles, 0.30%)</title><rect x="61.7107%" y="165" width="0.3029%" height="15" fill="rgb(227,1,9)" fg:x="1059534645" fg:w="5201006"/><text x="61.9607%" y="175.50"></text></g><g><title>__ip_queue_xmit{kernel} (5,201,006 cycles, 0.30%)</title><rect x="61.7107%" y="149" width="0.3029%" height="15" fill="rgb(248,47,43)" fg:x="1059534645" fg:w="5201006"/><text x="61.9607%" y="159.50"></text></g><g><title>ip_local_out{kernel} (5,201,006 cycles, 0.30%)</title><rect x="61.7107%" y="133" width="0.3029%" height="15" fill="rgb(221,10,30)" fg:x="1059534645" fg:w="5201006"/><text x="61.9607%" y="143.50"></text></g><g><title>ip_output{kernel} (3,994,058 cycles, 0.23%)</title><rect x="61.7810%" y="117" width="0.2326%" height="15" fill="rgb(210,229,1)" fg:x="1060741593" fg:w="3994058"/><text x="62.0310%" y="127.50"></text></g><g><title>ip_finish_output{kernel} (3,994,058 cycles, 0.23%)</title><rect x="61.7810%" y="101" width="0.2326%" height="15" fill="rgb(222,148,37)" fg:x="1060741593" fg:w="3994058"/><text x="62.0310%" y="111.50"></text></g><g><title>__ip_finish_output{kernel} (3,994,058 cycles, 0.23%)</title><rect x="61.7810%" y="85" width="0.2326%" height="15" fill="rgb(234,67,33)" fg:x="1060741593" fg:w="3994058"/><text x="62.0310%" y="95.50"></text></g><g><title>ip_finish_output2{kernel} (3,660,251 cycles, 0.21%)</title><rect x="61.8004%" y="69" width="0.2132%" height="15" fill="rgb(247,98,35)" fg:x="1061075400" fg:w="3660251"/><text x="62.0504%" y="79.50"></text></g><g><title>neigh_hh_output{kernel} (3,660,251 cycles, 0.21%)</title><rect x="61.8004%" y="53" width="0.2132%" height="15" fill="rgb(247,138,52)" fg:x="1061075400" fg:w="3660251"/><text x="62.0504%" y="63.50"></text></g><g><title>__dev_queue_xmit{kernel} (3,660,251 cycles, 0.21%)</title><rect x="61.8004%" y="37" width="0.2132%" height="15" fill="rgb(213,79,30)" fg:x="1061075400" fg:w="3660251"/><text x="62.0504%" y="47.50"></text></g><g><title>entry_SYSCALL_64_after_hwframe{kernel} (12,672,675 cycles, 0.74%)</title><rect x="61.2956%" y="389" width="0.7381%" height="15" fill="rgb(246,177,23)" fg:x="1052407790" fg:w="12672675"/><text x="61.5456%" y="399.50"></text></g><g><title>do_syscall_64{kernel} (12,672,675 cycles, 0.74%)</title><rect x="61.2956%" y="373" width="0.7381%" height="15" fill="rgb(230,62,27)" fg:x="1052407790" fg:w="12672675"/><text x="61.5456%" y="383.50"></text></g><g><title>x64_sys_call{kernel} (12,349,467 cycles, 0.72%)</title><rect x="61.3144%" y="357" width="0.7193%" height="15" fill="rgb(216,154,8)" fg:x="1052730998" fg:w="12349467"/><text x="61.5644%" y="367.50"></text></g><g><title>__x64_sys_recvfrom{kernel} (12,349,467 cycles, 0.72%)</title><rect x="61.3144%" y="341" width="0.7193%" height="15" fill="rgb(244,35,45)" fg:x="1052730998" fg:w="12349467"/><text x="61.5644%" y="351.50"></text></g><g><title>__sys_recvfrom{kernel} (12,349,467 cycles, 0.72%)</title><rect x="61.3144%" y="325" width="0.7193%" height="15" fill="rgb(251,115,12)" fg:x="1052730998" fg:w="12349467"/><text x="61.5644%" y="335.50"></text></g><g><title>sock_recvmsg{kernel} (12,349,467 cycles, 0.72%)</title><rect x="61.3144%" y="309" width="0.7193%" height="15" fill="rgb(240,54,50)" fg:x="1052730998" fg:w="12349467"/><text x="61.5644%" y="319.50"></text></g><g><title>inet_recvmsg{kernel} (12,349,467 cycles, 0.72%)</title><rect x="61.3144%" y="293" width="0.7193%" height="15" fill="rgb(233,84,52)" fg:x="1052730998" fg:w="12349467"/><text x="61.5644%" y="303.50"></text></g><g><title>tcp_recvmsg{kernel} (12,349,467 cycles, 0.72%)</title><rect x="61.3144%" y="277" width="0.7193%" height="15" fill="rgb(207,117,47)" fg:x="1052730998" fg:w="12349467"/><text x="61.5644%" y="287.50"></text></g><g><title>tcp_recvmsg_locked{kernel} (9,362,637 cycles, 0.55%)</title><rect x="61.4884%" y="261" width="0.5453%" height="15" fill="rgb(249,43,39)" fg:x="1055717828" fg:w="9362637"/><text x="61.7384%" y="271.50"></text></g><g><title>ma_recv{inlined} (13,346,446 cycles, 0.78%)</title><rect x="61.2767%" y="453" width="0.7773%" height="15" fill="rgb(209,38,44)" fg:x="1052084012" fg:w="13346446"/><text x="61.5267%" y="463.50"></text></g><g><title>recv{libc.so.6} (13,022,668 cycles, 0.76%)</title><rect x="61.2956%" y="437" width="0.7585%" height="15" fill="rgb(236,212,23)" fg:x="1052407790" fg:w="13022668"/><text x="61.5456%" y="447.50"></text></g><g><title>__syscall_cancel{libc.so.6} (13,022,668 cycles, 0.76%)</title><rect x="61.2956%" y="421" width="0.7585%" height="15" fill="rgb(242,79,21)" fg:x="1052407790" fg:w="13022668"/><text x="61.5456%" y="431.50"></text></g><g><title>__internal_syscall_cancel{inlined} (13,022,668 cycles, 0.76%)</title><rect x="61.2956%" y="405" width="0.7585%" height="15" fill="rgb(211,96,35)" fg:x="1052407790" fg:w="13022668"/><text x="61.5456%" y="415.50"></text></g><g><title>dequeue_entity{kernel} (4,885,024 cycles, 0.28%)</title><rect x="62.7026%" y="133" width="0.2845%" height="15" fill="rgb(253,215,40)" fg:x="1076566159" fg:w="4885024"/><text x="62.9526%" y="143.50"></text></g><g><title>poll_schedule_timeout.constprop.0{kernel} (13,053,196 cycles, 0.76%)</title><rect x="62.2820%" y="277" width="0.7603%" height="15" fill="rgb(211,81,21)" fg:x="1069343700" fg:w="13053196"/><text x="62.5320%" y="287.50"></text></g><g><title>schedule_hrtimeout_range{kernel} (13,053,196 cycles, 0.76%)</title><rect x="62.2820%" y="261" width="0.7603%" height="15" fill="rgb(208,190,38)" fg:x="1069343700" fg:w="13053196"/><text x="62.5320%" y="271.50"></text></g><g><title>schedule_hrtimeout_range_clock{kernel} (13,053,196 cycles, 0.76%)</title><rect x="62.2820%" y="245" width="0.7603%" height="15" fill="rgb(235,213,38)" fg:x="1069343700" fg:w="13053196"/><text x="62.5320%" y="255.50"></text></g><g><title>schedule{kernel} (12,303,464 cycles, 0.72%)</title><rect x="62.3257%" y="229" width="0.7166%" height="15" fill="rgb(237,122,38)" fg:x="1070093432" fg:w="12303464"/><text x="62.5757%" y="239.50"></text></g><g><title>__schedule{kernel} (12,303,464 cycles, 0.72%)</title><rect x="62.3257%" y="213" width="0.7166%" height="15" fill="rgb(244,218,35)" fg:x="1070093432" fg:w="12303464"/><text x="62.5757%" y="223.50"></text></g><g><title>try_to_block_task.constprop.0.isra.0{kernel} (6,531,672 cycles, 0.38%)</title><rect x="62.6618%" y="197" width="0.3804%" height="15" fill="rgb(240,68,47)" fg:x="1075865224" fg:w="6531672"/><text x="62.9118%" y="207.50"></text></g><g><title>dequeue_task{kernel} (5,830,737 cycles, 0.34%)</title><rect x="62.7026%" y="181" width="0.3396%" height="15" fill="rgb(210,16,53)" fg:x="1076566159" fg:w="5830737"/><text x="62.9526%" y="191.50"></text></g><g><title>dequeue_task_fair{kernel} (5,830,737 cycles, 0.34%)</title><rect x="62.7026%" y="165" width="0.3396%" height="15" fill="rgb(235,124,12)" fg:x="1076566159" fg:w="5830737"/><text x="62.9526%" y="175.50"></text></g><g><title>dequeue_entities{kernel} (5,830,737 cycles, 0.34%)</title><rect x="62.7026%" y="149" width="0.3396%" height="15" fill="rgb(224,169,11)" fg:x="1076566159" fg:w="5830737"/><text x="62.9526%" y="159.50"></text></g><g><title>ma_pvio_read{libmariadb.so.3} (30,745,998 cycles, 1.79%)</title><rect x="61.2767%" y="485" width="1.7907%" height="15" fill="rgb(250,166,2)" fg:x="1052084012" fg:w="30745998"/><text x="61.5267%" y="495.50">m..</text></g><g><title>pvio_socket_read{libmariadb.so.3} (30,745,998 cycles, 1.79%)</title><rect x="61.2767%" y="469" width="1.7907%" height="15" fill="rgb(242,216,29)" fg:x="1052084012" fg:w="30745998"/><text x="61.5267%" y="479.50">p..</text></g><g><title>pvio_socket_wait_io_or_timeout{libmariadb.so.3} (17,399,552 cycles, 1.01%)</title><rect x="62.0541%" y="453" width="1.0134%" height="15" fill="rgb(230,116,27)" fg:x="1065430458" fg:w="17399552"/><text x="62.3041%" y="463.50"></text></g><g><title>poll{inlined} (17,399,552 cycles, 1.01%)</title><rect x="62.0541%" y="437" width="1.0134%" height="15" fill="rgb(228,99,48)" fg:x="1065430458" fg:w="17399552"/><text x="62.3041%" y="447.50"></text></g><g><title>__poll{libc.so.6} (17,399,552 cycles, 1.01%)</title><rect x="62.0541%" y="421" width="1.0134%" height="15" fill="rgb(253,11,6)" fg:x="1065430458" fg:w="17399552"/><text x="62.3041%" y="431.50"></text></g><g><title>__syscall_cancel{libc.so.6} (17,399,552 cycles, 1.01%)</title><rect x="62.0541%" y="405" width="1.0134%" height="15" fill="rgb(247,143,39)" fg:x="1065430458" fg:w="17399552"/><text x="62.3041%" y="415.50"></text></g><g><title>__internal_syscall_cancel{inlined} (17,399,552 cycles, 1.01%)</title><rect x="62.0541%" y="389" width="1.0134%" height="15" fill="rgb(236,97,10)" fg:x="1065430458" fg:w="17399552"/><text x="62.3041%" y="399.50"></text></g><g><title>entry_SYSCALL_64_after_hwframe{kernel} (17,399,552 cycles, 1.01%)</title><rect x="62.0541%" y="373" width="1.0134%" height="15" fill="rgb(233,208,19)" fg:x="1065430458" fg:w="17399552"/><text x="62.3041%" y="383.50"></text></g><g><title>do_syscall_64{kernel} (17,399,552 cycles, 1.01%)</title><rect x="62.0541%" y="357" width="1.0134%" height="15" fill="rgb(216,164,2)" fg:x="1065430458" fg:w="17399552"/><text x="62.3041%" y="367.50"></text></g><g><title>x64_sys_call{kernel} (16,210,258 cycles, 0.94%)</title><rect x="62.1233%" y="341" width="0.9441%" height="15" fill="rgb(220,129,5)" fg:x="1066619752" fg:w="16210258"/><text x="62.3733%" y="351.50"></text></g><g><title>__x64_sys_poll{kernel} (16,210,258 cycles, 0.94%)</title><rect x="62.1233%" y="325" width="0.9441%" height="15" fill="rgb(242,17,10)" fg:x="1066619752" fg:w="16210258"/><text x="62.3733%" y="335.50"></text></g><g><title>do_sys_poll{kernel} (14,397,932 cycles, 0.84%)</title><rect x="62.2289%" y="309" width="0.8386%" height="15" fill="rgb(242,107,0)" fg:x="1068432078" fg:w="14397932"/><text x="62.4789%" y="319.50"></text></g><g><title>do_poll.constprop.0{kernel} (13,486,310 cycles, 0.79%)</title><rect x="62.2820%" y="293" width="0.7855%" height="15" fill="rgb(251,28,31)" fg:x="1069343700" fg:w="13486310"/><text x="62.5320%" y="303.50"></text></g><g><title>ma_pvio_cache_read{libmariadb.so.3} (38,330,194 cycles, 2.23%)</title><rect x="61.0454%" y="501" width="2.2325%" height="15" fill="rgb(233,223,10)" fg:x="1048112534" fg:w="38330194"/><text x="61.2954%" y="511.50">m..</text></g><g><title>memcpy{inlined} (3,612,718 cycles, 0.21%)</title><rect x="63.0675%" y="485" width="0.2104%" height="15" fill="rgb(215,21,27)" fg:x="1082830010" fg:w="3612718"/><text x="63.3175%" y="495.50"></text></g><g><title>ma_net_safe_read{libmariadb.so.3} (123,737,106 cycles, 7.21%)</title><rect x="56.1228%" y="549" width="7.2068%" height="15" fill="rgb(232,23,21)" fg:x="963593850" fg:w="123737106"/><text x="56.3728%" y="559.50">ma_net_saf..</text></g><g><title>ma_net_read{libmariadb.so.3} (107,560,801 cycles, 6.26%)</title><rect x="57.0649%" y="533" width="6.2647%" height="15" fill="rgb(244,5,23)" fg:x="979770155" fg:w="107560801"/><text x="57.3149%" y="543.50">ma_net_r..</text></g><g><title>ma_real_read{libmariadb.so.3} (87,726,605 cycles, 5.11%)</title><rect x="58.2201%" y="517" width="5.1095%" height="15" fill="rgb(226,81,46)" fg:x="999604351" fg:w="87726605"/><text x="58.4701%" y="527.50">ma_rea..</text></g><g><title>sql::mariadb::BasePrepareStatement::executeQuery(){libmariadbcpp.so} (1,032,646,684 cycles, 60.14%)</title><rect x="3.2083%" y="677" width="60.1446%" height="15" fill="rgb(247,70,30)" fg:x="55085273" fg:w="1032646684"/><text x="3.4583%" y="687.50">sql::mariadb::BasePrepareStatement::executeQuery(){libmariadbcpp.so}</text></g><g><title>sql::mariadb::ServerSidePreparedStatement::executeInternal(int){libmariadbcpp.so} (1,032,646,684 cycles, 60.14%)</title><rect x="3.2083%" y="661" width="60.1446%" height="15" fill="rgb(212,68,19)" fg:x="55085273" fg:w="1032646684"/><text x="3.4583%" y="671.50">sql::mariadb::ServerSidePreparedStatement::executeInternal(int){libmariadbcpp.so}</text></g><g><title>sql::mariadb::capi::QueryProtocol::executePreparedQuery(bool, sql::mariadb::ServerPrepareResult*, sql::mariadb::Results*, std::vector&lt;std::unique_ptr&lt;sql::mariadb::ParameterHolder, std::default_delete&lt;sql::mariadb::ParameterHolder&gt; &gt;, std::allocator&lt;std::unique_ptr&lt;sql::mariadb::ParameterHolder, std::default_delete&lt;sql::mariadb::ParameterHolder&gt; &gt; &gt; &gt;&amp;){libmariadbcpp.so} (1,032,646,684 cycles, 60.14%)</title><rect x="3.2083%" y="645" width="60.1446%" height="15" fill="rgb(240,187,13)" fg:x="55085273" fg:w="1032646684"/><text x="3.4583%" y="655.50">sql::mariadb::capi::QueryProtocol::executePreparedQuery(bool, sql::mariadb::ServerPrepareResult*, s..</text></g><g><title>sql::mariadb::capi::QueryProtocol::readResultSet(sql::mariadb::Results*, sql::mariadb::ServerPrepareResult*){libmariadbcpp.so} (365,160,939 cycles, 21.27%)</title><rect x="42.0848%" y="629" width="21.2681%" height="15" fill="rgb(223,113,26)" fg:x="722571018" fg:w="365160939"/><text x="42.3348%" y="639.50">sql::mariadb::capi::QueryProtocol:..</text></g><g><title>sql::mariadb::SelectResultSet::create(sql::mariadb::Results*, sql::mariadb::Protocol*, sql::mariadb::ServerPrepareResult*, bool, bool){libmariadbcpp.so} (365,160,939 cycles, 21.27%)</title><rect x="42.0848%" y="613" width="21.2681%" height="15" fill="rgb(206,192,2)" fg:x="722571018" fg:w="365160939"/><text x="42.3348%" y="623.50">sql::mariadb::SelectResultSet::cre..</text></g><g><title>sql::mariadb::capi::SelectResultSetBin::SelectResultSetBin(sql::mariadb::Results*, sql::mariadb::Protocol*, sql::mariadb::ServerPrepareResult*, bool, bool){libmariadbcpp.so} (365,160,939 cycles, 21.27%)</title><rect x="42.0848%" y="597" width="21.2681%" height="15" fill="rgb(241,108,4)" fg:x="722571018" fg:w="365160939"/><text x="42.3348%" y="607.50">sql::mariadb::capi::SelectResultSe..</text></g><g><title>mysql_stmt_store_result@libmariadbclient_18{libmariadb.so.3} (365,160,939 cycles, 21.27%)</title><rect x="42.0848%" y="581" width="21.2681%" height="15" fill="rgb(247,173,49)" fg:x="722571018" fg:w="365160939"/><text x="42.3348%" y="591.50">mysql_stmt_store_result@libmariadb..</text></g><g><title>mthd_stmt_read_all_rows{libmariadb.so.3} (149,078,143 cycles, 8.68%)</title><rect x="54.6702%" y="565" width="8.6828%" height="15" fill="rgb(224,114,35)" fg:x="938653814" fg:w="149078143"/><text x="54.9202%" y="575.50">mthd_stmt_re..</text></g><g><title>sql::mariadb::ColumnType::getType() const{libmariadbcpp.so} (3,870,912 cycles, 0.23%)</title><rect x="63.3530%" y="677" width="0.2255%" height="15" fill="rgb(245,159,27)" fg:x="1087731957" fg:w="3870912"/><text x="63.6030%" y="687.50"></text></g><g><title>sql::mariadb::capi::BinRowProtocolCapi::getInternalInt(sql::mariadb::ColumnDefinition*){libmariadbcpp.so} (38,629,492 cycles, 2.25%)</title><rect x="63.7287%" y="677" width="2.2499%" height="15" fill="rgb(245,172,44)" fg:x="1094183091" fg:w="38629492"/><text x="63.9787%" y="687.50">s..</text></g><g><title>sql::mariadb::capi::ColumnDefinitionCapi::getColumnType() const{libmariadbcpp.so} (15,475,705 cycles, 0.90%)</title><rect x="66.0538%" y="677" width="0.9014%" height="15" fill="rgb(236,23,11)" fg:x="1134103847" fg:w="15475705"/><text x="66.3038%" y="687.50"></text></g><g><title>sql::mariadb::capi::ColumnDefinitionCapi::isSigned() const{libmariadbcpp.so} (16,755,626 cycles, 0.98%)</title><rect x="66.9552%" y="677" width="0.9759%" height="15" fill="rgb(205,117,38)" fg:x="1149579552" fg:w="16755626"/><text x="67.2052%" y="687.50"></text></g><g><title>std::__shared_ptr&lt;sql::mariadb::ColumnDefinition,{__gnu_cxx::_Lock_policy)2&gt;::get() const+0x27 (inlined} (12,901,952 cycles, 0.75%)</title><rect x="68.7567%" y="661" width="0.7515%" height="15" fill="rgb(237,72,25)" fg:x="1180510453" fg:w="12901952"/><text x="69.0067%" y="671.50"></text></g><g><title>sql::CArray&lt;char&gt;::end() const{libmariadbcpp.so} (24,442,614 cycles, 1.42%)</title><rect x="69.5833%" y="613" width="1.4236%" height="15" fill="rgb(244,70,9)" fg:x="1194703322" fg:w="24442614"/><text x="69.8333%" y="623.50"></text></g><g><title>sql::CArray&lt;char&gt;::wrap(char*, unsigned long)@plt{libmariadbcpp.so} (6,453,103 cycles, 0.38%)</title><rect x="71.0069%" y="613" width="0.3758%" height="15" fill="rgb(217,125,39)" fg:x="1219145936" fg:w="6453103"/><text x="71.2569%" y="623.50"></text></g><g><title>sql::mariadb::capi::BinRowProtocolCapi::setPosition(int){libmariadbcpp.so} (91,482,892 cycles, 5.33%)</title><rect x="71.3828%" y="613" width="5.3283%" height="15" fill="rgb(235,36,10)" fg:x="1225599039" fg:w="91482892"/><text x="71.6328%" y="623.50">sql::ma..</text></g><g><title>sql::CArray&lt;char&gt;::wrap(char*, unsigned long){libmariadbcpp.so} (7,742,709 cycles, 0.45%)</title><rect x="76.2601%" y="597" width="0.4510%" height="15" fill="rgb(251,123,47)" fg:x="1309339222" fg:w="7742709"/><text x="76.5101%" y="607.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetBin::getInt(int) const{libmariadbcpp.so} (202,312,592 cycles, 11.78%)</title><rect x="68.0809%" y="677" width="11.7833%" height="15" fill="rgb(221,13,13)" fg:x="1168906644" fg:w="202312592"/><text x="68.3309%" y="687.50">sql::mariadb::cap..</text></g><g><title>std::unique_ptr&lt;sql::mariadb::RowProtocol, std::default_delete&lt;sql::mariadb::RowProtocol&gt; &gt;::operator-&gt;() const{inlined} (177,806,831 cycles, 10.36%)</title><rect x="69.5081%" y="661" width="10.3560%" height="15" fill="rgb(238,131,9)" fg:x="1193412405" fg:w="177806831"/><text x="69.7581%" y="671.50">std::unique_ptr..</text></g><g><title>std::unique_ptr&lt;sql::mariadb::RowProtocol, std::default_delete&lt;sql::mariadb::RowProtocol&gt; &gt;::get() const{inlined} (177,806,831 cycles, 10.36%)</title><rect x="69.5081%" y="645" width="10.3560%" height="15" fill="rgb(211,50,8)" fg:x="1193412405" fg:w="177806831"/><text x="69.7581%" y="655.50">std::unique_ptr..</text></g><g><title>std::__uniq_ptr_impl&lt;sql::mariadb::RowProtocol, std::default_delete&lt;sql::mariadb::RowProtocol&gt; &gt;::_M_ptr() const{inlined} (177,806,831 cycles, 10.36%)</title><rect x="69.5081%" y="629" width="10.3560%" height="15" fill="rgb(245,182,24)" fg:x="1193412405" fg:w="177806831"/><text x="69.7581%" y="639.50">std::__uniq_ptr..</text></g><g><title>sql::mariadb::capi::SelectResultSetBin::checkObjectRange(int) const{libmariadbcpp.so} (54,137,305 cycles, 3.15%)</title><rect x="76.7111%" y="613" width="3.1531%" height="15" fill="rgb(242,14,37)" fg:x="1317081931" fg:w="54137305"/><text x="76.9611%" y="623.50">sql..</text></g><g><title>std::unique_ptr&lt;sql::mariadb::RowProtocol, std::default_delete&lt;sql::mariadb::RowProtocol&gt; &gt;::operator-&gt;() const{inlined} (23,187,596 cycles, 1.35%)</title><rect x="78.5137%" y="597" width="1.3505%" height="15" fill="rgb(246,228,12)" fg:x="1348031640" fg:w="23187596"/><text x="78.7637%" y="607.50"></text></g><g><title>std::unique_ptr&lt;sql::mariadb::RowProtocol, std::default_delete&lt;sql::mariadb::RowProtocol&gt; &gt;::get() const{inlined} (23,187,596 cycles, 1.35%)</title><rect x="78.5137%" y="581" width="1.3505%" height="15" fill="rgb(213,55,15)" fg:x="1348031640" fg:w="23187596"/><text x="78.7637%" y="591.50"></text></g><g><title>std::__uniq_ptr_impl&lt;sql::mariadb::RowProtocol, std::default_delete&lt;sql::mariadb::RowProtocol&gt; &gt;::_M_ptr() const{inlined} (23,187,596 cycles, 1.35%)</title><rect x="78.5137%" y="565" width="1.3505%" height="15" fill="rgb(209,9,3)" fg:x="1348031640" fg:w="23187596"/><text x="78.7637%" y="575.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetBin::resetRow() const{libmariadbcpp.so} (20,606,313 cycles, 1.20%)</title><rect x="78.6640%" y="549" width="1.2002%" height="15" fill="rgb(230,59,30)" fg:x="1350612923" fg:w="20606313"/><text x="78.9140%" y="559.50"></text></g><g><title>std::vector&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;, std::allocator&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt; &gt; &gt;::size() const{inlined} (9,029,571 cycles, 0.53%)</title><rect x="79.3383%" y="533" width="0.5259%" height="15" fill="rgb(209,121,21)" fg:x="1362189665" fg:w="9029571"/><text x="79.5883%" y="543.50"></text></g><g><title>sql::mariadb::capi::SelectResultSetBin::next(){libmariadbcpp.so} (6,446,346 cycles, 0.38%)</title><rect x="79.8642%" y="677" width="0.3755%" height="15" fill="rgb(220,109,13)" fg:x="1371219236" fg:w="6446346"/><text x="80.1142%" y="687.50"></text></g><g><title>cfree@GLIBC_2.2.5{libc.so.6} (63,210,691 cycles, 3.68%)</title><rect x="80.3148%" y="645" width="3.6816%" height="15" fill="rgb(232,18,1)" fg:x="1378956235" fg:w="63210691"/><text x="80.5648%" y="655.50">cfre..</text></g><g><title>operator delete(void*)@plt{libstdc++.so.6.0.35} (5,160,735 cycles, 0.30%)</title><rect x="83.9964%" y="645" width="0.3006%" height="15" fill="rgb(215,41,42)" fg:x="1442166926" fg:w="5160735"/><text x="84.2464%" y="655.50"></text></g><g><title>operator delete(void*){libstdc++.so.6.0.35} (3,869,873 cycles, 0.23%)</title><rect x="84.2970%" y="645" width="0.2254%" height="15" fill="rgb(224,123,36)" fg:x="1447327661" fg:w="3869873"/><text x="84.5470%" y="655.50"></text></g><g><title>sql::CArray&lt;char&gt;::~CArray(){libmariadbcpp.so} (6,450,431 cycles, 0.38%)</title><rect x="84.5975%" y="645" width="0.3757%" height="15" fill="rgb(240,125,3)" fg:x="1452488176" fg:w="6450431"/><text x="84.8475%" y="655.50"></text></g><g><title>_int_free_maybe_trim{libc.so.6} (11,612,372 cycles, 0.68%)</title><rect x="85.8747%" y="565" width="0.6763%" height="15" fill="rgb(205,98,50)" fg:x="1474416291" fg:w="11612372"/><text x="86.1247%" y="575.50"></text></g><g><title>_int_free_merge_chunk{libc.so.6} (95,470,392 cycles, 5.56%)</title><rect x="86.5511%" y="565" width="5.5605%" height="15" fill="rgb(205,185,37)" fg:x="1486028663" fg:w="95470392"/><text x="86.8011%" y="575.50">_int_fr..</text></g><g><title>_int_free_create_chunk{inlined} (55,469,981 cycles, 3.23%)</title><rect x="88.8808%" y="549" width="3.2307%" height="15" fill="rgb(238,207,15)" fg:x="1526029074" fg:w="55469981"/><text x="89.1308%" y="559.50">_in..</text></g><g><title>unlink_chunk.isra.0{libc.so.6} (51,601,255 cycles, 3.01%)</title><rect x="89.1061%" y="533" width="3.0054%" height="15" fill="rgb(213,199,42)" fg:x="1529897800" fg:w="51601255"/><text x="89.3561%" y="543.50">unl..</text></g><g><title>_int_free_chunk{libc.so.6} (125,137,734 cycles, 7.29%)</title><rect x="85.0484%" y="581" width="7.2884%" height="15" fill="rgb(235,201,11)" fg:x="1460229374" fg:w="125137734"/><text x="85.2984%" y="591.50">_int_free_..</text></g><g><title>unlink_chunk.isra.0{libc.so.6} (3,868,053 cycles, 0.23%)</title><rect x="92.1116%" y="565" width="0.2253%" height="15" fill="rgb(207,46,11)" fg:x="1581499055" fg:w="3868053"/><text x="92.3616%" y="575.50"></text></g><g><title>_int_free_maybe_trim{libc.so.6} (12,902,494 cycles, 0.75%)</title><rect x="93.3135%" y="501" width="0.7515%" height="15" fill="rgb(241,35,35)" fg:x="1602136178" fg:w="12902494"/><text x="93.5635%" y="511.50"></text></g><g><title>_int_free_merge_chunk{libc.so.6} (91,580,005 cycles, 5.33%)</title><rect x="94.0650%" y="501" width="5.3339%" height="15" fill="rgb(243,32,47)" fg:x="1615038672" fg:w="91580005"/><text x="94.3150%" y="511.50">_int_fr..</text></g><g><title>_int_free_create_chunk{inlined} (64,496,301 cycles, 3.76%)</title><rect x="95.6424%" y="485" width="3.7565%" height="15" fill="rgb(247,202,23)" fg:x="1642122376" fg:w="64496301"/><text x="95.8924%" y="495.50">_int..</text></g><g><title>unlink_chunk.isra.0{libc.so.6} (52,891,890 cycles, 3.08%)</title><rect x="96.3183%" y="469" width="3.0806%" height="15" fill="rgb(219,102,11)" fg:x="1653726787" fg:w="52891890"/><text x="96.5683%" y="479.50">unl..</text></g><g><title>_int_free_chunk{libc.so.6} (118,669,516 cycles, 6.91%)</title><rect x="92.6375%" y="517" width="6.9117%" height="15" fill="rgb(243,110,44)" fg:x="1590530010" fg:w="118669516"/><text x="92.8875%" y="527.50">_int_free..</text></g><g><title>std::unique_ptr&lt;sql::PreparedStatement, std::default_delete&lt;sql::PreparedStatement&gt; &gt;::~unique_ptr(){inlined} (337,984,512 cycles, 19.69%)</title><rect x="80.2396%" y="677" width="19.6853%" height="15" fill="rgb(222,74,54)" fg:x="1377665582" fg:w="337984512"/><text x="80.4896%" y="687.50">std::unique_ptr&lt;sql::PreparedSt..</text></g><g><title>sql::mariadb::capi::SelectResultSetBin::~SelectResultSetBin(){libmariadbcpp.so} (337,984,512 cycles, 19.69%)</title><rect x="80.2396%" y="661" width="19.6853%" height="15" fill="rgb(216,99,12)" fg:x="1377665582" fg:w="337984512"/><text x="80.4896%" y="671.50">sql::mariadb::capi::SelectResul..</text></g><g><title>sql::mariadb::capi::SelectResultSetBin::~SelectResultSetBin(){libmariadbcpp.so} (256,711,487 cycles, 14.95%)</title><rect x="84.9732%" y="645" width="14.9517%" height="15" fill="rgb(226,22,26)" fg:x="1458938607" fg:w="256711487"/><text x="85.2232%" y="655.50">sql::mariadb::capi::Sel..</text></g><g><title>std::vector&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;, std::allocator&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt; &gt; &gt;::~vector(){inlined} (256,711,487 cycles, 14.95%)</title><rect x="84.9732%" y="629" width="14.9517%" height="15" fill="rgb(217,163,10)" fg:x="1458938607" fg:w="256711487"/><text x="85.2232%" y="639.50">std::vector&lt;std::vector..</text></g><g><title>void std::_Destroy&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;*, std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt; &gt;(std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;*, std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;*, std::allocator&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt; &gt;&amp;){inlined} (256,711,487 cycles, 14.95%)</title><rect x="84.9732%" y="613" width="14.9517%" height="15" fill="rgb(213,25,53)" fg:x="1458938607" fg:w="256711487"/><text x="85.2232%" y="623.50">void std::_Destroy&lt;std:..</text></g><g><title>void std::_Destroy&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;*&gt;(std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;*, std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;*){inlined} (256,711,487 cycles, 14.95%)</title><rect x="84.9732%" y="597" width="14.9517%" height="15" fill="rgb(252,105,26)" fg:x="1458938607" fg:w="256711487"/><text x="85.2232%" y="607.50">void std::_Destroy&lt;std:..</text></g><g><title>void std::_Destroy&lt;std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt; &gt;(std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;*){inlined} (130,282,986 cycles, 7.59%)</title><rect x="92.3368%" y="581" width="7.5881%" height="15" fill="rgb(220,39,43)" fg:x="1585367108" fg:w="130282986"/><text x="92.5868%" y="591.50">void std::..</text></g><g><title>std::vector&lt;sql::CArray&lt;char&gt;, std::allocator&lt;sql::CArray&lt;char&gt; &gt; &gt;::~vector(){inlined} (130,282,986 cycles, 7.59%)</title><rect x="92.3368%" y="565" width="7.5881%" height="15" fill="rgb(229,68,48)" fg:x="1585367108" fg:w="130282986"/><text x="92.5868%" y="575.50">std::vecto..</text></g><g><title>void std::_Destroy&lt;sql::CArray&lt;char&gt;*, sql::CArray&lt;char&gt; &gt;(sql::CArray&lt;char&gt;*, sql::CArray&lt;char&gt;*, std::allocator&lt;sql::CArray&lt;char&gt; &gt;&amp;){inlined} (130,282,986 cycles, 7.59%)</title><rect x="92.3368%" y="549" width="7.5881%" height="15" fill="rgb(252,8,32)" fg:x="1585367108" fg:w="130282986"/><text x="92.5868%" y="559.50">void std::..</text></g><g><title>void std::_Destroy&lt;sql::CArray&lt;char&gt;*&gt;(sql::CArray&lt;char&gt;*, sql::CArray&lt;char&gt;*){inlined} (130,282,986 cycles, 7.59%)</title><rect x="92.3368%" y="533" width="7.5881%" height="15" fill="rgb(223,20,43)" fg:x="1585367108" fg:w="130282986"/><text x="92.5868%" y="543.50">void std::..</text></g><g><title>void std::_Destroy&lt;sql::CArray&lt;char&gt; &gt;(sql::CArray&lt;char&gt;*){inlined} (3,869,741 cycles, 0.23%)</title><rect x="99.6996%" y="517" width="0.2254%" height="15" fill="rgb(229,81,49)" fg:x="1711780353" fg:w="3869741"/><text x="99.9496%" y="527.50"></text></g><g><title>all (1,716,938,892 cycles, 100%)</title><rect x="0.0000%" y="805" width="100.0000%" height="15" fill="rgb(236,28,36)" fg:x="0" fg:w="1716938892"/><text x="0.2500%" y="815.50"></text></g><g><title>run-mariadb (1,716,938,892 cycles, 100.00%)</title><rect x="0.0000%" y="789" width="100.0000%" height="15" fill="rgb(249,185,26)" fg:x="0" fg:w="1716938892"/><text x="0.2500%" y="799.50">run-mariadb</text></g><g><title>_start{run-mariadb} (1,716,938,892 cycles, 100.00%)</title><rect x="0.0000%" y="773" width="100.0000%" height="15" fill="rgb(249,174,33)" fg:x="0" fg:w="1716938892"/><text x="0.2500%" y="783.50">_start{run-mariadb}</text></g><g><title>__libc_start_main@@GLIBC_2.34{libc.so.6} (1,716,938,892 cycles, 100.00%)</title><rect x="0.0000%" y="757" width="100.0000%" height="15" fill="rgb(233,201,37)" fg:x="0" fg:w="1716938892"/><text x="0.2500%" y="767.50">__libc_start_main@@GLIBC_2.34{libc.so.6}</text></g><g><title>call_init{inlined} (1,716,938,892 cycles, 100.00%)</title><rect x="0.0000%" y="741" width="100.0000%" height="15" fill="rgb(221,78,26)" fg:x="0" fg:w="1716938892"/><text x="0.2500%" y="751.50">call_init{inlined}</text></g><g><title>__libc_start_call_main{libc.so.6} (1,716,938,892 cycles, 100.00%)</title><rect x="0.0000%" y="725" width="100.0000%" height="15" fill="rgb(250,127,30)" fg:x="0" fg:w="1716938892"/><text x="0.2500%" y="735.50">__libc_start_call_main{libc.so.6}</text></g><g><title>main{run-mariadb} (1,716,938,892 cycles, 100.00%)</title><rect x="0.0000%" y="709" width="100.0000%" height="15" fill="rgb(230,49,44)" fg:x="0" fg:w="1716938892"/><text x="0.2500%" y="719.50">main{run-mariadb}</text></g><g><title>t3(sql::Connection*){run-mariadb} (1,675,979,132 cycles, 97.61%)</title><rect x="2.3856%" y="693" width="97.6144%" height="15" fill="rgb(229,67,23)" fg:x="40959760" fg:w="1675979132"/><text x="2.6356%" y="703.50">t3(sql::Connection*){run-mariadb}</text></g></svg></svg>
